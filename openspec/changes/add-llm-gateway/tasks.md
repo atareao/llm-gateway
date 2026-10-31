@@ -7,12 +7,12 @@
 - [x] 5. GREEN: handler `POST /v1/chat/completions` no-streaming + error `model_not_found`.
 - [x] 6. RED: test de failover (primario caído → fallback; `x-gateway-backend`; todos caídos → 502).
 - [x] 7. GREEN: lógica de failover antes del primer token.
-- [ ] 8. RED: test de streaming SSE (chunks `data:` passthrough + `data: [DONE]`).
-- [ ] 9. GREEN: streaming.
+- [x] 8. RED: test de streaming SSE (chunks `data:` passthrough + `data: [DONE]`).
+- [x] 9. GREEN: streaming.
 - [ ] 10. RED: test de passthrough de `tool_calls` en la respuesta.
 - [ ] 11. GREEN: passthrough de tool_calls.
-- [ ] 12. RED: tests de `/v1/models` y `/healthz`.
-- [ ] 13. GREEN: endpoints auxiliares.
+- [x] 12. RED: tests de `/v1/models` y `/healthz`.
+- [x] 13. GREEN: endpoints auxiliares.
 - [ ] 14. RED: test de secretos por entorno (cabecera añadida; ausente → backend saltado).
 - [ ] 15. GREEN: resolución de `api_key_env`.
 - [ ] 16. Integración: backends simulados (mock) cubriendo los escenarios de failover y stream.
