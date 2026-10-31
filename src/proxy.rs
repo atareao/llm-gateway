@@ -25,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Value, json};
 
-use crate::config::{Backend, GatewayConfig};
+use crate::config::{Backend, GatewayConfig, Route};
 use crate::error::AppError;
 
 /// Timeout de establecimiento de conexión hacia un backend, para que un
@@ -92,10 +92,8 @@ pub fn backend_id(backend: &Backend) -> String {
 
 /// `POST /v1/chat/completions` (no-stream o streaming SSE).
 ///
-/// Resuelve la ruta lógica a partir del campo `model` y recorre sus backends en
-/// orden hasta obtener una respuesta válida, reescribiendo `model` con el del
-/// backend elegido y reenviando el resto del cuerpo verbatim. Si el cuerpo trae
-/// `stream: true`, la respuesta del upstream se reenvía sin bufferizar.
+/// Resuelve la ruta lógica a partir del campo `model` y delega el enrutado (con
+/// failover) en [`route_with_failover`].
 async fn chat_completions(
     State(state): State<AppState>,
     Json(body): Json<Value>,
@@ -113,12 +111,40 @@ async fn chat_completions(
 
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
+    route_with_failover(&state, route, &body, streaming).await
+}
+
+/// Recorre la cadena de backends de `route` en orden hasta obtener una
+/// respuesta válida (**failover antes del primer byte**): reintenta en error de
+/// conexión, timeout, `429` o `5xx`; un `4xx` distinto de `429` se devuelve tal
+/// cual. Un backend cuya `api_key_env` no resuelve se salta como si fallara.
+///
+/// En modo `streaming`, al primer backend OK se devuelve su stream sin
+/// consumir; a partir de ahí ya no hay failover.
+async fn route_with_failover(
+    state: &AppState,
+    route: &Route,
+    body: &Value,
+    streaming: bool,
+) -> Result<Response, AppError> {
     let mut attempts = 0usize;
     for backend in &route.backend {
         attempts += 1;
 
-        let payload = body_for_backend(&body, backend);
-        match send(&state.client, backend, payload, streaming).await {
+        let Some(api_key) = resolve_api_key(backend) else {
+            continue;
+        };
+
+        let payload = body_for_backend(body, backend);
+        match send(
+            &state.client,
+            backend,
+            payload,
+            streaming,
+            api_key.as_deref(),
+        )
+        .await
+        {
             Ok(response) if is_retryable(response.status()) => {
                 tracing::warn!(
                     backend = %backend_id(backend),
@@ -152,9 +178,35 @@ async fn chat_completions(
     }
 
     Err(AppError::AllBackendsFailed {
-        model: model.to_owned(),
+        model: route.name.clone(),
         attempts,
     })
+}
+
+/// Resuelve la API key del backend, si procede.
+///
+/// - `api_key_env = None` → `Some(None)` (backend local, sin cabecera).
+/// - `api_key_env = Some(var)` con la variable definida y no vacía → `Some(Some(key))`.
+/// - `api_key_env = Some(var)` sin definir (o vacía) → `None`: el backend se
+///   considera no disponible y se salta al siguiente.
+///
+/// Nunca registra el valor de la clave; solo, si acaso, el nombre de la
+/// variable y el identificador del backend.
+fn resolve_api_key(backend: &Backend) -> Option<Option<String>> {
+    match backend.api_key_env.as_deref() {
+        None => Some(None),
+        Some(var) => match std::env::var(var) {
+            Ok(value) if !value.is_empty() => Some(Some(value)),
+            _ => {
+                tracing::warn!(
+                    backend = %backend_id(backend),
+                    env_var = %var,
+                    "api_key_env sin resolver; se salta el backend"
+                );
+                None
+            }
+        },
+    }
 }
 
 /// Indica si un status del upstream permite reintentar con otro backend
@@ -165,7 +217,7 @@ fn is_retryable(status: StatusCode) -> bool {
 
 /// Envía la petición al backend y devuelve la respuesta con las cabeceras ya
 /// disponibles, **sin** consumir el cuerpo (permite decidir el failover antes
-/// del primer byte).
+/// del primer byte). Si `api_key` es `Some`, añade `Authorization: Bearer`.
 ///
 /// El `timeout_ms` por backend se aplica solo a peticiones no-stream: en
 /// streaming, un timeout global abortaría respuestas largas legítimas.
@@ -174,8 +226,12 @@ async fn send(
     backend: &Backend,
     payload: Value,
     streaming: bool,
+    api_key: Option<&str>,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut request = client.post(chat_url(&backend.base_url)).json(&payload);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
     if !streaming && let Some(ms) = backend.timeout_ms {
         request = request.timeout(Duration::from_millis(ms));
     }

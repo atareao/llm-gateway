@@ -38,11 +38,22 @@ route:
         timeout_ms: 30000
 ```
 
+## 🔀 Enrutado y failover
+
+Cada petición trae un `model` **lógico** (nombre de ruta). El gateway lo sustituye por el `model` real del backend elegido y reenvía el resto del cuerpo verbatim. Los backends de una ruta se prueban **en orden** (primario primero).
+
+- **Failover antes del primer byte**: si un backend falla por conexión, timeout, `429` o `5xx`, se salta al siguiente. Un `4xx` distinto de `429` se devuelve tal cual, sin reintentar. Si todos fallan → `502` estilo OpenAI.
+- **Cabecera `x-gateway-backend`**: en las respuestas con éxito identifica el backend que atendió la petición, con el formato **`<base_url>#<model>`** (p. ej. `http://localhost:11434/v1#qwen2.5:7b-instruct`).
+- **Streaming**: con `"stream": true` los chunks SSE `data:` se reenvían sin bufferizar y terminan cuando el upstream cierra (típicamente `data: [DONE]`).
+- **⚠️ Limitación (corte a mitad de stream)**: una vez empezada la emisión **no hay failover**. Si el upstream se corta a mitad, el stream se cierra con error; no se reintenta porque ya se habrían enviado bytes al cliente.
+- **Secretos**: los backends con `api_key_env` leen la clave del entorno en tiempo de petición y envían `Authorization: Bearer <valor>`. Si la variable no está definida, el backend se considera no disponible y se salta. La clave **nunca** aparece en los logs.
+
 ## ▶️ Uso
 
 ```bash
 GATEWAY_CONFIG=./gateway.yaml llm-gateway
-# Escucha en http://127.0.0.1:4000/v1
+# Escucha por defecto en http://127.0.0.1:8080
+# Sobrescribe con GATEWAY_LISTEN=host:puerto
 ```
 
 En OpenCode, como proveedor:
@@ -50,7 +61,7 @@ En OpenCode, como proveedor:
 ```jsonc
 "gateway": {
   "package": "aisdk:@ai-sdk/openai-compatible",
-  "settings": { "baseURL": "http://127.0.0.1:4000/v1" },
+  "settings": { "baseURL": "http://127.0.0.1:8080/v1" },
   "models": { "mech-writer": { "capabilities": { "tools": true } } }
 }
 ```
