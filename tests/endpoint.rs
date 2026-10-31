@@ -8,6 +8,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use llm_gateway::config::GatewayConfig;
@@ -41,6 +42,18 @@ async fn spawn_canned_backend(canned: Value) -> String {
     spawn(app).await
 }
 
+/// Backend simulado que responde siempre con un `status` y un JSON fijos.
+async fn spawn_status_backend(status: StatusCode, body: Value) -> String {
+    async fn reply(State((status, body)): State<(StatusCode, Arc<Value>)>) -> Response {
+        (status, axum::Json((*body).clone())).into_response()
+    }
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(reply))
+        .with_state((status, Arc::new(body)));
+    spawn(app).await
+}
+
 async fn spawn(app: Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -66,10 +79,7 @@ route:
     );
     let config: GatewayConfig = serde_saphyr::from_str(&yaml).expect("config de test válida");
 
-    let state = AppState {
-        config: Arc::new(config),
-        client: reqwest::Client::new(),
-    };
+    let state = AppState::new(config).expect("construir AppState");
     let app = router(state);
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -150,6 +160,75 @@ async fn unknown_model_returns_404_model_not_found() {
             .is_some_and(|m| m.contains("foo")),
         "el mensaje debe mencionar el modelo pedido: {body}"
     );
+}
+
+/// `model` ausente → `400` `invalid_request_error` (no `404`).
+#[tokio::test]
+async fn missing_model_returns_400_invalid_request() {
+    let backend = spawn_echo_backend().await;
+    let gateway = spawn_gateway(&backend).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .json(&json!({"messages": []}))
+        .send()
+        .await
+        .expect("request al gateway");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let body: Value = response.json().await.expect("json de error");
+    assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| { m.contains("model") })
+    );
+}
+
+/// `model` no-string → `400` `invalid_request_error`.
+#[tokio::test]
+async fn non_string_model_returns_400_invalid_request() {
+    let backend = spawn_echo_backend().await;
+    let gateway = spawn_gateway(&backend).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .json(&json!({"model": 123, "messages": []}))
+        .send()
+        .await
+        .expect("request al gateway");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let body: Value = response.json().await.expect("json de error");
+    assert_eq!(body["error"]["type"], json!("invalid_request_error"));
+}
+
+/// Un `4xx` del upstream se propaga tal cual (status y cuerpo), sin failover.
+#[tokio::test]
+async fn upstream_4xx_is_passed_through_verbatim() {
+    let error_body = json!({
+        "error": {
+            "message": "bad request upstream",
+            "type": "invalid_request_error",
+            "code": "bad_request"
+        }
+    });
+    let backend = spawn_status_backend(StatusCode::BAD_REQUEST, error_body.clone()).await;
+    let gateway = spawn_gateway(&backend).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .json(&json!({"model": "mech-writer", "messages": []}))
+        .send()
+        .await
+        .expect("request al gateway");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let body: Value = response.json().await.expect("json de respuesta");
+    assert_eq!(body, error_body);
 }
 
 /// Scenario: Preserva `tool_calls` en la respuesta del backend.

@@ -86,7 +86,7 @@ fn yaml_error(err: serde_saphyr::Error, path: &Path) -> anyhow::Error {
 fn validate(config: &GatewayConfig) -> Result<()> {
     for route in &config.route {
         if route.backend.is_empty() {
-            bail!("config: la ruta '{}' has no backends", route.name);
+            bail!("config: la ruta '{}' no tiene backends", route.name);
         }
     }
     Ok(())

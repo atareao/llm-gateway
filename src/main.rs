@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         .parse()
         .context("GATEWAY_LISTEN no es una dirección válida (host:puerto)")?;
 
-    let app = router(AppState::new(config));
+    let app = router(AppState::new(config).context("no se pudo construir el cliente HTTP")?);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("no se pudo escuchar en {addr}"))?;

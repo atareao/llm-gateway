@@ -5,8 +5,8 @@
 - [ ] 3. GREEN: parser y validador de config.
 - [x] 4. RED: test de reescritura de `model` + passthrough de campos desconocidos (no-stream).
 - [x] 5. GREEN: handler `POST /v1/chat/completions` no-streaming + error `model_not_found`.
-- [ ] 6. RED: test de failover (primario caído → fallback; `x-gateway-backend`; todos caídos → 502).
-- [ ] 7. GREEN: lógica de failover antes del primer token.
+- [x] 6. RED: test de failover (primario caído → fallback; `x-gateway-backend`; todos caídos → 502).
+- [x] 7. GREEN: lógica de failover antes del primer token.
 - [ ] 8. RED: test de streaming SSE (chunks `data:` passthrough + `data: [DONE]`).
 - [ ] 9. GREEN: streaming.
 - [ ] 10. RED: test de passthrough de `tool_calls` en la respuesta.
