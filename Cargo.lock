@@ -612,6 +612,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

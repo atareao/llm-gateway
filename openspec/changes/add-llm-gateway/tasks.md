@@ -3,8 +3,8 @@
 - [ ] 1. Crate: dependencias (`axum`, `tokio`, `reqwest` con `stream`, `serde`, `serde_json`, `serde-saphyr` # YAML (config), `tracing`, `anyhow`); `dev-deps`: `wiremock` o servidor axum de prueba, `tokio` con `test-util`.
 - [ ] 2. RED: tests de carga y validación de `gateway.yaml` (válida / ruta sin backends / fichero ausente / YAML inválido).
 - [ ] 3. GREEN: parser y validador de config.
-- [ ] 4. RED: test de reescritura de `model` + passthrough de campos desconocidos (no-stream).
-- [ ] 5. GREEN: handler `POST /v1/chat/completions` no-streaming + error `model_not_found`.
+- [x] 4. RED: test de reescritura de `model` + passthrough de campos desconocidos (no-stream).
+- [x] 5. GREEN: handler `POST /v1/chat/completions` no-streaming + error `model_not_found`.
 - [ ] 6. RED: test de failover (primario caído → fallback; `x-gateway-backend`; todos caídos → 502).
 - [ ] 7. GREEN: lógica de failover antes del primer token.
 - [ ] 8. RED: test de streaming SSE (chunks `data:` passthrough + `data: [DONE]`).
