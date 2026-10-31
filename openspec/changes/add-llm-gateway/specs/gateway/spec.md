@@ -94,6 +94,7 @@ Ante fallo de conexión, timeout, `429` o `5xx` **antes de emitir el primer byte
 - **WHEN** llega la petición
 - **THEN** intenta el primario, falla, y responde desde el fallback
 - **AND** la respuesta incluye la cabecera `x-gateway-backend` con el fallback usado
+  (formato `<base_url>#<model>`, p. ej. `http://localhost:11434/v1#qwen2.5:7b-instruct`)
 
 #### Scenario: Primario OK
 - **GIVEN** que el primario responde `200`
