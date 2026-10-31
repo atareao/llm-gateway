@@ -1,0 +1,21 @@
+# Tasks — add-llm-gateway (TDD)
+
+- [ ] 1. Crate: dependencias (`axum`, `tokio`, `reqwest` con `stream`, `serde`, `serde_json`, `toml`, `tracing`, `anyhow`); `dev-deps`: `wiremock` o servidor axum de prueba, `tokio` con `test-util`.
+- [ ] 2. RED: tests de carga y validación de `gateway.toml` (válida / ruta sin backends / fichero ausente).
+- [ ] 3. GREEN: parser y validador de config.
+- [ ] 4. RED: test de reescritura de `model` + passthrough de campos desconocidos (no-stream).
+- [ ] 5. GREEN: handler `POST /v1/chat/completions` no-streaming + error `model_not_found`.
+- [ ] 6. RED: test de failover (primario caído → fallback; `x-gateway-backend`; todos caídos → 502).
+- [ ] 7. GREEN: lógica de failover antes del primer token.
+- [ ] 8. RED: test de streaming SSE (chunks `data:` passthrough + `data: [DONE]`).
+- [ ] 9. GREEN: streaming.
+- [ ] 10. RED: test de passthrough de `tool_calls` en la respuesta.
+- [ ] 11. GREEN: passthrough de tool_calls.
+- [ ] 12. RED: tests de `/v1/models` y `/healthz`.
+- [ ] 13. GREEN: endpoints auxiliares.
+- [ ] 14. RED: test de secretos por entorno (cabecera añadida; ausente → backend saltado).
+- [ ] 15. GREEN: resolución de `api_key_env`.
+- [ ] 16. Integración: backends simulados (mock) cubriendo los escenarios de failover y stream.
+- [ ] 17. REFACTOR: `cargo fmt --check` y `cargo clippy -- -D warnings` sin warnings.
+- [ ] 18. Docs: `README.md` + `gateway.toml.example` + ejemplos de uso con OpenCode.
+- [ ] 19. Verificación manual end-to-end con Ollama real (primario) y OpenRouter (fallback).
