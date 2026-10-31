@@ -12,7 +12,7 @@ Escrito en **Rust** (axum + tokio + reqwest). Pensado para que [OpenCode](https:
 | 🧩 **OpenAI-compatible** | `POST /v1/chat/completions` (stream y no-stream), `GET /v1/models`, `GET /healthz` |
 | 🛠️ **Tools** | Paso transparente de `tools`, `tool_choice` y `tool_calls` |
 | 📡 **Streaming SSE** | Reenvío sin bufferizar de los chunks `data:` |
-| 🔑 **Secretos por entorno** | Las claves se referencian con `api_key_env`; nunca en el TOML ni en los logs |
+| 🔑 **Secretos por entorno** | Las claves se referencian con `api_key_env`; nunca en el YAML ni en los logs |
 
 ## 🚧 Estado
 
@@ -24,27 +24,24 @@ En desarrollo (SDD/OpenSpec). El diseño y los escenarios viven en [`openspec/ch
 cargo build --release
 ```
 
-## ⚙️ Configuración (`gateway.toml`)
+## ⚙️ Configuración (`gateway.yaml`)
 
-```toml
-[[route]]
-name = "mech-writer"
-
-[[route.backend]]
-base_url = "http://localhost:11434/v1"
-model    = "qwen2.5:7b-instruct"
-
-[[route.backend]]
-base_url    = "https://openrouter.ai/api/v1"
-model       = "qwen/qwen3-8b"
-api_key_env = "OPENROUTER_API_KEY"
-timeout_ms  = 30000
+```yaml
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://localhost:11434/v1"
+        model: "qwen2.5:7b-instruct"
+      - base_url: "https://openrouter.ai/api/v1"
+        model: "qwen/qwen3-8b"
+        api_key_env: "OPENROUTER_API_KEY"
+        timeout_ms: 30000
 ```
 
 ## ▶️ Uso
 
 ```bash
-GATEWAY_CONFIG=./gateway.toml llm-gateway
+GATEWAY_CONFIG=./gateway.yaml llm-gateway
 # Escucha en http://127.0.0.1:4000/v1
 ```
 

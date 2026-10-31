@@ -6,9 +6,9 @@ Proxy local compatible con la API de OpenAI que enruta cada petición a una cade
 
 ## ADDED Requirements
 
-### Requirement: Configuración de rutas por TOML
+### Requirement: Configuración de rutas por YAML
 
-El gateway se configura con un fichero TOML que define una lista de rutas; cada ruta tiene un `name` (nombre lógico que pide el cliente) y una lista **ordenada** `backend` (primario primero, respaldos después).
+El gateway se configura con un fichero YAML (por defecto `gateway.yaml`, o la ruta indicada por la variable de entorno `GATEWAY_CONFIG`) que define una lista de rutas; cada ruta tiene un `name` (nombre lógico que pide el cliente) y una lista **ordenada** `backend` (primario primero, respaldos después). El parseo se hace con `serde-saphyr`.
 
 - `pub struct GatewayConfig { pub route: Vec<Route> }`
 - `pub struct Route { pub name: String, pub backend: Vec<Backend> }`
@@ -17,12 +17,12 @@ El gateway se configura con un fichero TOML que define una lista de rutas; cada 
 **Scenarios:**
 
 #### Scenario: Config válida
-- **GIVEN** un `gateway.toml` con una ruta `mech-writer` y dos backends
+- **GIVEN** un `gateway.yaml` con una ruta `mech-writer` y dos backends
 - **WHEN** se carga la config
 - **THEN** la ruta existe con 2 backends en orden
 
 #### Scenario: Ruta sin backends
-- **GIVEN** una ruta con `backend = []`
+- **GIVEN** una ruta con `backend: []`
 - **WHEN** se valida
 - **THEN** error de configuración indicando el nombre de la ruta
 
@@ -30,6 +30,11 @@ El gateway se configura con un fichero TOML que define una lista de rutas; cada 
 - **GIVEN** que `GATEWAY_CONFIG` apunta a un fichero inexistente
 - **WHEN** arranca
 - **THEN** el proceso aborta con un error claro
+
+#### Scenario: YAML inválido
+- **GIVEN** un `gateway.yaml` con sintaxis YAML incorrecta
+- **WHEN** se carga
+- **THEN** el proceso aborta con un error que incluye la línea y la columna del problema
 
 ### Requirement: Endpoint compatible con OpenAI
 

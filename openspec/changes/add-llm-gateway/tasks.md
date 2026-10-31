@@ -1,7 +1,7 @@
 # Tasks — add-llm-gateway (TDD)
 
-- [ ] 1. Crate: dependencias (`axum`, `tokio`, `reqwest` con `stream`, `serde`, `serde_json`, `toml`, `tracing`, `anyhow`); `dev-deps`: `wiremock` o servidor axum de prueba, `tokio` con `test-util`.
-- [ ] 2. RED: tests de carga y validación de `gateway.toml` (válida / ruta sin backends / fichero ausente).
+- [ ] 1. Crate: dependencias (`axum`, `tokio`, `reqwest` con `stream`, `serde`, `serde_json`, `serde-saphyr` # YAML (config), `tracing`, `anyhow`); `dev-deps`: `wiremock` o servidor axum de prueba, `tokio` con `test-util`.
+- [ ] 2. RED: tests de carga y validación de `gateway.yaml` (válida / ruta sin backends / fichero ausente / YAML inválido).
 - [ ] 3. GREEN: parser y validador de config.
 - [ ] 4. RED: test de reescritura de `model` + passthrough de campos desconocidos (no-stream).
 - [ ] 5. GREEN: handler `POST /v1/chat/completions` no-streaming + error `model_not_found`.
@@ -17,5 +17,5 @@
 - [ ] 15. GREEN: resolución de `api_key_env`.
 - [ ] 16. Integración: backends simulados (mock) cubriendo los escenarios de failover y stream.
 - [ ] 17. REFACTOR: `cargo fmt --check` y `cargo clippy -- -D warnings` sin warnings.
-- [ ] 18. Docs: `README.md` + `gateway.toml.example` + ejemplos de uso con OpenCode.
+- [ ] 18. Docs: `README.md` + `gateway.yaml.example` + ejemplos de uso con OpenCode.
 - [ ] 19. Verificación manual end-to-end con Ollama real (primario) y OpenRouter (fallback).

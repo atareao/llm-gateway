@@ -10,7 +10,7 @@ Un proxy local **compatible con la API de OpenAI** que enruta cada petición a u
 - `POST /v1/chat/completions` (streaming SSE y no-streaming), con paso transparente del cuerpo y de los `tool_calls`.
 - Failover **antes del primer token** ante fallo de conexión, timeout, `429` o `5xx`.
 - `GET /v1/models` y `GET /healthz`.
-- Configuración por TOML (`gateway.toml`).
+- Configuración por YAML (`gateway.yaml`, vía `serde-saphyr`).
 
 **Out (explícito):**
 - Persistencia, cuotas, métricas avanzadas, UI, multi-tenant y autenticación de entrada.
@@ -23,20 +23,17 @@ Un proxy local **compatible con la API de OpenAI** que enruta cada petición a u
 
 ## Contratos
 
-- **Config**: `gateway.toml` (ruta vía env `GATEWAY_CONFIG`, por defecto `./gateway.toml`).
-- **Env**: las claves de API se referencian por `api_key_env` (nunca en el TOML).
+- **Config**: `gateway.yaml` (ruta vía env `GATEWAY_CONFIG`, por defecto `./gateway.yaml`).
+- **Env**: las claves de API se referencian por `api_key_env` (nunca en el YAML).
 
-```toml
-[[route]]
-name = "mech-writer"
-
-[[route.backend]]
-base_url    = "http://localhost:11434/v1"
-model       = "qwen2.5:7b-instruct"
-
-[[route.backend]]
-base_url    = "https://openrouter.ai/api/v1"
-model       = "qwen/qwen3-8b"
-api_key_env = "OPENROUTER_API_KEY"
-timeout_ms  = 30000
+```yaml
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://localhost:11434/v1"
+        model: "qwen2.5:7b-instruct"
+      - base_url: "https://openrouter.ai/api/v1"
+        model: "qwen/qwen3-8b"
+        api_key_env: "OPENROUTER_API_KEY"
+        timeout_ms: 30000
 ```
