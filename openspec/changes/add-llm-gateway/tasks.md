@@ -18,4 +18,4 @@
 - [x] 16. Integración: backends simulados (mock) cubriendo los escenarios de failover y stream.
 - [x] 17. REFACTOR: `cargo fmt --check` y `cargo clippy -- -D warnings` sin warnings.
 - [x] 18. Docs: `README.md` + `gateway.yaml.example` + ejemplos de uso con OpenCode.
-- [ ] 19. Verificación manual end-to-end con Ollama real (primario) y OpenRouter (fallback).
+- [x] 19. Verificación manual end-to-end con Ollama real (primario) y OpenRouter (fallback).
