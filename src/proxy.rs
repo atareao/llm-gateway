@@ -41,6 +41,30 @@ const DEFAULT_CONTENT_TYPE: &str = "application/json";
 /// `content-type` por defecto para respuestas en streaming.
 const DEFAULT_STREAM_CONTENT_TYPE: &str = "text/event-stream";
 
+/// Presupuesto por defecto de **time-to-first-byte** en streaming cuando el
+/// backend no define `timeout_ms`. Solo limita el arranque: una vez llega la
+/// primera cabecera, el stream fluye sin deadline.
+const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Fallo al contactar con un backend, antes de tener su respuesta.
+enum SendError {
+    /// Error de transporte de `reqwest` (conexión, TLS, lectura…).
+    Transport(reqwest::Error),
+    /// Venció el guard de time-to-first-byte.
+    FirstByteTimeout(Duration),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::Transport(err) => write!(f, "{err}"),
+            SendError::FirstByteTimeout(budget) => {
+                write!(f, "timeout de primer byte tras {budget:?}")
+            }
+        }
+    }
+}
+
 /// Estado compartido por los handlers: configuración de rutas y cliente HTTP
 /// reutilizable (con pool de conexiones) hacia los backends.
 #[derive(Clone)]
@@ -219,23 +243,39 @@ fn is_retryable(status: StatusCode) -> bool {
 /// disponibles, **sin** consumir el cuerpo (permite decidir el failover antes
 /// del primer byte). Si `api_key` es `Some`, añade `Authorization: Bearer`.
 ///
-/// El `timeout_ms` por backend se aplica solo a peticiones no-stream: en
-/// streaming, un timeout global abortaría respuestas largas legítimas.
+/// - **No-stream**: se aplica un `timeout` global `request.timeout(timeout_ms)`.
+/// - **Stream**: se aplica un guard de **time-to-first-byte** con
+///   `tokio::time::timeout(timeout_ms | default, request.send())`, que solo
+///   limita el arranque: en cuanto llegan las cabeceras, el cuerpo fluye sin
+///   deadline. **No** se usa un timeout global, que abortaría respuestas largas.
 async fn send(
     client: &reqwest::Client,
     backend: &Backend,
     payload: Value,
     streaming: bool,
     api_key: Option<&str>,
-) -> Result<reqwest::Response, reqwest::Error> {
+) -> Result<reqwest::Response, SendError> {
     let mut request = client.post(chat_url(&backend.base_url)).json(&payload);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
-    if !streaming && let Some(ms) = backend.timeout_ms {
-        request = request.timeout(Duration::from_millis(ms));
+
+    if streaming {
+        let budget = backend
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT);
+        match tokio::time::timeout(budget, request.send()).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(err)) => Err(SendError::Transport(err)),
+            Err(_elapsed) => Err(SendError::FirstByteTimeout(budget)),
+        }
+    } else {
+        if let Some(ms) = backend.timeout_ms {
+            request = request.timeout(Duration::from_millis(ms));
+        }
+        request.send().await.map_err(SendError::Transport)
     }
-    request.send().await
 }
 
 /// Convierte la respuesta del upstream en una respuesta no-stream (buffered).
