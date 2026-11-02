@@ -34,4 +34,4 @@
 ## 6. Git Flow
 
 - [x] 6.1 Crear `feature/add-non-stream-default-timeout` desde `development`.
-- [ ] 6.2 Commits con gitmoji + PR a `development`.
+- [x] 6.2 Commits con gitmoji + PR a `development`.
