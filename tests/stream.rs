@@ -16,6 +16,8 @@ use llm_gateway::proxy::{AppState, router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+mod common;
+
 /// Mock que emite un stream SSE por partes y termina con `data: [DONE]`.
 async fn spawn_sse_backend() -> String {
     async fn sse() -> Response {
@@ -137,16 +139,6 @@ async fn spawn(app: Router) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve mock");
     });
-    format!("http://{addr}/v1")
-}
-
-/// Puerto donde nadie escucha (conexión rechazada).
-async fn dead_backend() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener);
     format!("http://{addr}/v1")
 }
 
@@ -307,7 +299,7 @@ async fn stream_not_requested_returns_non_stream() {
 #[tokio::test]
 async fn stream_fails_over_before_first_byte() {
     let fallback = spawn_sse_backend().await;
-    let primary = dead_backend().await;
+    let primary = common::dead_backend().await;
     let gateway = spawn_gateway(&[
         (&primary, "qwen2.5:7b-instruct"),
         (&fallback, "qwen/qwen3-8b"),
