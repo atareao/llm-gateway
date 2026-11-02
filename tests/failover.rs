@@ -19,6 +19,8 @@ use llm_gateway::proxy::{AppState, backend_id, router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+mod common;
+
 /// Mock que devuelve (echo) el JSON recibido.
 async fn spawn_echo_backend() -> String {
     async fn echo(body: Bytes) -> Response {
@@ -88,16 +90,6 @@ async fn spawn(app: Router) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve mock");
     });
-    format!("http://{addr}/v1")
-}
-
-/// Devuelve una `base_url` a un puerto donde nadie escucha (conexión rechazada).
-async fn dead_backend() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener); // liberamos el puerto: nadie escuchará
     format!("http://{addr}/v1")
 }
 
@@ -208,7 +200,7 @@ async fn post_chat(gateway: &str, body: Value) -> reqwest::Response {
 async fn primary_down_fails_over_to_fallback() {
     let fallback = spawn_echo_backend().await;
     let b = Backends {
-        primary: dead_backend().await,
+        primary: common::dead_backend().await,
         primary_model: "qwen2.5:7b-instruct".to_owned(),
         fallback: fallback.clone(),
         fallback_model: "qwen/qwen3-8b".to_owned(),
@@ -258,9 +250,9 @@ async fn primary_ok_does_not_touch_fallback() {
 #[tokio::test]
 async fn all_backends_down_returns_502() {
     let b = Backends {
-        primary: dead_backend().await,
+        primary: common::dead_backend().await,
         primary_model: "qwen2.5:7b-instruct".to_owned(),
-        fallback: dead_backend().await,
+        fallback: common::dead_backend().await,
         fallback_model: "qwen/qwen3-8b".to_owned(),
     };
     let gateway = spawn_gateway(&b).await;
@@ -466,5 +458,24 @@ fn backend_id_format_is_base_url_hash_model() {
     assert_eq!(
         backend_id(&backend),
         "http://localhost:11434/v1#qwen2.5:7b-instruct"
+    );
+}
+
+/// Scenario: el puerto reservado por `dead_backend()` no puede reutilizarlo
+/// otro test, o el "primario caído" reviviría y devolvería 404.
+#[tokio::test]
+async fn dead_backend_port_is_not_reusable() {
+    let url = common::dead_backend().await;
+    let addr: std::net::SocketAddr = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .expect("host:puerto")
+        .parse()
+        .expect("dirección válida");
+
+    assert!(
+        TcpListener::bind(addr).await.is_err(),
+        "el puerto de dead_backend no debe quedar libre: {addr}"
     );
 }

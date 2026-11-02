@@ -12,6 +12,8 @@ use llm_gateway::proxy::{AppState, router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+mod common;
+
 async fn spawn_sse_backend() -> String {
     async fn sse() -> Response {
         let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
@@ -50,19 +52,10 @@ async fn spawn(app: Router) -> String {
     format!("http://{addr}/v1")
 }
 
-async fn dead_backend() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener);
-    format!("http://{addr}/v1")
-}
-
 /// Levanta el gateway real con dos rutas: `mech-writer` (primario caído +
 /// fallback OK) y `code-helper` (backend SSE).
 async fn spawn_gateway(fallback: &str, sse: &str) -> String {
-    let primary = dead_backend().await;
+    let primary = common::dead_backend().await;
     let yaml = format!(
         r#"
 route:
