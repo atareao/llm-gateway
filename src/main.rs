@@ -8,12 +8,20 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let json = std::env::var("GATEWAY_LOG_FORMAT")
+        .map(|value| value.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+
+    if json {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     let config = llm_gateway::config::load_default()?;
     tracing::info!(routes = config.route.len(), "configuración cargada");

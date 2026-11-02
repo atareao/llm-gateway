@@ -16,6 +16,8 @@ use llm_gateway::proxy::{AppState, router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+mod common;
+
 /// Genera un nombre de variable de entorno único por invocación.
 fn unique_env(prefix: &str) -> String {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -70,15 +72,6 @@ async fn spawn(app: Router) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve mock");
     });
-    format!("http://{addr}/v1")
-}
-
-async fn dead_backend() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener);
     format!("http://{addr}/v1")
 }
 
@@ -143,7 +136,11 @@ async fn missing_env_var_skips_backend_and_fails_over() {
 
     let fallback = spawn_echo_backend().await;
     let gateway = spawn_gateway(&[
-        (&dead_backend().await, "qwen2.5:7b-instruct", Some(&var)),
+        (
+            &common::dead_backend().await,
+            "qwen2.5:7b-instruct",
+            Some(&var),
+        ),
         (&fallback, "qwen/qwen3-8b", None),
     ])
     .await;

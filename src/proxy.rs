@@ -14,19 +14,23 @@
 //! reintenta, porque ya se habrían enviado bytes al cliente).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::extract::rejection::JsonRejection;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Value, json};
+use tracing::Instrument;
 
 use crate::config::{Backend, GatewayConfig, Route};
 use crate::error::AppError;
+use crate::metrics::{AttemptResult, GlobalOutcome, Metrics, Outcome};
 
 /// Timeout de establecimiento de conexión hacia un backend, para que un
 /// backend caído no deje la petición colgada antes de decidir el failover.
@@ -35,11 +39,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// Nombre de la cabecera que identifica el backend que atendió la petición.
 pub const BACKEND_HEADER: &str = "x-gateway-backend";
 
+/// Cabecera de correlación de la petición.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
 /// `content-type` por defecto para respuestas no-stream.
 const DEFAULT_CONTENT_TYPE: &str = "application/json";
 
 /// `content-type` por defecto para respuestas en streaming.
 const DEFAULT_STREAM_CONTENT_TYPE: &str = "text/event-stream";
+
+/// Presupuesto por defecto de **timeout total** para peticiones no-stream
+/// cuando el backend no define `timeout_ms`.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Presupuesto por defecto de **time-to-first-byte** en streaming cuando el
 /// backend no define `timeout_ms`. Solo limita el arranque: una vez llega la
@@ -73,6 +84,8 @@ pub struct AppState {
     pub config: Arc<GatewayConfig>,
     /// Cliente HTTP compartido hacia los backends.
     pub client: reqwest::Client,
+    /// Registro de métricas Prometheus.
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -89,9 +102,12 @@ impl AppState {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
 
+        let metrics = Arc::new(Metrics::new(&config));
+
         Ok(Self {
             config: Arc::new(config),
             client,
+            metrics,
         })
     }
 }
@@ -102,7 +118,19 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(list_models))
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics_handler))
         .with_state(state)
+}
+
+/// `GET /metrics`: exposición en formato Prometheus.
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics.render(),
+    )
 }
 
 /// Identificador determinista del backend usado, en el formato
@@ -120,22 +148,81 @@ pub fn backend_id(backend: &Backend) -> String {
 /// failover) en [`route_with_failover`].
 async fn chat_completions(
     State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> Result<Response, AppError> {
-    let model = body.get("model").and_then(Value::as_str).ok_or_else(|| {
-        AppError::InvalidRequest("el campo 'model' es obligatorio y debe ser una cadena".to_owned())
-    })?;
+    headers: HeaderMap,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Response {
+    let request_id = resolve_request_id(&headers);
+    let started = Instant::now();
 
-    let route = state
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            state.metrics.record_global(GlobalOutcome::InvalidRequest);
+            tracing::warn!(
+                request_id = %request_id,
+                error = %rejection,
+                "cuerpo de petición inválido"
+            );
+            return with_request_id(
+                AppError::InvalidRequest(rejection.body_text()).into_response(),
+                &request_id,
+            );
+        }
+    };
+
+    let Some(model) = body.get("model").and_then(Value::as_str) else {
+        state.metrics.record_global(GlobalOutcome::InvalidRequest);
+        tracing::warn!(request_id = %request_id, "petición sin 'model' válido");
+        return with_request_id(
+            AppError::InvalidRequest(
+                "el campo 'model' es obligatorio y debe ser una cadena".to_owned(),
+            )
+            .into_response(),
+            &request_id,
+        );
+    };
+
+    let Some(route_idx) = state
         .config
         .route
         .iter()
-        .find(|route| route.name == model)
-        .ok_or_else(|| AppError::ModelNotFound(model.to_owned()))?;
+        .position(|route| route.name == model)
+    else {
+        state.metrics.record_global(GlobalOutcome::ModelNotFound);
+        tracing::warn!(request_id = %request_id, model = %model, "modelo desconocido");
+        return with_request_id(
+            AppError::ModelNotFound(model.to_owned()).into_response(),
+            &request_id,
+        );
+    };
 
+    let route = &state.config.route[route_idx];
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    route_with_failover(&state, route, &body, streaming).await
+    let span = tracing::info_span!(
+        "request",
+        request_id = %request_id,
+        route = %route.name,
+        streaming
+    );
+    let result = route_with_failover(&state, route_idx, route, &body, streaming)
+        .instrument(span)
+        .await;
+
+    let elapsed = started.elapsed();
+    let outcome = if result.is_ok() {
+        Outcome::Success
+    } else {
+        Outcome::AllFailed
+    };
+    state
+        .metrics
+        .record_request(route_idx, streaming, outcome, elapsed);
+
+    match result {
+        Ok(response) => with_request_id(response, &request_id),
+        Err(err) => with_request_id(err.into_response(), &request_id),
+    }
 }
 
 /// Recorre la cadena de backends de `route` en orden hasta obtener una
@@ -147,17 +234,35 @@ async fn chat_completions(
 /// consumir; a partir de ahí ya no hay failover.
 async fn route_with_failover(
     state: &AppState,
+    route_idx: usize,
     route: &Route,
     body: &Value,
     streaming: bool,
 ) -> Result<Response, AppError> {
+    let started = Instant::now();
     let mut attempts = 0usize;
-    for backend in &route.backend {
-        attempts += 1;
+    let mut considered = 0usize;
+
+    for (backend_idx, backend) in route.backend.iter().enumerate() {
+        considered += 1;
+        let attempt_started = Instant::now();
 
         let Some(api_key) = resolve_api_key(backend) else {
+            state.metrics.record_attempt(
+                route_idx,
+                backend_idx,
+                AttemptResult::MissingApiKey,
+                attempt_started.elapsed(),
+            );
+            tracing::warn!(
+                backend = %backend_id(backend),
+                result = AttemptResult::MissingApiKey.label(),
+                latency_ms = attempt_started.elapsed().as_millis() as u64,
+                "backend sin api_key; probando el siguiente"
+            );
             continue;
         };
+        attempts += 1;
 
         let payload = body_for_backend(body, backend);
         match send(
@@ -170,40 +275,124 @@ async fn route_with_failover(
         .await
         {
             Ok(response) if is_retryable(response.status()) => {
+                state.metrics.record_attempt(
+                    route_idx,
+                    backend_idx,
+                    AttemptResult::RetryableStatus,
+                    attempt_started.elapsed(),
+                );
                 tracing::warn!(
                     backend = %backend_id(backend),
                     status = %response.status(),
+                    result = AttemptResult::RetryableStatus.label(),
+                    latency_ms = attempt_started.elapsed().as_millis() as u64,
                     "backend retornó un status reintentable; probando el siguiente"
                 );
             }
             Ok(response) => {
                 if streaming {
-                    // A partir de aquí ya se emiten bytes: sin failover.
+                    state.metrics.record_attempt(
+                        route_idx,
+                        backend_idx,
+                        AttemptResult::Success,
+                        attempt_started.elapsed(),
+                    );
+                    tracing::debug!(
+                        backend = %backend_id(backend),
+                        result = AttemptResult::Success.label(),
+                        latency_ms = attempt_started.elapsed().as_millis() as u64,
+                        "intento completado"
+                    );
+                    if attempts > 1 {
+                        state.metrics.record_failover(route_idx);
+                    }
+                    tracing::info!(
+                        outcome = Outcome::Success.label(),
+                        attempts,
+                        latency_ms = started.elapsed().as_millis() as u64,
+                        "petición completada"
+                    );
                     return Ok(stream_response(response, backend));
                 }
 
                 match full_response(response, backend).await {
-                    Ok(response) => return Ok(response),
-                    Err(err) => tracing::warn!(
-                        backend = %backend_id(backend),
-                        error = %err,
-                        "error leyendo la respuesta del backend; probando el siguiente"
-                    ),
+                    Ok(response) => {
+                        state.metrics.record_attempt(
+                            route_idx,
+                            backend_idx,
+                            AttemptResult::Success,
+                            attempt_started.elapsed(),
+                        );
+                        tracing::debug!(
+                            backend = %backend_id(backend),
+                            result = AttemptResult::Success.label(),
+                            latency_ms = attempt_started.elapsed().as_millis() as u64,
+                            "intento completado"
+                        );
+                        if attempts > 1 {
+                            state.metrics.record_failover(route_idx);
+                        }
+                        tracing::info!(
+                            outcome = Outcome::Success.label(),
+                            attempts,
+                            latency_ms = started.elapsed().as_millis() as u64,
+                            "petición completada"
+                        );
+                        return Ok(response);
+                    }
+                    Err(err) => {
+                        state.metrics.record_attempt(
+                            route_idx,
+                            backend_idx,
+                            AttemptResult::BodyError,
+                            attempt_started.elapsed(),
+                        );
+                        tracing::warn!(
+                            backend = %backend_id(backend),
+                            result = AttemptResult::BodyError.label(),
+                            error = %err,
+                            latency_ms = attempt_started.elapsed().as_millis() as u64,
+                            "error leyendo la respuesta del backend; probando el siguiente"
+                        );
+                    }
                 }
             }
             Err(err) => {
+                let result = match err {
+                    SendError::Transport(_) => AttemptResult::TransportError,
+                    SendError::FirstByteTimeout(_) => AttemptResult::FirstByteTimeout,
+                };
+                state.metrics.record_attempt(
+                    route_idx,
+                    backend_idx,
+                    result,
+                    attempt_started.elapsed(),
+                );
                 tracing::warn!(
                     backend = %backend_id(backend),
+                    result = result.label(),
                     error = %err,
+                    latency_ms = attempt_started.elapsed().as_millis() as u64,
                     "backend inalcanzable; probando el siguiente"
                 );
             }
         }
     }
 
+    if attempts > 1 {
+        state.metrics.record_failover(route_idx);
+    }
+    tracing::warn!(
+        outcome = Outcome::AllFailed.label(),
+        attempts,
+        considered,
+        latency_ms = started.elapsed().as_millis() as u64,
+        "petición fallida"
+    );
+
     Err(AppError::AllBackendsFailed {
         model: route.name.clone(),
-        attempts,
+        attempts: considered,
     })
 }
 
@@ -243,7 +432,10 @@ fn is_retryable(status: StatusCode) -> bool {
 /// disponibles, **sin** consumir el cuerpo (permite decidir el failover antes
 /// del primer byte). Si `api_key` es `Some`, añade `Authorization: Bearer`.
 ///
-/// - **No-stream**: se aplica un `timeout` global `request.timeout(timeout_ms)`.
+/// - **No-stream**: se aplica **siempre** un timeout total (`request.timeout(budget)`),
+///   con `budget = timeout_ms` si el backend lo define, o [`DEFAULT_REQUEST_TIMEOUT`]
+///   (120 s) en caso contrario. Así una petición no-stream colgada nunca deja la
+///   conexión abierta indefinidamente.
 /// - **Stream**: se aplica un guard de **time-to-first-byte** con
 ///   `tokio::time::timeout(timeout_ms | default, request.send())`, que solo
 ///   limita el arranque: en cuanto llegan las cabeceras, el cuerpo fluye sin
@@ -271,9 +463,11 @@ async fn send(
             Err(_elapsed) => Err(SendError::FirstByteTimeout(budget)),
         }
     } else {
-        if let Some(ms) = backend.timeout_ms {
-            request = request.timeout(Duration::from_millis(ms));
-        }
+        let budget = backend
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+        request = request.timeout(budget);
         request.send().await.map_err(SendError::Transport)
     }
 }
@@ -355,6 +549,40 @@ fn body_for_backend(body: &Value, backend: &Backend) -> Value {
 /// (que ya incluye `/v1`), uniendo bien las barras.
 fn chat_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+/// Devuelve el `x-request-id` del cliente si es válido, o genera uno.
+///
+/// Se acepta un valor ASCII visible de 1 a 128 bytes; cualquier otra cosa se
+/// descarta para no propagar cabeceras malformadas ni valores arbitrariamente
+/// largos a los logs.
+fn resolve_request_id(headers: &HeaderMap) -> String {
+    if let Some(value) = headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        && !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return value.to_owned();
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "req-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Añade `x-request-id` a la respuesta.
+fn with_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+    response
 }
 
 /// `GET /v1/models`: lista los nombres lógicos de ruta como modelos.

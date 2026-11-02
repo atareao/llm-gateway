@@ -16,6 +16,8 @@ use llm_gateway::proxy::{AppState, router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+mod common;
+
 /// Mock que emite un stream SSE por partes y termina con `data: [DONE]`.
 async fn spawn_sse_backend() -> String {
     async fn sse() -> Response {
@@ -137,16 +139,6 @@ async fn spawn(app: Router) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve mock");
     });
-    format!("http://{addr}/v1")
-}
-
-/// Puerto donde nadie escucha (conexión rechazada).
-async fn dead_backend() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener);
     format!("http://{addr}/v1")
 }
 
@@ -307,7 +299,7 @@ async fn stream_not_requested_returns_non_stream() {
 #[tokio::test]
 async fn stream_fails_over_before_first_byte() {
     let fallback = spawn_sse_backend().await;
-    let primary = dead_backend().await;
+    let primary = common::dead_backend().await;
     let gateway = spawn_gateway(&[
         (&primary, "qwen2.5:7b-instruct"),
         (&fallback, "qwen/qwen3-8b"),
@@ -361,6 +353,44 @@ async fn slow_first_byte_fails_over_to_fallback() {
             .and_then(|v| v.to_str().ok()),
         Some(format!("{fallback}#qwen/qwen3-8b").as_str()),
         "debe responder el fallback tras vencer el time-to-first-byte del primario"
+    );
+
+    let body = response.text().await.expect("cuerpo del stream");
+    assert!(body.contains("data: [DONE]"));
+}
+
+/// Scenario: el primario no declara `timeout_ms` y tarda más que el
+/// `DEFAULT_FIRST_BYTE_TIMEOUT` (5 s) en emitir el primer byte → el guard de
+/// *time-to-first-byte* por defecto lo da por fallido y responde el fallback.
+#[tokio::test(start_paused = true)]
+async fn stream_without_timeout_ms_slow_first_byte_fails_over() {
+    let primary = spawn_slow_sse_backend(Duration::from_secs(7)).await;
+    let fallback = spawn_sse_backend().await;
+    let gateway = spawn_gateway_with_timeout(&[
+        (&primary, "qwen2.5:7b-instruct", None),
+        (&fallback, "qwen/qwen3-8b", None),
+    ])
+    .await;
+
+    let handle = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{gateway}/v1/chat/completions"))
+            .json(&json!({"model": "mech-writer", "stream": true, "messages": []}))
+            .send()
+            .await
+            .expect("request al gateway")
+    });
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let response = handle.await.expect("join del request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-gateway-backend")
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("{fallback}#qwen/qwen3-8b").as_str()),
+        "debe responder el fallback tras vencer el time-to-first-byte por defecto"
     );
 
     let body = response.text().await.expect("cuerpo del stream");
