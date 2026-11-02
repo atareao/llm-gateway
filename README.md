@@ -13,6 +13,7 @@ Escrito en **Rust** (axum + tokio + reqwest). Pensado para que [OpenCode](https:
 | 🛠️ **Tools** | Paso transparente de `tools`, `tool_choice` y `tool_calls` |
 | 📡 **Streaming SSE** | Reenvío sin bufferizar de los chunks `data:` |
 | 🔑 **Secretos por entorno** | Las claves se referencian con `api_key_env`; nunca en el YAML ni en los logs |
+| 📊 **Observabilidad** | `/metrics` en formato Prometheus, logs correlacionados por `x-request-id` y salida JSON opcional |
 
 ## 🚧 Estado
 
@@ -53,6 +54,53 @@ Cada petición trae un `model` **lógico** (nombre de ruta). El gateway lo susti
 - **Streaming**: con `"stream": true` los chunks SSE `data:` se reenvían sin bufferizar y terminan cuando el upstream cierra (típicamente `data: [DONE]`).
 - **⚠️ Limitación (corte a mitad de stream)**: una vez empezada la emisión **no hay failover**. Si el upstream se corta a mitad, el stream se cierra con error; no se reintenta porque ya se habrían enviado bytes al cliente.
 - **Secretos**: los backends con `api_key_env` leen la clave del entorno en tiempo de petición y envían `Authorization: Bearer <valor>`. Si la variable no está definida, el backend se considera no disponible y se salta. La clave **nunca** aparece en los logs.
+
+## 📊 Observabilidad
+
+### Métricas Prometheus
+
+`GET /metrics` expone el estado del gateway en formato de exposición de Prometheus
+(`text/plain; version=0.0.4`). No requiere autenticación: el gateway escucha en
+loopback por defecto.
+
+| Métrica | Tipo | Etiquetas |
+|---|---|---|
+| `llm_gateway_requests_total` | counter | `route`, `streaming`, `outcome` (`success`, `all_failed`) |
+| `llm_gateway_request_duration_seconds` | histogram | `route`, `streaming` |
+| `llm_gateway_failover_total` | counter | `route` |
+| `llm_gateway_backend_attempts_total` | counter | `route`, `backend`, `result` |
+| `llm_gateway_backend_duration_seconds` | histogram | `route`, `backend` |
+| `llm_gateway_errors_total` | counter | `kind` (`invalid_request`, `model_not_found`) |
+
+`result` vale `success`, `retryable_status`, `transport_error`,
+`first_byte_timeout`, `missing_api_key` o `body_error`. Los histogramas usan los
+buckets `0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120` segundos y `+Inf`.
+
+En streaming, los histogramas de duración miden el **tiempo hasta la primera
+cabecera** (TTFB), no la duración total del stream: el gateway deja de medir en
+cuanto el upstream entrega las cabeceras.
+
+La cardinalidad está acotada por la configuración: solo se etiqueta con rutas y
+backends del YAML, nunca con el `model` que pide el cliente.
+
+```bash
+curl -s localhost:8080/metrics | grep llm_gateway_failover_total
+```
+
+### Correlación de logs
+
+Cada petición a `/v1/chat/completions` devuelve `x-request-id`. Si el cliente
+envía uno válido (ASCII visible, 1–128 bytes) se reutiliza; si no, se genera
+`req-<pid>-<contador>`. Todos los eventos de esa petición llevan el mismo
+`request_id`, junto con `route`, `streaming`, `outcome`, `attempts` y
+`latency_ms`; cada intento añade `backend`, `result` y su `latency_ms`.
+
+### Formato de logs
+
+```bash
+GATEWAY_LOG_FORMAT=json llm-gateway   # una línea JSON por evento
+RUST_LOG=debug llm-gateway            # incluye los intentos con éxito
+```
 
 ## ▶️ Uso
 
