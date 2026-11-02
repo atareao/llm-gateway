@@ -38,11 +38,17 @@ route:
         timeout_ms: 30000
 ```
 
+> `timeout_ms` es **opcional** por backend. En no-stream es el **timeout total** de
+> la petición; en streaming limita el **primer byte**. Si se omite, se usa el
+> default correspondiente (ver más abajo).
+
 ## 🔀 Enrutado y failover
 
 Cada petición trae un `model` **lógico** (nombre de ruta). El gateway lo sustituye por el `model` real del backend elegido y reenvía el resto del cuerpo verbatim. Los backends de una ruta se prueban **en orden** (primario primero).
 
 - **Failover antes del primer byte**: si un backend falla por conexión, timeout, `429` o `5xx`, se salta al siguiente. Un `4xx` distinto de `429` se devuelve tal cual, sin reintentar. Si todos fallan → `502` estilo OpenAI.
+- **Timeout (no-stream)**: se aplica **siempre** un timeout total. Prioridad: `timeout_ms` del backend si está definido; en caso contrario, el default **120 s** (`DEFAULT_REQUEST_TIMEOUT`). Así una respuesta no-stream colgada nunca deja la petición abierta indefinidamente.
+- **Timeout (streaming)**: el `timeout_ms` (o el default de **primer byte**, 5 s) solo limita el arranque. Una vez llegan las cabeceras, el cuerpo SSE fluye sin deadline, para no abortar respuestas largas.
 - **Cabecera `x-gateway-backend`**: en las respuestas con éxito identifica el backend que atendió la petición, con el formato **`<base_url>#<model>`** (p. ej. `http://localhost:11434/v1#qwen2.5:7b-instruct`).
 - **Streaming**: con `"stream": true` los chunks SSE `data:` se reenvían sin bufferizar y terminan cuando el upstream cierra (típicamente `data: [DONE]`).
 - **⚠️ Limitación (corte a mitad de stream)**: una vez empezada la emisión **no hay failover**. Si el upstream se corta a mitad, el stream se cierra con error; no se reintenta porque ya se habrían enviado bytes al cliente.

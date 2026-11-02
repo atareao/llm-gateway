@@ -5,11 +5,13 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::Router;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use llm_gateway::config::GatewayConfig;
@@ -38,6 +40,33 @@ async fn spawn_counting_backend() -> (String, Arc<AtomicUsize>) {
         .route("/v1/chat/completions", post(reply))
         .with_state(Arc::clone(&counter));
     (spawn(app).await, counter)
+}
+
+/// Mock que acepta la conexión pero **nunca responde** (se queda colgado hasta
+/// que el gateway aplica su timeout).
+async fn spawn_hang_backend() -> String {
+    async fn hang() -> Response {
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+    let app = Router::new().route("/v1/chat/completions", post(hang));
+    spawn(app).await
+}
+
+/// Mock que responde `200` con cabeceras `application/json` pero un cuerpo que
+/// **nunca** produce datos: el cliente recibe las cabeceras y se queda esperando
+/// el cuerpo indefinidamente (hasta que actúe el timeout).
+async fn spawn_hang_body_backend() -> String {
+    async fn hang_body() -> Response {
+        let stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(stream))
+            .expect("respuesta")
+    }
+    let app = Router::new().route("/v1/chat/completions", post(hang_body));
+    spawn(app).await
 }
 
 /// Mock que responde siempre con un `status` y cuerpo fijos.
@@ -94,6 +123,54 @@ route:
         b.primary, b.primary_model, b.fallback, b.fallback_model
     );
     let config: GatewayConfig = serde_saphyr::from_str(&yaml).expect("config de test válida");
+    let state = AppState::new(config).expect("construir AppState");
+    let app = router(state);
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve gateway");
+    });
+    format!("http://{addr}")
+}
+
+/// Levanta el gateway con una ruta de un único backend (sin fallback).
+async fn spawn_gateway_single(base_url: &str, model: &str) -> String {
+    spawn_gateway_from_yaml(&format!(
+        r#"
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "{base_url}"
+        model: "{model}"
+"#
+    ))
+    .await
+}
+
+/// Levanta el gateway con primario y fallback, aplicando `timeout_ms` al primario.
+async fn spawn_gateway_with_primary_timeout(b: &Backends, timeout_ms: u64) -> String {
+    spawn_gateway_from_yaml(&format!(
+        r#"
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "{}"
+        model: "{}"
+        timeout_ms: {timeout_ms}
+      - base_url: "{}"
+        model: "{}"
+"#,
+        b.primary, b.primary_model, b.fallback, b.fallback_model
+    ))
+    .await
+}
+
+/// Arranca un gateway a partir de un YAML de configuración dado.
+async fn spawn_gateway_from_yaml(yaml: &str) -> String {
+    let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
     let state = AppState::new(config).expect("construir AppState");
     let app = router(state);
 
@@ -271,6 +348,109 @@ async fn primary_400_does_not_fail_over() {
         counter.load(Ordering::SeqCst),
         0,
         "un 400 no debe provocar failover"
+    );
+}
+
+/// Scenario: en no-stream, el primario acepta la conexión pero nunca responde.
+/// Sin `timeout_ms`, se aplica el timeout total por defecto (120 s); el reloj se
+/// virtualiza con `start_paused` y `advance` para no esperar tiempo real. Al
+/// vencer, hay failover y responde el fallback.
+#[tokio::test(start_paused = true)]
+async fn no_stream_hanging_primary_applies_default_timeout_and_fails_over() {
+    let primary = spawn_hang_backend().await;
+    let fallback = spawn_echo_backend().await;
+    let b = Backends {
+        primary,
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback: fallback.clone(),
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway(&b).await;
+
+    let handle = tokio::spawn(async move {
+        post_chat(&gateway, json!({"model": "mech-writer", "messages": []})).await
+    });
+    tokio::time::advance(Duration::from_secs(121)).await;
+    let response = handle.await.expect("join del request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend_header(&response),
+        format!("{fallback}#qwen/qwen3-8b")
+    );
+}
+
+/// Scenario: en no-stream, ruta con un único backend sin `timeout_ms` que nunca
+/// responde → el timeout por defecto se aplica y se devuelve `502` (no cuelga).
+#[tokio::test(start_paused = true)]
+async fn no_stream_single_hanging_backend_applies_default_timeout_and_502() {
+    let gateway = spawn_gateway_single(&spawn_hang_backend().await, "qwen2.5:7b-instruct").await;
+
+    let handle = tokio::spawn(async move {
+        post_chat(&gateway, json!({"model": "mech-writer", "messages": []})).await
+    });
+    tokio::time::advance(Duration::from_secs(121)).await;
+    let response = handle.await.expect("join del request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let body: Value = response.json().await.expect("json de error");
+    assert_eq!(body["error"]["type"], json!("api_error"));
+}
+
+/// Scenario: en no-stream, el primario entrega cabeceras pero nunca el cuerpo,
+/// y no define `timeout_ms`. El timeout total por defecto (120 s) se aplica al
+/// ciclo completo de la petición, dispara el failover y responde el fallback.
+#[tokio::test(start_paused = true)]
+async fn no_stream_hanging_body_applies_default_timeout_and_fails_over() {
+    let primary = spawn_hang_body_backend().await;
+    let fallback = spawn_echo_backend().await;
+    let b = Backends {
+        primary,
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback: fallback.clone(),
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway(&b).await;
+
+    let handle = tokio::spawn(async move {
+        post_chat(&gateway, json!({"model": "mech-writer", "messages": []})).await
+    });
+    tokio::time::advance(Duration::from_secs(121)).await;
+    let response = handle.await.expect("join del request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend_header(&response),
+        format!("{fallback}#qwen/qwen3-8b")
+    );
+}
+
+/// Scenario: en no-stream con `timeout_ms` explícito corto, se respeta ese valor
+/// en vez del default de 120 s (el primario colgado da paso al fallback).
+#[tokio::test(start_paused = true)]
+async fn no_stream_explicit_short_timeout_is_respected() {
+    let primary = spawn_hang_backend().await;
+    let fallback = spawn_echo_backend().await;
+    let b = Backends {
+        primary,
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback: fallback.clone(),
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway_with_primary_timeout(&b, 300).await;
+
+    let handle = tokio::spawn(async move {
+        post_chat(&gateway, json!({"model": "mech-writer", "messages": []})).await
+    });
+    // Muy por debajo del default (120 s): si se usara el default, no habría
+    // respuesta con este avance.
+    tokio::time::advance(Duration::from_millis(400)).await;
+    let response = handle.await.expect("join del request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend_header(&response),
+        format!("{fallback}#qwen/qwen3-8b")
     );
 }
 

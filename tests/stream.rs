@@ -367,6 +367,44 @@ async fn slow_first_byte_fails_over_to_fallback() {
     assert!(body.contains("data: [DONE]"));
 }
 
+/// Scenario: el primario no declara `timeout_ms` y tarda más que el
+/// `DEFAULT_FIRST_BYTE_TIMEOUT` (5 s) en emitir el primer byte → el guard de
+/// *time-to-first-byte* por defecto lo da por fallido y responde el fallback.
+#[tokio::test(start_paused = true)]
+async fn stream_without_timeout_ms_slow_first_byte_fails_over() {
+    let primary = spawn_slow_sse_backend(Duration::from_secs(7)).await;
+    let fallback = spawn_sse_backend().await;
+    let gateway = spawn_gateway_with_timeout(&[
+        (&primary, "qwen2.5:7b-instruct", None),
+        (&fallback, "qwen/qwen3-8b", None),
+    ])
+    .await;
+
+    let handle = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("{gateway}/v1/chat/completions"))
+            .json(&json!({"model": "mech-writer", "stream": true, "messages": []}))
+            .send()
+            .await
+            .expect("request al gateway")
+    });
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let response = handle.await.expect("join del request");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-gateway-backend")
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("{fallback}#qwen/qwen3-8b").as_str()),
+        "debe responder el fallback tras vencer el time-to-first-byte por defecto"
+    );
+
+    let body = response.text().await.expect("cuerpo del stream");
+    assert!(body.contains("data: [DONE]"));
+}
+
 /// Scenario: corte a mitad de stream → NO se reintenta y el stream al cliente
 /// termina con error (sin `data: [DONE]`).
 #[tokio::test]
