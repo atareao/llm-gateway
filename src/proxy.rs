@@ -41,6 +41,10 @@ const DEFAULT_CONTENT_TYPE: &str = "application/json";
 /// `content-type` por defecto para respuestas en streaming.
 const DEFAULT_STREAM_CONTENT_TYPE: &str = "text/event-stream";
 
+/// Presupuesto por defecto de **timeout total** para peticiones no-stream
+/// cuando el backend no define `timeout_ms`.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Presupuesto por defecto de **time-to-first-byte** en streaming cuando el
 /// backend no define `timeout_ms`. Solo limita el arranque: una vez llega la
 /// primera cabecera, el stream fluye sin deadline.
@@ -243,7 +247,10 @@ fn is_retryable(status: StatusCode) -> bool {
 /// disponibles, **sin** consumir el cuerpo (permite decidir el failover antes
 /// del primer byte). Si `api_key` es `Some`, añade `Authorization: Bearer`.
 ///
-/// - **No-stream**: se aplica un `timeout` global `request.timeout(timeout_ms)`.
+/// - **No-stream**: se aplica **siempre** un timeout total (`request.timeout(budget)`),
+///   con `budget = timeout_ms` si el backend lo define, o [`DEFAULT_REQUEST_TIMEOUT`]
+///   (120 s) en caso contrario. Así una petición no-stream colgada nunca deja la
+///   conexión abierta indefinidamente.
 /// - **Stream**: se aplica un guard de **time-to-first-byte** con
 ///   `tokio::time::timeout(timeout_ms | default, request.send())`, que solo
 ///   limita el arranque: en cuanto llegan las cabeceras, el cuerpo fluye sin
@@ -271,9 +278,11 @@ async fn send(
             Err(_elapsed) => Err(SendError::FirstByteTimeout(budget)),
         }
     } else {
-        if let Some(ms) = backend.timeout_ms {
-            request = request.timeout(Duration::from_millis(ms));
-        }
+        let budget = backend
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+        request = request.timeout(budget);
         request.send().await.map_err(SendError::Transport)
     }
 }
