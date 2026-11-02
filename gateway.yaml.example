@@ -6,4 +6,6 @@ route:
       - base_url: "https://openrouter.ai/api/v1"
         model: "qwen/qwen3-8b"
         api_key_env: "OPENROUTER_API_KEY"
+        # Opcional. No-stream: timeout total (default 120s si se omite).
+        # Streaming: timeout de primer byte (default 5s).
         timeout_ms: 30000
