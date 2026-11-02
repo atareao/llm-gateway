@@ -43,5 +43,5 @@
 ## 6. Git Flow
 
 - [x] 6.1 Rama `feature/add-observability` desde `development`.
-- [ ] 6.2 Commits con gitmoji + PR a `development`.
+- [x] 6.2 Commits con gitmoji + PR a `development`.
 - [ ] 6.3 `openspec archive add-observability` tras el merge.
