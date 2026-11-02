@@ -26,5 +26,5 @@
 ## 5. Git Flow
 
 - [x] 5.1 Rama `feature/fix-flaky-dead-backend-tests` desde `development`.
-- [ ] 5.2 Commits con gitmoji + PR a `development`.
+- [x] 5.2 Commits con gitmoji + PR a `development`.
 - [ ] 5.3 `openspec archive fix-flaky-dead-backend-tests` tras el merge.
