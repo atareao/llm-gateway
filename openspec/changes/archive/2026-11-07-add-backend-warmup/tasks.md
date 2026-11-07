@@ -35,4 +35,4 @@
 
 ## 5. Verificación manual
 
-- [ ] 5.1 Backend Ollama con `warmup.interval_ms` y `curl localhost:8080/metrics | grep llm_gateway_backend_warm` — pendiente: verificación con Ollama real.
+- [x] 5.1 Verificado con Ollama real (2026-11-07, `qwen3:14b`, `interval_ms: 5000`): gauge `llm_gateway_backend_warm{route="ollama-local"}=1`, `warmup_total{result="success"}=19 / failure=2`, modelo residente en `ollama ps` con `expires_at` renovado, y `requests_total` sin contaminar. Nota: el cold load de un 14B (~90s) supera `WARMUP_TIMEOUT` (30s) → los 2 primeros warmups fallan.
