@@ -38,6 +38,19 @@ pub struct Backend {
     pub api_key_env: Option<String>,
     /// Timeout de la petición en milisegundos (opcional).
     pub timeout_ms: Option<u64>,
+    /// Bloque opcional de keep-alive (warmup) para este backend.
+    pub warmup: Option<Warmup>,
+}
+
+/// Configuración de keep-alive (warmup) de un backend.
+#[derive(Debug, Deserialize)]
+pub struct Warmup {
+    /// Intervalo entre warmups, en milisegundos (debe ser mayor que 0).
+    pub interval_ms: u64,
+    /// Timeout de cada warmup, en milisegundos (opcional; si se omite se usa
+    /// [`crate::warmup::WARMUP_TIMEOUT`], 30 s). Si está presente, debe ser
+    /// mayor que 0.
+    pub timeout_ms: Option<u64>,
 }
 
 /// Carga la configuración desde `path` y la valida.
@@ -87,6 +100,26 @@ fn validate(config: &GatewayConfig) -> Result<()> {
     for route in &config.route {
         if route.backend.is_empty() {
             bail!("config: la ruta '{}' no tiene backends", route.name);
+        }
+        for backend in &route.backend {
+            if let Some(warmup) = &backend.warmup {
+                if warmup.interval_ms == 0 {
+                    bail!(
+                        "config: la ruta '{}' backend '{}#{}' tiene warmup.interval_ms = 0; debe ser mayor que 0",
+                        route.name,
+                        backend.base_url,
+                        backend.model
+                    );
+                }
+                if warmup.timeout_ms == Some(0) {
+                    bail!(
+                        "config: la ruta '{}' backend '{}#{}' tiene warmup.timeout_ms = 0; debe ser mayor que 0",
+                        route.name,
+                        backend.base_url,
+                        backend.model
+                    );
+                }
+            }
         }
     }
     Ok(())

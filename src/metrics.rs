@@ -159,6 +159,12 @@ struct BackendMetrics {
     id: String,
     attempts: [AtomicU64; 6],
     duration: Histogram,
+    /// El backend declara un bloque `warmup`.
+    warmup_enabled: bool,
+    /// Estado del último warmup: `1` si respondió `2xx`, `0` en caso contrario.
+    warm: AtomicU64,
+    /// Warmups por resultado: `[success, failure]`.
+    warmups: [AtomicU64; 2],
 }
 
 struct RouteMetrics {
@@ -195,6 +201,9 @@ impl Metrics {
                         id: backend_id(backend),
                         attempts: std::array::from_fn(|_| AtomicU64::new(0)),
                         duration: Histogram::new(),
+                        warmup_enabled: backend.warmup.is_some(),
+                        warm: AtomicU64::new(0),
+                        warmups: std::array::from_fn(|_| AtomicU64::new(0)),
                     })
                     .collect(),
             })
@@ -233,6 +242,17 @@ impl Metrics {
         {
             backend.attempts[result.index()].fetch_add(1, Ordering::Relaxed);
             backend.duration.observe(elapsed);
+        }
+    }
+
+    /// Registra el resultado de un warmup: fija el gauge `warm` a `1` (éxito)
+    /// o `0` (fallo) e incrementa el counter por resultado.
+    pub fn record_warmup(&self, route: usize, backend: usize, ok: bool) {
+        if let Some(route) = self.routes.get(route)
+            && let Some(backend) = route.backends.get(backend)
+        {
+            backend.warm.store(u64::from(ok), Ordering::Relaxed);
+            backend.warmups[usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -351,6 +371,53 @@ impl Metrics {
             );
         }
 
+        // Las familias de warmup solo existen si algún backend declara `warmup`:
+        // sin muestras, no se emiten sus directivas `# HELP`/`# TYPE`.
+        let any_warmup = self
+            .routes
+            .iter()
+            .any(|route| route.backends.iter().any(|backend| backend.warmup_enabled));
+
+        if any_warmup {
+            out.push_str("# HELP llm_gateway_backend_warm Si el último warmup del backend respondió 2xx (1) o no (0).\n");
+            out.push_str("# TYPE llm_gateway_backend_warm gauge\n");
+            for route in &self.routes {
+                for backend in &route.backends {
+                    if !backend.warmup_enabled {
+                        continue;
+                    }
+                    let value = backend.warm.load(Ordering::Relaxed);
+                    let _ = writeln!(
+                        out,
+                        "llm_gateway_backend_warm{{route=\"{}\",backend=\"{}\"}} {value}",
+                        escape(&route.name),
+                        escape(&backend.id)
+                    );
+                }
+            }
+
+            out.push_str(
+                "# HELP llm_gateway_warmup_total Warmups ejecutados por backend y resultado.\n",
+            );
+            out.push_str("# TYPE llm_gateway_warmup_total counter\n");
+            for route in &self.routes {
+                for backend in &route.backends {
+                    if !backend.warmup_enabled {
+                        continue;
+                    }
+                    for (result, index) in [("success", 0usize), ("failure", 1usize)] {
+                        let value = backend.warmups[index].load(Ordering::Relaxed);
+                        let _ = writeln!(
+                            out,
+                            "llm_gateway_warmup_total{{route=\"{}\",backend=\"{}\",result=\"{result}\"}} {value}",
+                            escape(&route.name),
+                            escape(&backend.id)
+                        );
+                    }
+                }
+            }
+        }
+
         out
     }
 }
@@ -399,6 +466,7 @@ mod tests {
                     model: "m".to_owned(),
                     api_key_env: None,
                     timeout_ms: None,
+                    warmup: None,
                 }],
             }],
         }

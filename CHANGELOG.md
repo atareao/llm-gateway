@@ -1,4 +1,14 @@
 # Changelog
+## [0.3.0] - 2026-11-07
+
+### Documentation
+
+- *(warmup)* Marcar tarea 5.1 verificada con Ollama real (#9)
+
+### Features
+
+- *(warmup)* Keep-alive de backends con prewarm y heartbeat (#8)
+- *(warmup)* Hardening del keep-alive (#10)
 ## [0.2.0] - 2026-11-02
 
 ### Documentation

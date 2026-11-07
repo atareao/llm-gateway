@@ -55,6 +55,27 @@ Cada petición trae un `model` **lógico** (nombre de ruta). El gateway lo susti
 - **⚠️ Limitación (corte a mitad de stream)**: una vez empezada la emisión **no hay failover**. Si el upstream se corta a mitad, el stream se cierra con error; no se reintenta porque ya se habrían enviado bytes al cliente.
 - **Secretos**: los backends con `api_key_env` leen la clave del entorno en tiempo de petición y envían `Authorization: Bearer <valor>`. Si la variable no está definida, el backend se considera no disponible y se salta. La clave **nunca** aparece en los logs.
 
+## ♨️ Keep-alive de backends (warmup)
+
+Mantiene **caliente** un backend OpenAI-compatible para evitar el **arranque en frío** (modelo no residente en memoria/VRAM). Al arrancar y cada `interval_ms` el gateway envía un `POST <base_url>/chat/completions` mínimo (un mensaje `user`, `max_tokens: 1`, sin `stream`) que reinicia el temporizador de inactividad del backend (p. ej. el `keep_alive` de Ollama, 5 min).
+
+```yaml
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://localhost:11434/v1"
+        model: "qwen2.5:7b-instruct"
+        warmup:
+          interval_ms: 240000   # 4 min < keep_alive de Ollama (5 min)
+          timeout_ms: 300000    # opcional; default 30 s si se omite
+```
+
+- `warmup` es **opcional** por backend; **ausente = deshabilitado** (comportamiento sin cambios).
+- `interval_ms` es obligatorio y debe ser **> 0** (un `0` es error de configuración).
+- `timeout_ms` es opcional y debe ser **> 0** si está presente; acota cada warmup. Si se omite, se usa el default de 30 s (súbelo para modelos con cold load largo, p. ej. ~90 s en un 14B).
+- Un warmup fallido **no** aborta el keep-alive ni afecta a los demás backends. Tras un warmup más largo que `interval_ms` no hay ráfaga de peticiones (los ticks acumulados se descartan).
+- Al recibir SIGINT/SIGTERM el gateway aborta las tareas de keep-alive y cierra de forma ordenada.
+
 ## 📊 Observabilidad
 
 ### Métricas Prometheus
@@ -70,6 +91,8 @@ loopback por defecto.
 | `llm_gateway_failover_total` | counter | `route` |
 | `llm_gateway_backend_attempts_total` | counter | `route`, `backend`, `result` |
 | `llm_gateway_backend_duration_seconds` | histogram | `route`, `backend` |
+| `llm_gateway_backend_warm` | gauge | `route`, `backend` |
+| `llm_gateway_warmup_total` | counter | `route`, `backend`, `result` |
 | `llm_gateway_errors_total` | counter | `kind` (`invalid_request`, `model_not_found`) |
 
 `result` vale `success`, `retryable_status`, `transport_error`,
