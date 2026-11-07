@@ -1,4 +1,10 @@
 # Changelog
+## [0.3.1] - 2026-11-07
+
+### Miscellaneous Tasks
+
+- *(release)* Automatiza versionado y publicación (vampus + git-cliff + Actions) (#12)
+- *(release)* Workflow único sin GH_PAT (#13)
 ## [0.3.0] - 2026-11-07
 
 ### Documentation
