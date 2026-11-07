@@ -145,6 +145,77 @@ route:
     );
 }
 
+/// Scenario 1.1d: `warmup.timeout_ms` ausente → `None` (se usará el default).
+#[test]
+fn warmup_timeout_ms_absent_is_none() {
+    let file = write_temp(WARMUP_YAML);
+
+    let config = load(file.path()).expect("valid config should load");
+
+    let warmup = config.route[0].backend[0]
+        .warmup
+        .as_ref()
+        .expect("el backend declarado debe conservar su warmup");
+    assert_eq!(warmup.interval_ms, 240_000);
+    assert_eq!(
+        warmup.timeout_ms, None,
+        "sin `timeout_ms`, el warmup debe quedar en None"
+    );
+}
+
+const WARMUP_TIMEOUT_YAML: &str = r#"
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://localhost:11434/v1"
+        model: "qwen2.5:7b-instruct"
+        warmup:
+          interval_ms: 240000
+          timeout_ms: 300000
+"#;
+
+/// Scenario 1.1e: `warmup.timeout_ms` presente se parsea y conserva.
+#[test]
+fn warmup_timeout_ms_is_parsed() {
+    let file = write_temp(WARMUP_TIMEOUT_YAML);
+
+    let config = load(file.path()).expect("valid config should load");
+
+    let warmup = config.route[0].backend[0]
+        .warmup
+        .as_ref()
+        .expect("el backend declarado debe conservar su warmup");
+    assert_eq!(warmup.interval_ms, 240_000);
+    assert_eq!(warmup.timeout_ms, Some(300_000));
+}
+
+/// Scenario 1.1f: `warmup.timeout_ms = 0` → error que nombra ruta y backend.
+#[test]
+fn warmup_timeout_zero_is_rejected() {
+    let yaml = r#"
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://warmup-timeout-zero.invalid/v1"
+        model: "warmup-timeout-zero-model"
+        warmup:
+          interval_ms: 240000
+          timeout_ms: 0
+"#;
+    let file = write_temp(yaml);
+
+    let err = load(file.path()).expect_err("timeout_ms 0 debe ser rechazado");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("mech-writer"),
+        "el error debe nombrar la ruta afectada, got: {msg}"
+    );
+    assert!(
+        msg.contains("warmup-timeout-zero"),
+        "el error debe nombrar el backend afectado, got: {msg}"
+    );
+}
+
 /// Scenario: YAML inválido
 #[test]
 fn invalid_yaml_reports_line_information() {

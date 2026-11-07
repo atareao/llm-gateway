@@ -7,6 +7,13 @@
 //! Cada petición reinicia el temporizador de inactividad del backend (p. ej.
 //! `keep_alive` de Ollama), evitando que descargue el modelo de memoria.
 //!
+//! Cada warmup se acota con el `warmup.timeout_ms` del backend o, si se omite,
+//! con [`WARMUP_TIMEOUT`] (30 s). El ticker usa
+//! [`tokio::time::MissedTickBehavior::Delay`]: tras un warmup más largo que el
+//! intervalo no se disparan en ráfaga los ticks acumulados. La API key se
+//! resuelve una sola vez al iniciar la tarea; si no resuelve, se registra un
+//! único `failure` y el bucle continúa en `debug` sin peticiones HTTP.
+//!
 //! El warmup reutiliza el mismo camino que el tráfico normal para la URL, la
 //! resolución de la API key y la sustitución de `model` (helpers de
 //! [`crate::proxy`]), pero **no** registra intentos ni peticiones normales: solo
@@ -15,12 +22,25 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use tokio::time::MissedTickBehavior;
 
+use crate::config::Warmup;
 use crate::proxy::backend_id;
 use crate::proxy::{AppState, body_for_backend, chat_url, resolve_api_key};
 
-/// Timeout total de cada petición de warmup.
+/// Timeout total por defecto de cada petición de warmup (30 s).
+///
+/// Se usa cuando el backend no declara `warmup.timeout_ms`.
 pub const WARMUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout efectivo de un warmup: el `timeout_ms` del backend o, si se omite,
+/// [`WARMUP_TIMEOUT`].
+fn warmup_timeout(warmup: &Warmup) -> Duration {
+    warmup
+        .timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(WARMUP_TIMEOUT)
+}
 
 /// Construye el cuerpo mínimo OpenAI-compatible del warmup.
 ///
@@ -32,6 +52,76 @@ fn warmup_body(model: &str) -> Value {
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 1,
     })
+}
+
+/// Ejecuta un único warmup contra `(route, backend)` con la API key ya resuelta
+/// y registra el resultado.
+///
+/// El timeout de la petición es el `warmup.timeout_ms` del backend o, si se
+/// omite, [`WARMUP_TIMEOUT`]. `api_key` es el valor de [`resolve_api_key`]:
+/// `Some(None)` para un backend local (sin cabecera) y `Some(Some(_))` cuando
+/// hay clave. Devuelve `true` si el backend respondió `2xx`.
+///
+/// El fallo de transporte (`reqwest::Error`) se registra como `warn` **con su
+/// causa**; el valor de la clave nunca aparece en los logs.
+async fn warmup_request(
+    state: &AppState,
+    route: usize,
+    backend: usize,
+    api_key: &Option<String>,
+) -> bool {
+    let Some(backend_cfg) = state
+        .config
+        .route
+        .get(route)
+        .and_then(|route| route.backend.get(backend))
+    else {
+        return false;
+    };
+
+    let timeout = backend_cfg
+        .warmup
+        .as_ref()
+        .map(warmup_timeout)
+        .unwrap_or(WARMUP_TIMEOUT);
+
+    let payload = body_for_backend(&warmup_body(&backend_cfg.model), backend_cfg);
+    let mut request = state
+        .client
+        .post(chat_url(&backend_cfg.base_url))
+        .json(&payload)
+        .timeout(timeout);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+
+    let response = request.send().await;
+    let ok = matches!(&response, Ok(response) if response.status().is_success());
+    state.metrics.record_warmup(route, backend, ok);
+
+    match &response {
+        Ok(response) if ok => {
+            tracing::debug!(backend = %backend_id(backend_cfg), "warmup completado");
+        }
+        Ok(response) => {
+            tracing::warn!(
+                backend = %backend_id(backend_cfg),
+                status = %response.status(),
+                result = "failure",
+                "warmup fallido"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                backend = %backend_id(backend_cfg),
+                error = %err,
+                result = "failure",
+                "warmup fallido"
+            );
+        }
+    }
+
+    ok
 }
 
 /// Ejecuta un único warmup contra `(route, backend)` y devuelve si respondió
@@ -76,51 +166,31 @@ pub async fn warmup_once(state: &AppState, route: usize, backend: usize) -> bool
         return false;
     };
 
-    let payload = body_for_backend(&warmup_body(&backend_cfg.model), backend_cfg);
-    let mut request = state
-        .client
-        .post(chat_url(&backend_cfg.base_url))
-        .json(&payload)
-        .timeout(WARMUP_TIMEOUT);
-    if let Some(key) = api_key {
-        request = request.bearer_auth(key);
-    }
-
-    let ok = match request.send().await {
-        Ok(response) => response.status().is_success(),
-        Err(_) => false,
-    };
-
-    state.metrics.record_warmup(route, backend, ok);
-    if ok {
-        tracing::debug!(backend = %backend_id(backend_cfg), "warmup completado");
-    } else {
-        tracing::warn!(
-            backend = %backend_id(backend_cfg),
-            result = "failure",
-            "warmup fallido"
-        );
-    }
-
-    ok
+    warmup_request(state, route, backend, &api_key).await
 }
 
 /// Lanza una tarea de fondo por cada backend con `warmup` habilitado.
 ///
 /// Cada tarea ejecuta un bucle con `tokio::time::interval`: el primer tick es
-/// inmediato (warmup de arranque) y después repite cada `interval_ms`. Un
-/// warmup fallido nunca aborta el bucle.
+/// inmediato (warmup de arranque) y después repite cada `interval_ms`, con
+/// [`MissedTickBehavior::Delay`] —tras un warmup más largo que el intervalo, el
+/// siguiente tick se programa `interval_ms` después de terminar el actual, sin
+/// disparar en ráfaga los ticks acumulados—. Un warmup fallido nunca aborta el
+/// bucle.
 ///
-/// Devuelve un `JoinHandle` por backend con `warmup`. El llamante decide qué
-/// hacer con ellos: `main.rs` los **descarta**, y Tokio deja entonces cada tarea
-/// **detachada** hasta el fin del proceso (dropear un `JoinHandle` no cancela la
-/// tarea). Para un apagado ordenado habría que guardarlos y hacer
-/// `abort()`/`await` en el cierre.
+/// La API key se resuelve **una sola vez** al iniciar la tarea (no en cada
+/// tick). Si no resuelve, se registra **un único** `failure` y un `debug` por
+/// tick, sin emitir peticiones HTTP.
 ///
-/// # Precondición
+/// Devuelve un `JoinHandle` por backend con `warmup`; el llamante decide qué
+/// hacer con ellos. `main.rs` los conserva y los aborta en el cierre ordenado
+/// (SIGINT/SIGTERM).
 ///
-/// `warmup.interval_ms > 0`, garantizado por [`crate::config::load`]:
-/// `tokio::time::interval` *paniquea* con un periodo cero.
+/// # Notas
+///
+/// Un `warmup.interval_ms` de `0` se ignora (`continue`): `tokio::time::interval`
+/// *paniquea* con un periodo cero, y [`crate::config::load`] ya lo rechaza, pero
+/// [`AppState::new`] es público y no valida.
 pub fn spawn_warmup(state: AppState) -> Vec<tokio::task::JoinHandle<()>> {
     let mut handles = Vec::new();
 
@@ -131,16 +201,66 @@ pub fn spawn_warmup(state: AppState) -> Vec<tokio::task::JoinHandle<()>> {
             };
 
             let interval = Duration::from_millis(warmup.interval_ms);
+            if interval.is_zero() {
+                continue;
+            }
+
+            let api_key = resolve_api_key(backend);
             let state = state.clone();
             handles.push(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
-                loop {
-                    ticker.tick().await;
-                    warmup_once(&state, route_idx, backend_idx).await;
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+                match api_key {
+                    Some(key) => loop {
+                        ticker.tick().await;
+                        warmup_request(&state, route_idx, backend_idx, &key).await;
+                    },
+                    None => {
+                        // Sin clave: un solo `failure` (el `warn` ya lo emitió
+                        // `resolve_api_key` al arrancar la tarea) y traza
+                        // `debug` por tick, sin ninguna petición HTTP.
+                        state.metrics.record_warmup(route_idx, backend_idx, false);
+                        loop {
+                            ticker.tick().await;
+                            let backend = &state.config.route[route_idx].backend[backend_idx];
+                            tracing::debug!(
+                                backend = %backend_id(backend),
+                                result = "failure",
+                                "warmup omitido: api_key_env sin resolver"
+                            );
+                        }
+                    }
                 }
             }));
         }
     }
 
     handles
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{WARMUP_TIMEOUT, warmup_timeout};
+    use crate::config::Warmup;
+
+    /// El timeout efectivo es `WARMUP_TIMEOUT` (30 s) cuando se omite
+    /// `timeout_ms`; si está presente, se usa tal cual.
+    #[test]
+    fn warmup_timeout_uses_default_when_none() {
+        let without = Warmup {
+            interval_ms: 240_000,
+            timeout_ms: None,
+        };
+        assert_eq!(warmup_timeout(&without), WARMUP_TIMEOUT);
+        assert_eq!(warmup_timeout(&without), Duration::from_secs(30));
+
+        let explicit = Warmup {
+            interval_ms: 60_000,
+            timeout_ms: Some(300_000),
+        };
+        assert_eq!(warmup_timeout(&explicit), Duration::from_millis(300_000));
+    }
 }

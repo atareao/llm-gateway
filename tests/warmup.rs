@@ -154,6 +154,104 @@ fn config_yaml_two_backends(first_url: &str, second_url: &str, warmup_interval_m
     )
 }
 
+/// Mock OpenAI-compatible que **retrasa** cada respuesta `delay` y **cuenta**
+/// las peticiones recibidas (para observar la cadencia del keep-alive).
+async fn spawn_delayed_backend(delay: Duration) -> (String, Arc<Mutex<usize>>) {
+    async fn handler(
+        State((delay, count)): State<(Duration, Arc<Mutex<usize>>)>,
+    ) -> impl IntoResponse {
+        *count.lock().expect("lock del mock") += 1;
+        tokio::time::sleep(delay).await;
+        (StatusCode::OK, axum::Json(json!({"ok": true}))).into_response()
+    }
+
+    let count = Arc::new(Mutex::new(0usize));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handler))
+        .with_state((delay, Arc::clone(&count)));
+    (spawn(app).await, count)
+}
+
+/// Mock OpenAI-compatible cuyo **primer** warmup tarda `first_delay` y el resto
+/// responde de inmediato; **cuenta** las peticiones recibidas.
+///
+/// Modela el caso real del cold load: un warmup lento bloquea el bucle y, ya
+/// caliente, los ticks acumulados se disparan de golpe con `Burst`.
+async fn spawn_slow_first_backend(first_delay: Duration) -> (String, Arc<Mutex<usize>>) {
+    async fn handler(
+        State((first_delay, count)): State<(Duration, Arc<Mutex<usize>>)>,
+    ) -> impl IntoResponse {
+        let seen = {
+            let mut guard = count.lock().expect("lock del mock");
+            *guard += 1;
+            *guard
+        };
+        if seen == 1 {
+            tokio::time::sleep(first_delay).await;
+        }
+        (StatusCode::OK, axum::Json(json!({"ok": true}))).into_response()
+    }
+
+    let count = Arc::new(Mutex::new(0usize));
+    let app = Router::new()
+        .route("/v1/chat/completions", post(handler))
+        .with_state((first_delay, Arc::clone(&count)));
+    (spawn(app).await, count)
+}
+
+/// YAML de `mech-writer` con un backend y `warmup.timeout_ms` explícito.
+fn config_yaml_with_timeout(
+    base_url: &str,
+    model: &str,
+    interval_ms: u64,
+    timeout_ms: u64,
+) -> String {
+    format!(
+        "route:\n  - name: mech-writer\n    backend:\n      - base_url: \"{base_url}\"\n        model: \"{model}\"\n        warmup:\n          interval_ms: {interval_ms}\n          timeout_ms: {timeout_ms}\n"
+    )
+}
+
+/// `std::io::Write` que acumula la salida de los logs en un `Vec<u8>` compartido
+/// (permite aseverar sobre lo registrado sin un backend de logs externo).
+struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lock de logs").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Buffer global de logs, una sola instancia por proceso de test.
+static LOG_CAPTURE: std::sync::OnceLock<Arc<Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+
+/// Instala **una única vez** un subscriber global que captura los eventos `WARN`
+/// (o superiores) en [`LOG_CAPTURE`] y devuelve el buffer.
+///
+/// Se usa un subscriber global en lugar de `set_default` (thread-local) porque el
+/// runtime de test puede emitir el evento desde otro hilo; `set_global_default`
+/// es robusto frente a eso.
+fn capture_logs() -> Arc<Mutex<Vec<u8>>> {
+    LOG_CAPTURE
+        .get_or_init(|| {
+            let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let writer_buffer = Arc::clone(&buffer);
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || SharedBuffer(Arc::clone(&writer_buffer)))
+                .finish();
+            // Si ya hubiera un subscriber global instalado, se ignora el error.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+            buffer
+        })
+        .clone()
+}
+
 /// Scenario 1.2: backend sin `warmup` → 0 peticiones de warmup.
 #[tokio::test]
 async fn backend_without_warmup_receives_no_requests() {
@@ -377,5 +475,140 @@ async fn warmup_missing_env_fails_without_http_request() {
         requests.lock().expect("lock del mock").len(),
         0,
         "sin api key NO debe emitirse ninguna petición HTTP"
+    );
+}
+
+/// Scenario 1.2 (hardening): tras un warmup lento NO hay ráfaga de ticks
+/// acumulados (`MissedTickBehavior::Delay`).
+#[tokio::test]
+async fn spawn_warmup_does_not_burst_after_slow_warmup() {
+    // El primer warmup bloquea 300 ms; los siguientes responden al instante.
+    let (backend, count) = spawn_slow_first_backend(Duration::from_millis(300)).await;
+    let yaml = config_yaml(&backend, "qwen2.5:7b-instruct", Some(50), None);
+    let (_gateway, state) = spawn_gateway(&yaml).await;
+
+    let handles = spawn_warmup(state);
+
+    // ~300 ms de warmup lento + margen. Con `Burst` se dispararían ya los ~6
+    // ticks acumulados (≥6 peticiones); con `Delay`, a lo sumo un par.
+    tokio::time::sleep(Duration::from_millis(380)).await;
+    let seen = *count.lock().expect("lock del mock");
+    drop(handles);
+
+    assert!(
+        seen <= 3,
+        "no debe haber ráfaga de warmups acumulados tras un warmup lento; hubo {seen}"
+    );
+}
+
+/// Scenario 1.3: el `timeout_ms` configurable acota el warmup.
+///
+/// El default de 30 s (escenario «sin `timeout_ms`, retardo > default») se
+/// verifica en el test unitario `warmup_timeout_uses_default_when_none` de
+/// `src/warmup.rs`, para no alargar el test de integración 30 s.
+#[tokio::test]
+async fn warmup_respects_configured_timeout() {
+    // `timeout_ms` holgado frente a un retardo de 300 ms → `success`.
+    let (generous, _count) = spawn_delayed_backend(Duration::from_millis(300)).await;
+    let yaml = config_yaml_with_timeout(&generous, "qwen2.5:7b-instruct", 240_000, 2_000);
+    let (gateway, state) = spawn_gateway(&yaml).await;
+
+    assert!(
+        warmup_once(&state, 0, 0).await,
+        "con timeout_ms=2000 y respuesta en ~300 ms el warmup debe ser success"
+    );
+    let id = backend_id(&state.config.route[0].backend[0]);
+    let body = get_metrics(&gateway).await;
+    assert!(
+        body.contains(&format!(
+            r#"llm_gateway_warmup_total{{route="mech-writer",backend="{id}",result="success"}} 1"#
+        )),
+        "counter warmup_total success esperado a 1:\n{body}"
+    );
+
+    // `timeout_ms` estrecho (< retardo) → `failure` por timeout.
+    let (narrow, _count) = spawn_delayed_backend(Duration::from_millis(300)).await;
+    let yaml = config_yaml_with_timeout(&narrow, "qwen2.5:7b-instruct", 240_000, 100);
+    let (gateway, state) = spawn_gateway(&yaml).await;
+
+    assert!(
+        !warmup_once(&state, 0, 0).await,
+        "con timeout_ms=100 y respuesta en ~300 ms el warmup debe ser failure"
+    );
+    let id = backend_id(&state.config.route[0].backend[0]);
+    let body = get_metrics(&gateway).await;
+    assert!(
+        body.contains(&format!(
+            r#"llm_gateway_warmup_total{{route="mech-writer",backend="{id}",result="failure"}} 1"#
+        )),
+        "counter warmup_total failure esperado a 1:\n{body}"
+    );
+}
+
+/// Scenario 1.4 (hardening): `api_key_env` sin resolver en el keep-alive →
+/// exactamente una `failure` y cero peticiones HTTP a lo largo de varios ticks.
+#[tokio::test]
+async fn spawn_warmup_missing_env_records_single_failure_without_http() {
+    let var = format!(
+        "GATEWAY_TEST_WARMUP_KEY_MISSING_LOOP_{}",
+        std::process::id()
+    );
+    // SAFETY: nombre de variable único para este test; el binario es un proceso aparte.
+    unsafe { std::env::remove_var(&var) };
+
+    let (backend, requests) = spawn_capturing_backend().await;
+    let yaml = config_yaml(&backend, "qwen2.5:7b-instruct", Some(30), Some(&var));
+    let (gateway, state) = spawn_gateway(&yaml).await;
+
+    let handles = spawn_warmup(state.clone());
+
+    // Varios ticks con interval_ms=30 (≈6-7 ticks).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let id = backend_id(&state.config.route[0].backend[0]);
+    let body = get_metrics(&gateway).await;
+    drop(handles);
+
+    let failure_series = format!(
+        r#"llm_gateway_warmup_total{{route="mech-writer",backend="{id}",result="failure"}}"#
+    );
+    assert_eq!(
+        metric_value(&body, &failure_series),
+        Some(1.0),
+        "la clave sin resolver debe registrar exactamente un `failure` (no uno por tick):\n{body}"
+    );
+    assert_eq!(
+        requests.lock().expect("lock del mock").len(),
+        0,
+        "sin api key NO debe emitirse ninguna petición HTTP en ningún tick"
+    );
+}
+
+/// Scenario 1.5: fallo de transporte → el `warn` incluye el backend y la causa.
+#[tokio::test]
+async fn transport_failure_logs_backend_and_cause() {
+    let buffer = capture_logs();
+
+    let dead = common::dead_backend().await;
+    let yaml = config_yaml(&dead, "primary", Some(240_000), None);
+    let (_gateway, state) = spawn_gateway(&yaml).await;
+
+    let ok = warmup_once(&state, 0, 0).await;
+    assert!(!ok, "un warmup contra un backend caído debe devolver false");
+
+    let logs = String::from_utf8(buffer.lock().expect("lock de logs").clone())
+        .expect("los logs deben ser UTF-8");
+    let id = backend_id(&state.config.route[0].backend[0]);
+    let line = logs
+        .lines()
+        .find(|line| line.contains(&id))
+        .unwrap_or_else(|| panic!("sin línea de log para el backend {id}. logs:\n{logs}"));
+    assert!(
+        line.contains("error"),
+        "el `warn` debe registrar la causa del error de transporte: {line}"
+    );
+    assert!(
+        line.contains("warmup fallido"),
+        "el `warn` debe describir el fallo de warmup: {line}"
     );
 }

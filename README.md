@@ -67,11 +67,14 @@ route:
         model: "qwen2.5:7b-instruct"
         warmup:
           interval_ms: 240000   # 4 min < keep_alive de Ollama (5 min)
+          timeout_ms: 300000    # opcional; default 30 s si se omite
 ```
 
 - `warmup` es **opcional** por backend; **ausente = deshabilitado** (comportamiento sin cambios).
 - `interval_ms` es obligatorio y debe ser **> 0** (un `0` es error de configuración).
-- Un warmup fallido **no** aborta el keep-alive ni afecta a los demás backends.
+- `timeout_ms` es opcional y debe ser **> 0** si está presente; acota cada warmup. Si se omite, se usa el default de 30 s (súbelo para modelos con cold load largo, p. ej. ~90 s en un 14B).
+- Un warmup fallido **no** aborta el keep-alive ni afecta a los demás backends. Tras un warmup más largo que `interval_ms` no hay ráfaga de peticiones (los ticks acumulados se descartan).
+- Al recibir SIGINT/SIGTERM el gateway aborta las tareas de keep-alive y cierra de forma ordenada.
 
 ## 📊 Observabilidad
 

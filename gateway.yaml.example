@@ -7,6 +7,10 @@ route:
         # modelo residente y evita el arranque en frío.
         warmup:
           interval_ms: 240000
+          # Opcional. Timeout de cada warmup (default 30 s). Súbelo (p. ej.
+          # 300000) si el cold load del modelo supera los 30 s (p. ej. un 14B
+          # tarda ~90 s en cargar).
+          # timeout_ms: 300000
       - base_url: "https://openrouter.ai/api/v1"
         model: "qwen/qwen3-8b"
         api_key_env: "OPENROUTER_API_KEY"
