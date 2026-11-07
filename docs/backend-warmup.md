@@ -15,8 +15,9 @@ ninguna petición extra.
 
 ## Ficheros implicados
 
-- `src/config.rs` — `struct Warmup { interval_ms }` y el campo
-  `Backend::warmup: Option<Warmup>`, más la validación `interval_ms > 0`.
+- `src/config.rs` — `struct Warmup { interval_ms, timeout_ms }` y el campo
+  `Backend::warmup: Option<Warmup>`, más la validación `interval_ms > 0` y
+  `timeout_ms > 0` (si está presente).
 - `src/warmup.rs` — `warmup_body`, `warmup_once`, `spawn_warmup`, `WARMUP_TIMEOUT`.
 - `src/proxy.rs` — `AppState`, `chat_url`, `resolve_api_key` y `body_for_backend`
   (reutilizados por el warmup, ahora `pub(crate)`).
@@ -30,6 +31,14 @@ ninguna petición extra.
   cada backend con `warmup` presente. El bucle usa `tokio::time::interval`, cuyo
   **primer tick es inmediato** (warmup de arranque); luego repite cada
   `interval_ms`.
+- **Sin ráfaga (`MissedTickBehavior::Delay`)**: si un warmup dura más que
+  `interval_ms` (cold load largo o timeout), el ticker **no** dispara en ráfaga
+  los ticks acumulados: el siguiente tick se programa `interval_ms` después de
+  terminar el actual. Con `Burst` (default de Tokio) un warmup de 30 s con
+  `interval_ms` de 5 s provocaba ~17 peticiones seguidas.
+- **Timeout configurable**: cada warmup se acota con `warmup.timeout_ms` o, si
+  se omite, con `WARMUP_TIMEOUT` (30 s). Un modelo grande puede tardar ~90 s en
+  cargar, así que conviene subir `timeout_ms` por encima del cold load real.
 - **Petición mínima**: `POST <base_url>/chat/completions` con el `model` real del
   backend, un único mensaje `user` con `"ping"` y `max_tokens: 1`, **sin**
   `stream`. La URL, la sustitución de `model` y el `Authorization: Bearer` se
@@ -39,9 +48,15 @@ ninguna petición extra.
   «modelo recién tocado / caliente»; `0`, que el backend no respondió.
 - **Un fallo no aborta**: un warmup fallido (backend caído, timeout,
   `api_key_env` sin resolver) se registra como `failure` y el bucle **sigue**. No
-  afecta al tráfico normal ni a otros backends.
-- **Sin petición sin clave**: si el `api_key_env` del backend no resuelve,
-  `warmup_once` devuelve `false` **sin emitir petición HTTP**.
+  afecta al tráfico normal ni a otros backends. El `warn` de fallo de transporte
+  incluye la causa del `reqwest::Error` (timeout, conexión rechazada…).
+- **Clave resuelta una sola vez**: la API key se resuelve al **iniciar** la tarea
+  de keep-alive, no en cada tick. Si el `api_key_env` no resuelve, se emite **un
+  único** `warn` y **un único** `failure`, y el bucle continúa en `debug` **sin
+  emitir ninguna petición HTTP** (antes se repetía el aviso en cada tick).
+- **Apagado ordenado**: `main.rs` conserva los `JoinHandle` de `spawn_warmup` y
+  los aborta al recibir SIGINT/SIGTERM (`axum::serve(...).with_graceful_shutdown`),
+  de modo que no quedan tareas de fondo activas durante el cierre.
 
 El warmup **no** contamina las métricas de tráfico: no incrementa
 `llm_gateway_requests_total` ni `llm_gateway_backend_attempts_total`.
@@ -56,6 +71,7 @@ route:
         model: "qwen2.5:7b-instruct"
         warmup:
           interval_ms: 240000   # 4 min < keep_alive de Ollama (5 min)
+          timeout_ms: 300000    # opcional; default 30 s
 ```
 
 Structs Rust equivalentes:
@@ -64,6 +80,9 @@ Structs Rust equivalentes:
 pub struct Warmup {
     /// Intervalo entre warmups, en milisegundos (debe ser mayor que 0).
     pub interval_ms: u64,
+    /// Timeout de cada warmup, en milisegundos (opcional; > 0 si está presente;
+    /// default `WARMUP_TIMEOUT`, 30 s).
+    pub timeout_ms: Option<u64>,
 }
 
 pub struct Backend {
@@ -81,6 +100,9 @@ Reglas:
 - `warmup` es **opcional** por backend; **ausente = deshabilitado**.
 - `interval_ms` es obligatorio y debe ser **> 0**; un `0` provoca un error de
   configuración que nombra la ruta y el backend.
+- `timeout_ms` es **opcional** y debe ser **> 0** si está presente (un `0` es
+  error de configuración). Si se omite, se usa el default de 30 s. Súbelo por
+  encima del cold load real del modelo (p. ej. 300 000 ms para un 14B).
 - Recomendado: `interval_ms` **menor** que el `keep_alive` del backend (p. ej.
   240 000 ms = 4 min frente a los 5 min de Ollama).
 
@@ -124,14 +146,24 @@ Deshabilitarlo = quitar el bloque `warmup` (los backends de la misma ruta sin
   duplicada en la resolución de URL y secretos.
 - **Cardinalidad acotada**: las etiquetas salen del YAML (rutas y backends), no
   del tráfico.
+- **`MissedTickBehavior::Delay`** (`warmup-hardening`): un keep-alive interesa
+  espaciar peticiones, no recuperar el tiempo perdido, así que se descartan los
+  ticks acumulados en lugar de dispararlos en ráfaga.
+- **Clave resuelta una vez** (`warmup-hardening`): la variable de entorno no
+  cambia durante la vida del proceso, así que resolverla por tick solo generaba
+  spam de `warn` y trabajo redundante.
+- **Timeout por backend** (`warmup-hardening`): subir el default a 300 s
+  penalizaría a los backends pequeños (una conexión colgada bloquearía el tick 5
+  min); se prefirió un `timeout_ms` opcional por backend.
+- **Diagnóstico de fallo de transporte** (`warmup-hardening`): el `warn` incluye
+  el `reqwest::Error` (que ya describe timeout/connect/reset) sin añadir campos a
+  las métricas, cuya cardinalidad se mantiene acotada a `success`/`failure`.
 
 ## Follow-ups y limitaciones
 
-- **Sin shutdown graceful**: `spawn_warmup` devuelve `Vec<JoinHandle<()>>` pero
-  `main.rs` los descarta; las tareas quedan *detachadas* y mueren con el proceso.
-  Un apagado ordenado requeriría guardarlos y hacer `abort()`/`await` en el cierre.
 - **Sin control nativo de `keep_alive`**: no se envía la extensión propietaria de
   Ollama (`keep_alive`), por lo que el periodo efectivo depende del backend; el
   `interval_ms` debe elegirse por debajo de su valor de descarga.
-- **Sin verificación con Ollama real**: los tests cubren el comportamiento con
-  mocks; falta validar contra un Ollama real (tarea 5.1 del change).
+- **Sin verificación con Ollama real (5.1)**: los tests cubren el comportamiento
+  con mocks (incluida la ausencia de ráfaga y el timeout configurable); queda
+  validar contra un Ollama real con `timeout_ms` acorde al cold load (~90 s).

@@ -31,7 +31,7 @@ Corregir los dos defectos del keep-alive detectados en la verificación real (5.
 
 ## Estado
 
-- [ ] Change `warmup-hardening` aprobado por el usuario.
-- [ ] RED → GREEN → REFACTOR.
-- [ ] Docs actualizadas → `docs/warmup-hardening.md`.
-- [ ] Change archivado y plan renombrado a `plans/PLAN-002-ARCHIVED.md`.
+- [x] Change `warmup-hardening` aprobado por el usuario.
+- [x] RED → GREEN → REFACTOR (74 tests, clippy/fmt limpios).
+- [x] Docs actualizadas → `docs/warmup-hardening.md`.
+- [x] Change archivado (`openspec/changes/archive/2026-11-07-warmup-hardening/`) y plan renombrado a `plans/PLAN-002-ARCHIVED.md`.
