@@ -1,7 +1,18 @@
 [package]
-name = "llm-gateway"
+name = "llm-gateway-rs"
 version = "0.3.1"
 edition = "2024"
+autobins = false
+description = "Gateway proxy OpenAI-compatible con failover y keep-alive (warmup) de backends."
+license = "MIT"
+repository = "https://github.com/atareao/llm-gateway"
+readme = "README.md"
+keywords = ["llm", "gateway", "proxy", "openai", "ai"]
+categories = ["web-programming::http-server"]
+
+[[bin]]
+name = "llm-gateway"
+path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"

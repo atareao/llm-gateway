@@ -14,8 +14,8 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use llm_gateway::config::GatewayConfig;
-use llm_gateway::proxy::{AppState, backend_id, router};
+use llm_gateway_rs::config::GatewayConfig;
+use llm_gateway_rs::proxy::{AppState, backend_id, router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -449,7 +449,7 @@ async fn no_stream_explicit_short_timeout_is_respected() {
 /// Comprobación de que el identificador de backend es el documentado.
 #[test]
 fn backend_id_format_is_base_url_hash_model() {
-    let backend = llm_gateway::config::Backend {
+    let backend = llm_gateway_rs::config::Backend {
         base_url: "http://localhost:11434/v1".to_owned(),
         model: "qwen2.5:7b-instruct".to_owned(),
         api_key_env: None,
