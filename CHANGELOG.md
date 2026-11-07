@@ -1,4 +1,9 @@
 # Changelog
+## [0.3.2] - 2026-11-07
+
+### Miscellaneous Tasks
+
+- *(publish)* Renombra el paquete a llm-gateway-rs y añade metadata para crates.io (#15)
 ## [0.3.1] - 2026-11-07
 
 ### Miscellaneous Tasks
