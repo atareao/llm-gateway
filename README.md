@@ -1,5 +1,7 @@
 # 🔀 llm-gateway
 
+[![CI](https://github.com/atareao/llm-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/atareao/llm-gateway/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/llm-gateway-rs.svg)](https://crates.io/crates/llm-gateway-rs) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 > Proxy local **compatible con la API de OpenAI** que enruta cada petición a una **cadena ordenada de backends** (local primero, remoto de respaldo) y hace **failover** cuando el primario falla.
 
 Escrito en **Rust** (axum + tokio + reqwest). Pensado para que [OpenCode](https://opencode.ai) pueda usar modelos **locales** (coste 0) sin perder robustez: OpenCode fija el modelo de cada agente de forma estática y **no** salta a otro si el primario falla; este gateway aporta ese *fallback*.
@@ -18,6 +20,16 @@ Escrito en **Rust** (axum + tokio + reqwest). Pensado para que [OpenCode](https:
 ## 🚧 Estado
 
 En desarrollo (SDD/OpenSpec). El diseño y los escenarios viven en [`openspec/changes/add-llm-gateway/`](./openspec/changes/add-llm-gateway/).
+
+## 📥 Instalar
+
+Desde crates.io (instala el binario `llm-gateway`):
+
+```bash
+cargo install llm-gateway-rs
+```
+
+O descarga un binario precompilado desde [Releases](https://github.com/atareao/llm-gateway/releases) (`llm-gateway-x86_64-unknown-linux-gnu.tar.gz` / `llm-gateway-aarch64-unknown-linux-gnu.tar.gz`).
 
 ## 📦 Compilar
 
