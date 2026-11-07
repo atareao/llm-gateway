@@ -1,8 +1,8 @@
 //! Tests de integración de los endpoints auxiliares (Requisito 6):
 //! `GET /v1/models` y `GET /healthz`.
 
-use llm_gateway::config::GatewayConfig;
-use llm_gateway::proxy::{AppState, router};
+use llm_gateway_rs::config::GatewayConfig;
+use llm_gateway_rs::proxy::{AppState, router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
