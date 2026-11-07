@@ -405,7 +405,7 @@ async fn route_with_failover(
 ///
 /// Nunca registra el valor de la clave; solo, si acaso, el nombre de la
 /// variable y el identificador del backend.
-fn resolve_api_key(backend: &Backend) -> Option<Option<String>> {
+pub(crate) fn resolve_api_key(backend: &Backend) -> Option<Option<String>> {
     match backend.api_key_env.as_deref() {
         None => Some(None),
         Some(var) => match std::env::var(var) {
@@ -537,7 +537,7 @@ fn assemble(
 
 /// Clona `body` y sustituye su `model` por el del backend. El resto de campos
 /// (incluidos los desconocidos) se conservan intactos.
-fn body_for_backend(body: &Value, backend: &Backend) -> Value {
+pub(crate) fn body_for_backend(body: &Value, backend: &Backend) -> Value {
     let mut value = body.clone();
     if let Some(object) = value.as_object_mut() {
         object.insert("model".to_owned(), Value::String(backend.model.clone()));
@@ -547,7 +547,7 @@ fn body_for_backend(body: &Value, backend: &Backend) -> Value {
 
 /// Compone la URL del endpoint de chat a partir de la `base_url` del backend
 /// (que ya incluye `/v1`), uniendo bien las barras.
-fn chat_url(base_url: &str) -> String {
+pub(crate) fn chat_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
 }
 
