@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use llm_gateway::proxy::{AppState, router};
+use llm_gateway_rs::proxy::{AppState, router};
 
 /// Dirección de escucha por defecto.
 const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         tracing_subscriber::fmt().with_env_filter(filter).init();
     }
 
-    let config = llm_gateway::config::load_default()?;
+    let config = llm_gateway_rs::config::load_default()?;
     tracing::info!(routes = config.route.len(), "configuración cargada");
 
     let addr: SocketAddr = std::env::var("GATEWAY_LISTEN")
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     let app = router(state.clone());
 
     // Se conservan los handles de keep-alive para abortarlos en el cierre.
-    let warmup_handles = llm_gateway::warmup::spawn_warmup(state);
+    let warmup_handles = llm_gateway_rs::warmup::spawn_warmup(state);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await

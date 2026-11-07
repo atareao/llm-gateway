@@ -7,8 +7,8 @@ use axum::body::{Body, Bytes};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use llm_gateway::config::GatewayConfig;
-use llm_gateway::proxy::{AppState, router};
+use llm_gateway_rs::config::GatewayConfig;
+use llm_gateway_rs::proxy::{AppState, router};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 

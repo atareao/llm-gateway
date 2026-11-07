@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use llm_gateway::config::load;
+use llm_gateway_rs::config::load;
 
 const VALID_YAML: &str = r#"
 route:

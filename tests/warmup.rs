@@ -1,6 +1,6 @@
 //! Tests de integración del warmup de backends (keep-alive, Requisito 1).
 //!
-//! Fase RED (TDD): este fichero referencia `llm_gateway::warmup`
+//! Fase RED (TDD): este fichero referencia `llm_gateway_rs::warmup`
 //! (`warmup_once` / `spawn_warmup`), que todavía **no** existe. Es esperable que
 //! falle en compilación hasta GREEN.
 //!
@@ -17,9 +17,9 @@ use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use llm_gateway::config::GatewayConfig;
-use llm_gateway::proxy::{AppState, backend_id, router};
-use llm_gateway::warmup::{spawn_warmup, warmup_once};
+use llm_gateway_rs::config::GatewayConfig;
+use llm_gateway_rs::proxy::{AppState, backend_id, router};
+use llm_gateway_rs::warmup::{spawn_warmup, warmup_once};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
