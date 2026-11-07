@@ -19,4 +19,4 @@ Cerrar el hueco de documentación de las dos features de tooling recién cerrada
 - [x] `docs/release-automation.md`
 - [x] `docs/publish-crate.md`
 - [x] `README.md` (badge + install)
-- [ ] PR → `development`
+- [x] PR → `development`
