@@ -65,10 +65,30 @@ git checkout development && git merge main && git push origin development
 
 ## CI Workflows
 
-- **`ci.yml`** — push y PR a main/development: formato, lint, build, tests
+- **`ci.yml`** — push y PR a `main`/`development`: formato, lint, build, tests.
+- **`release-prepare.yml`** — push a `main`: detecta el bump (major/minor/patch) desde
+  los conventional commits, ejecuta `vampus upgrade`, regenera `CHANGELOG.md` con
+  `git-cliff`, hace commit `🚀 chore(release): vX.Y.Z`, crea y empuja el tag `vX.Y.Z`
+  y sincroniza `development`. Ignora sus propios commits de release.
+- **`release.yml`** — push de tag `v*`: compila los binarios Linux (`x86_64` y
+  `aarch64`), crea la GitHub Release con las notas del `CHANGELOG.md` y adjunta los
+  `tar.gz`. Publica en crates.io solo si existe `CARGO_REGISTRY_TOKEN`.
+
+### Releases (automático)
+
+```bash
+# 1. PR de development → main (conventional commits definen el bump)
+# 2. Al mergear, release-prepare.yml versiona y etiqueta; release.yml compila y publica.
+```
+
+Igual que antes, sigue siendo válido hacerlo a mano (vampus + git-cliff + tag + `gh release`).
 
 ## Secretos de GitHub necesarios
 
 | Secreto | Propósito |
 |---|---|
-| `GH_PAT` | Personal Access Token con scope `contents: write` |
+| `GH_PAT` | Personal Access Token con scope `contents: write` (push de commit/tag y sync de `development` desde los workflows). |
+| `CARGO_REGISTRY_TOKEN` | *(opcional)* Token de crates.io; si está definido, `release.yml` publica el crate. |
+
+> Nota: `release-prepare.yml` empuja a `main` y a `development`. Si esas ramas tienen
+> protecciones, permite a GitHub Actions saltárselas (o añade el bot a los bypass).
