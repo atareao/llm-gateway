@@ -1,4 +1,10 @@
 # Changelog
+## [0.3.3] - 2026-11-07
+
+### Documentation
+
+- *(release)* Documenta release-automation y publish-crate + badge/install (#17)
+- *(plans)* Archiva PLAN-004 (#18)
 ## [0.3.2] - 2026-11-07
 
 ### Miscellaneous Tasks
