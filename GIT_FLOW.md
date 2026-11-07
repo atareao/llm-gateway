@@ -65,10 +65,31 @@ git checkout development && git merge main && git push origin development
 
 ## CI Workflows
 
-- **`ci.yml`** — push y PR a main/development: formato, lint, build, tests
+- **`ci.yml`** — push y PR a `main`/`development`: formato, lint, build, tests.
+- **`release.yml`** — push a `main` (**workflow único, sin `GH_PAT`**): detecta el bump
+  (major/minor/patch) desde los conventional commits, ejecuta `vampus upgrade`,
+  regenera `CHANGELOG.md` con `git-cliff`, hace commit `🚀 chore(release): vX.Y.Z`,
+  crea y empuja el tag `vX.Y.Z`, sincroniza `development`, compila los binarios Linux
+  (`x86_64` y `aarch64`) y crea la GitHub Release con las notas del `CHANGELOG.md` y los
+  `tar.gz`. Publica en crates.io solo si existe `CARGO_REGISTRY_TOKEN`.
+
+### Releases (automático)
+
+```bash
+# 1. PR de development → main (conventional commits definen el bump)
+# 2. Al mergear, release.yml versiona, etiqueta, compila y publica en una sola ejecución.
+```
+
+Igual que antes, sigue siendo válido hacerlo a mano (vampus + git-cliff + tag + `gh release`).
 
 ## Secretos de GitHub necesarios
 
 | Secreto | Propósito |
 |---|---|
-| `GH_PAT` | Personal Access Token con scope `contents: write` |
+| `CARGO_REGISTRY_TOKEN` | *(opcional)* Token de crates.io; si está definido, `release.yml` publica el crate. Sin él, la release no falla: simplemente no publica. |
+
+> Notas:
+> - `release.yml` usa el `GITHUB_TOKEN` del propio workflow (`permissions: contents: write`);
+>   **no requiere `GH_PAT`**.
+> - Empuja commit y tag a `main` y sincroniza `development`: si esas ramas tienen
+>   protecciones, permite a GitHub Actions saltárselas (o añade el bot a los bypass).
