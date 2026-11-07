@@ -454,6 +454,7 @@ fn backend_id_format_is_base_url_hash_model() {
         model: "qwen2.5:7b-instruct".to_owned(),
         api_key_env: None,
         timeout_ms: None,
+        warmup: None,
     };
     assert_eq!(
         backend_id(&backend),

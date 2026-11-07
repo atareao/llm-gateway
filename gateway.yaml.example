@@ -3,6 +3,10 @@ route:
     backend:
       - base_url: "http://localhost:11434/v1"
         model: "qwen2.5:7b-instruct"
+        # Keep-alive: opcional. 4 min < keep_alive de Ollama (5 min) mantiene el
+        # modelo residente y evita el arranque en frío.
+        warmup:
+          interval_ms: 240000
       - base_url: "https://openrouter.ai/api/v1"
         model: "qwen/qwen3-8b"
         api_key_env: "OPENROUTER_API_KEY"
