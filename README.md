@@ -10,7 +10,7 @@ Escrito en **Rust** (axum + tokio + reqwest). Pensado para que [OpenCode](https:
 
 | | |
 |---|---|
-| 🔀 **Failover** | Cadena ordenada de backends por ruta; salta al siguiente ante fallo de conexión, timeout, `429` o `5xx` |
+| 🔀 **Failover** | Cadena ordenada de backends por ruta; salta al siguiente ante fallo de conexión, timeout, `429` o `5xx`; y, en no-stream, si la respuesta `2xx` no trae `tool_calls` con `tool_choice` estricto |
 | 🧩 **OpenAI-compatible** | `POST /v1/chat/completions` (stream y no-stream), `GET /v1/models`, `GET /healthz` |
 | 🛠️ **Tools** | Paso transparente de `tools`, `tool_choice` y `tool_calls` |
 | 📡 **Streaming SSE** | Reenvío sin bufferizar de los chunks `data:` |
@@ -60,6 +60,7 @@ route:
 Cada petición trae un `model` **lógico** (nombre de ruta). El gateway lo sustituye por el `model` real del backend elegido y reenvía el resto del cuerpo verbatim. Los backends de una ruta se prueban **en orden** (primario primero).
 
 - **Failover antes del primer byte**: si un backend falla por conexión, timeout, `429` o `5xx`, se salta al siguiente. Un `4xx` distinto de `429` se devuelve tal cual, sin reintentar. Si todos fallan → `502` estilo OpenAI.
+- **Failover post-respuesta (tools)**: en **no-stream**, si la petición exige una llamada a herramienta (`tool_choice: "required"`, `"any"` o una función concreta) y la respuesta **`2xx` no trae `tool_calls`**, se salta al siguiente backend. Con `tool_choice` `"auto"`, `"none"` o ausente **no aplica**; tampoco en `stream: true`. Si se agota la cadena → `502` con `error.code` `"no_tool_call"`. Detalle en [`docs/toolcall-failover.md`](docs/toolcall-failover.md).
 - **Timeout (no-stream)**: se aplica **siempre** un timeout total. Prioridad: `timeout_ms` del backend si está definido; en caso contrario, el default **120 s** (`DEFAULT_REQUEST_TIMEOUT`). Así una respuesta no-stream colgada nunca deja la petición abierta indefinidamente.
 - **Timeout (streaming)**: el `timeout_ms` (o el default de **primer byte**, 5 s) solo limita el arranque. Una vez llegan las cabeceras, el cuerpo SSE fluye sin deadline, para no abortar respuestas largas.
 - **Cabecera `x-gateway-backend`**: en las respuestas con éxito identifica el backend que atendió la petición, con el formato **`<base_url>#<model>`** (p. ej. `http://localhost:11434/v1#qwen2.5:7b-instruct`).
