@@ -30,6 +30,10 @@ pub enum AppError {
     /// Todos los backends de la cadena fallaron antes del primer byte.
     #[error("all {attempts} backend(s) failed for model '{model}'")]
     AllBackendsFailed { model: String, attempts: usize },
+
+    /// La petición exigía un `tool_call` y ningún backend lo devolvió.
+    #[error("no backend returned a tool call for model '{model}' after {attempts} attempt(s)")]
+    NoToolCallFromAllBackends { model: String, attempts: usize },
 }
 
 impl IntoResponse for AppError {
@@ -47,6 +51,9 @@ impl IntoResponse for AppError {
             ),
             AppError::Upstream(_) | AppError::AllBackendsFailed { .. } => {
                 (StatusCode::BAD_GATEWAY, "api_error", "upstream_error")
+            }
+            AppError::NoToolCallFromAllBackends { .. } => {
+                (StatusCode::BAD_GATEWAY, "api_error", "no_tool_call")
             }
         };
 

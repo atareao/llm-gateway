@@ -17,13 +17,14 @@ const BUCKETS: [f64; 11] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.
 const OUTCOMES: [Outcome; 2] = [Outcome::Success, Outcome::AllFailed];
 const GLOBAL_OUTCOMES: [GlobalOutcome; 2] =
     [GlobalOutcome::InvalidRequest, GlobalOutcome::ModelNotFound];
-const ATTEMPT_RESULTS: [AttemptResult; 6] = [
+const ATTEMPT_RESULTS: [AttemptResult; 7] = [
     AttemptResult::Success,
     AttemptResult::RetryableStatus,
     AttemptResult::TransportError,
     AttemptResult::FirstByteTimeout,
     AttemptResult::MissingApiKey,
     AttemptResult::BodyError,
+    AttemptResult::NoToolCall,
 ];
 
 /// Resultado final de una petición a `/v1/chat/completions`.
@@ -83,6 +84,8 @@ pub enum AttemptResult {
     FirstByteTimeout,
     MissingApiKey,
     BodyError,
+    /// Respuesta `2xx` sin `tool_calls` cuando la petición los exigía.
+    NoToolCall,
 }
 
 impl AttemptResult {
@@ -95,6 +98,7 @@ impl AttemptResult {
             Self::FirstByteTimeout => "first_byte_timeout",
             Self::MissingApiKey => "missing_api_key",
             Self::BodyError => "body_error",
+            Self::NoToolCall => "no_tool_call",
         }
     }
 
@@ -106,6 +110,7 @@ impl AttemptResult {
             Self::FirstByteTimeout => 3,
             Self::MissingApiKey => 4,
             Self::BodyError => 5,
+            Self::NoToolCall => 6,
         }
     }
 }
@@ -157,7 +162,7 @@ impl Histogram {
 
 struct BackendMetrics {
     id: String,
-    attempts: [AtomicU64; 6],
+    attempts: [AtomicU64; 7],
     duration: Histogram,
     /// El backend declara un bloque `warmup`.
     warmup_enabled: bool,

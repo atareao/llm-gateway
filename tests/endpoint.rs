@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use llm_gateway_rs::config::GatewayConfig;
@@ -51,6 +51,19 @@ async fn spawn_status_backend(status: StatusCode, body: Value) -> String {
     let app = Router::new()
         .route("/v1/chat/completions", post(reply))
         .with_state((status, Arc::new(body)));
+    spawn(app).await
+}
+
+/// Backend que responde con bytes crudos (JSON con orden de claves no canónico)
+/// y `content-type: application/json`, para poder afirmar passthrough exacto.
+async fn spawn_raw_backend(raw: &'static str) -> String {
+    async fn reply(State(raw): State<&'static str>) -> Response {
+        ([(header::CONTENT_TYPE, "application/json")], raw).into_response()
+    }
+
+    let app = Router::new()
+        .route("/v1/chat/completions", post(reply))
+        .with_state(raw);
     spawn(app).await
 }
 
@@ -270,5 +283,50 @@ async fn tool_calls_in_response_are_passed_through_intact() {
     assert_eq!(
         body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
         json!("f")
+    );
+}
+
+/// Scenario: La inspección no altera la respuesta. Aunque el gateway parsee el
+/// cuerpo para decidir el failover, devuelve los bytes del upstream **byte a
+/// byte** (el orden de claves del mock no es el canónico, así que una
+/// re-serialización lo delataría) y preserva el `content-type`.
+#[tokio::test]
+async fn inspection_preserves_response_bytes_verbatim() {
+    const RAW: &str = concat!(
+        r#"{"weird":"order","choices":[{"index":0,"message":{"content":null,"#,
+        r#""role":"assistant","tool_calls":[{"id":"c1","type":"function","#,
+        r#""function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"#,
+        r#""id":"chatcmpl-raw","object":"chat.completion"}"#
+    );
+    let backend = spawn_raw_backend(RAW).await;
+    let gateway = spawn_gateway(&backend).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .json(&json!({
+            "model": "mech-writer",
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "tool_choice": "required"
+        }))
+        .send()
+        .await
+        .expect("request al gateway");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json"),
+        "el content-type del upstream debe preservarse"
+    );
+
+    let bytes = response.bytes().await.expect("cuerpo de respuesta");
+    assert_eq!(
+        bytes.as_ref(),
+        RAW.as_bytes(),
+        "el cuerpo debe ser byte a byte el del upstream"
     );
 }

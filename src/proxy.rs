@@ -8,10 +8,20 @@
 //! timeout, `429` o `5xx`, se prueba el siguiente; un `4xx` distinto de `429`
 //! se devuelve al cliente sin reintentar.
 //!
+//! Además, solo en **no-stream**, si la petición incluye `tools` como lista no
+//! vacía y `tool_choice` exige una llamada a herramienta (`required`, `any` u
+//! objeto con función), una respuesta de éxito (`2xx`) cuyo cuerpo no contenga
+//! `tool_calls` cuenta como intento fallido y se continúa con el siguiente
+//! backend. La inspección es conservadora (si el cuerpo no parsea o la forma es
+//! inesperada, se devuelve como éxito) y **no** altera los bytes enviados al
+//! cliente.
+//!
 //! ### Limitación de streaming
 //! En modo `stream: true`, una vez empezada la emisión **no hay failover**: si
 //! el upstream se corta a mitad, el stream se cierra con error (no se
-//! reintenta, porque ya se habrían enviado bytes al cliente).
+//! reintenta, porque ya se habrían enviado bytes al cliente). La condición del
+//! `tool_choice` tampoco se aplica en streaming: los `tool_calls` llegarían como
+//! deltas SSE y detectarlos obligaría a bufferizar, rompiendo el passthrough.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -230,6 +240,17 @@ async fn chat_completions(
 /// conexión, timeout, `429` o `5xx`; un `4xx` distinto de `429` se devuelve tal
 /// cual. Un backend cuya `api_key_env` no resuelve se salta como si fallara.
 ///
+/// En **no-stream**, si la petición exige un `tool_call` (ver
+/// [`request_requires_tool_call`]) y una respuesta de **éxito** (`2xx`) no lo
+/// trae (ver [`response_has_tool_call`]), ese intento se registra como
+/// [`AttemptResult::NoToolCall`] y se prueba el siguiente backend. Un
+/// `4xx`/`3xx` no se inspecciona por esta vía: se devuelve tal cual, como antes.
+///
+/// Al agotar la cadena, el motivo del fallo decide el error devuelto: si hubo al
+/// menos un intento `NoToolCall` **tiene prioridad**, y se devuelve
+/// [`AppError::NoToolCallFromAllBackends`] sobre cualquier otro motivo
+/// (p. ej. [`AppError::AllBackendsFailed`]).
+///
 /// En modo `streaming`, al primer backend OK se devuelve su stream sin
 /// consumir; a partir de ahí ya no hay failover.
 async fn route_with_failover(
@@ -242,6 +263,9 @@ async fn route_with_failover(
     let started = Instant::now();
     let mut attempts = 0usize;
     let mut considered = 0usize;
+    // Se decide una sola vez por petición y solo aplica en no-stream.
+    let requires_tool_call = !streaming && request_requires_tool_call(body);
+    let mut no_tool_call_seen = false;
 
     for (backend_idx, backend) in route.backend.iter().enumerate() {
         considered += 1;
@@ -316,7 +340,26 @@ async fn route_with_failover(
                 }
 
                 match full_response(response, backend).await {
-                    Ok(response) => {
+                    Ok((response, body_bytes)) => {
+                        if requires_tool_call
+                            && response.status().is_success()
+                            && !response_has_tool_call(&body_bytes)
+                        {
+                            state.metrics.record_attempt(
+                                route_idx,
+                                backend_idx,
+                                AttemptResult::NoToolCall,
+                                attempt_started.elapsed(),
+                            );
+                            tracing::warn!(
+                                backend = %backend_id(backend),
+                                result = AttemptResult::NoToolCall.label(),
+                                latency_ms = attempt_started.elapsed().as_millis() as u64,
+                                "respuesta sin tool_calls cuando la petición los exige; probando el siguiente"
+                            );
+                            no_tool_call_seen = true;
+                            continue;
+                        }
                         state.metrics.record_attempt(
                             route_idx,
                             backend_idx,
@@ -390,6 +433,15 @@ async fn route_with_failover(
         "petición fallida"
     );
 
+    // Se distingue el motivo del agotamiento: si algún intento falló por no
+    // traer `tool_calls`, el cliente recibe un código específico.
+    if no_tool_call_seen {
+        return Err(AppError::NoToolCallFromAllBackends {
+            model: route.name.clone(),
+            attempts: considered,
+        });
+    }
+
     Err(AppError::AllBackendsFailed {
         model: route.name.clone(),
         attempts: considered,
@@ -426,6 +478,71 @@ pub(crate) fn resolve_api_key(backend: &Backend) -> Option<Option<String>> {
 /// (`429` o `5xx`); un `4xx` distinto de `429` no se reintenta.
 fn is_retryable(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Indica si la petición **exige** una llamada a herramienta: requiere que
+/// `tools` sea una lista no vacía y que `tool_choice` sea `required`, `any` o
+/// un objeto que nombre una función.
+///
+/// Con `tool_choice` igual a `auto`, `none`, ausente o de forma inesperada, no
+/// se aplica la condición post-respuesta (el modelo puede legítimamente no
+/// llamar a ninguna herramienta).
+fn request_requires_tool_call(body: &Value) -> bool {
+    let has_tools = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_tools {
+        return false;
+    }
+
+    match body.get("tool_choice") {
+        Some(Value::String(choice)) => choice == "required" || choice == "any",
+        Some(Value::Object(choice)) => choice.contains_key("function"),
+        _ => false,
+    }
+}
+
+/// Indica si el cuerpo de la respuesta contiene alguna llamada a herramienta
+/// (`choices[*].message.tool_calls` no vacío).
+///
+/// La inspección es **conservadora**: si el cuerpo no parsea como JSON, no trae
+/// `choices` (o está vacío) o la forma de alguna `choice` es inesperada, se
+/// devuelve `true` para no penalizar una respuesta rara (se tratará como
+/// éxito). Solo devuelve `false` cuando se confirma la ausencia de `tool_calls`
+/// en todas las `choices`.
+fn response_has_tool_call(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return true;
+    };
+
+    let Some(choices) = value
+        .get("choices")
+        .and_then(Value::as_array)
+        .filter(|choices| !choices.is_empty())
+    else {
+        return true;
+    };
+
+    let mut absence_confirmed = true;
+    for choice in choices {
+        // Sin `message` no se puede confirmar la ausencia: no penalizamos.
+        let Some(message) = choice.get("message") else {
+            absence_confirmed = false;
+            continue;
+        };
+        match message.get("tool_calls") {
+            // Ausente o lista vacía: esta `choice` no trae llamada.
+            None => {}
+            Some(Value::Array(tool_calls)) if tool_calls.is_empty() => {}
+            // Lista no vacía: hay llamada a herramienta.
+            Some(Value::Array(_)) => return true,
+            // Forma inesperada: inspección no concluyente, no penalizamos.
+            Some(_) => absence_confirmed = false,
+        }
+    }
+
+    !absence_confirmed
 }
 
 /// Envía la petición al backend y devuelve la respuesta con las cabeceras ya
@@ -473,21 +590,29 @@ async fn send(
 }
 
 /// Convierte la respuesta del upstream en una respuesta no-stream (buffered).
+///
+/// Devuelve además los bytes del cuerpo ya buffereado para que el enrutado
+/// pueda inspeccionarlos (p. ej. para comprobar la presencia de `tool_calls`)
+/// sin recomputarlos; el `Body` de la respuesta se construye a partir de una
+/// copia barata de esos mismos bytes, así que lo devuelto al cliente es
+/// idéntico al upstream.
 async fn full_response(
     response: reqwest::Response,
     backend: &Backend,
-) -> Result<Response, AppError> {
+) -> Result<(Response, Bytes), AppError> {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let body = response.bytes().await.map_err(AppError::Upstream)?;
 
-    Ok(assemble(
+    let response = assemble(
         status,
         content_type,
-        Body::from(body),
+        Body::from(body.clone()),
         DEFAULT_CONTENT_TYPE,
         backend,
-    ))
+    );
+
+    Ok((response, body))
 }
 
 /// Reenvía el cuerpo del upstream como stream SSE, **sin bufferizar**, usando
@@ -604,7 +729,8 @@ async fn healthz() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::chat_url;
+    use super::{chat_url, request_requires_tool_call, response_has_tool_call};
+    use serde_json::json;
 
     #[test]
     fn chat_url_joins_slashes() {
@@ -620,5 +746,71 @@ mod tests {
             chat_url("http://localhost:11434/v1///"),
             "http://localhost:11434/v1/chat/completions"
         );
+    }
+
+    /// `tools` como lista no vacía + `tool_choice` exigente.
+    #[test]
+    fn request_requires_tool_call_only_with_strict_choice() {
+        let tools = json!([{"type": "function", "function": {"name": "f"}}]);
+
+        for choice in [json!("required"), json!("any")] {
+            assert!(
+                request_requires_tool_call(&json!({"tools": tools, "tool_choice": choice})),
+                "tool_choice {choice} debe exigir tool call"
+            );
+        }
+
+        assert!(request_requires_tool_call(&json!({
+            "tools": tools,
+            "tool_choice": {"type": "function", "function": {"name": "f"}}
+        })));
+
+        for choice in [json!("auto"), json!("none")] {
+            assert!(
+                !request_requires_tool_call(&json!({"tools": tools, "tool_choice": choice})),
+                "tool_choice {choice} NO debe exigir tool call"
+            );
+        }
+
+        assert!(!request_requires_tool_call(&json!({"tools": tools})));
+        assert!(!request_requires_tool_call(
+            &json!({"tools": [], "tool_choice": "required"})
+        ));
+        assert!(!request_requires_tool_call(
+            &json!({"tool_choice": "required"})
+        ));
+        assert!(!request_requires_tool_call(&json!({
+            "tools": tools,
+            "tool_choice": {"type": "function"}
+        })));
+    }
+
+    /// Inspección conservadora: solo `false` si se confirma la ausencia.
+    #[test]
+    fn response_has_tool_call_is_conservative() {
+        assert!(response_has_tool_call(b"no es json"));
+        assert!(response_has_tool_call(br#"{"choices":[]}"#));
+        assert!(response_has_tool_call(br#"{"sin":"choices"}"#));
+        assert!(response_has_tool_call(br#"{"choices":"no-es-array"}"#));
+        assert!(response_has_tool_call(
+            br#"{"choices":[{"sin":"message"}]}"#
+        ));
+        assert!(response_has_tool_call(
+            br#"{"choices":[{"message":{"tool_calls":"no-es-array"}}]}"#
+        ));
+        assert!(response_has_tool_call(
+            br#"{"choices":[{"message":{"tool_calls":[{"id":"c1"}]}}]}"#
+        ));
+        // `message` presente sin `tool_calls` (o con lista vacía) es la
+        // ausencia normal: se confirma y se permite el failover.
+        assert!(!response_has_tool_call(
+            br#"{"choices":[{"message":{"tool_calls":[]}}]}"#
+        ));
+        assert!(!response_has_tool_call(
+            br#"{"choices":[{"message":{"role":"assistant"}}]}"#
+        ));
+        assert!(!response_has_tool_call(
+            br#"{"choices":[{"message":{"content":"hola"}}]}"#
+        ));
     }
 }
