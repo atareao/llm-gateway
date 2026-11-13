@@ -19,7 +19,7 @@ async fn spawn_echo_backend() -> String {
         axum::Json(value).into_response()
     }
     let app = Router::new().route("/v1/chat/completions", post(echo));
-    spawn(app).await
+    common::spawn(app).await
 }
 
 async fn spawn_status_backend(status: StatusCode) -> String {
@@ -29,18 +29,7 @@ async fn spawn_status_backend(status: StatusCode) -> String {
     let app = Router::new()
         .route("/v1/chat/completions", post(reply))
         .with_state(status);
-    spawn(app).await
-}
-
-async fn spawn(app: Router) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve mock");
-    });
-    format!("http://{addr}/v1")
+    common::spawn(app).await
 }
 
 /// Levanta el gateway con la ruta `mech-writer` y los backends dados.
@@ -277,7 +266,7 @@ async fn spawn_sse_backend() -> String {
             .expect("respuesta SSE")
     }
     let app = Router::new().route("/v1/chat/completions", post(sse));
-    spawn(app).await
+    common::spawn(app).await
 }
 
 /// Levanta el gateway con `(base_url, model, api_key_env)` por backend.
@@ -410,5 +399,31 @@ async fn streaming_request_is_recorded() {
             r#"llm_gateway_requests_total{route="mech-writer",streaming="true",outcome="success"} 1"#
         ),
         "streaming:\n{body}"
+    );
+}
+
+/// Scenario: una respuesta `200` sin `tool_calls` cuando la petición las exige
+/// registra un intento `no_tool_call`.
+#[tokio::test]
+async fn no_tool_call_attempt_is_recorded() {
+    let (backend, _hits) = common::spawn_json_backend(common::text_body()).await;
+    let gateway = spawn_gateway(&[(&backend, "m")]).await;
+
+    let response = post_chat(
+        &gateway,
+        json!({
+            "model": "mech-writer",
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "tool_choice": "required"
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let (_, _, body) = get_metrics(&gateway).await;
+    assert!(
+        body.contains(r#"result="no_tool_call"} 1"#),
+        "intento sin tool_calls:\n{body}"
     );
 }

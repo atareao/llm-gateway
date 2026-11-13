@@ -108,8 +108,11 @@ loopback por defecto.
 | `llm_gateway_errors_total` | counter | `kind` (`invalid_request`, `model_not_found`) |
 
 `result` vale `success`, `retryable_status`, `transport_error`,
-`first_byte_timeout`, `missing_api_key` o `body_error`. Los histogramas usan los
-buckets `0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120` segundos y `+Inf`.
+`first_byte_timeout`, `missing_api_key`, `body_error` o `no_tool_call` (este
+último es una respuesta `2xx` sin `tool_calls` cuando la petición exigía una
+llamada a herramienta; ver [`docs/toolcall-failover.md`](docs/toolcall-failover.md).
+Los histogramas usan los buckets `0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
+120` segundos y `+Inf`.
 
 En streaming, los histogramas de duración miden el **tiempo hasta la primera
 cabecera** (TTFB), no la duración total del stream: el gateway deja de medir en
