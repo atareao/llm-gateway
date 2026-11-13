@@ -1,4 +1,15 @@
 # Changelog
+## [0.4.0] - 2026-11-13
+
+### Documentation
+
+- *(openspec)* Propuesta y plan para failover ante respuesta sin tool_calls (#21)
+- Documenta el failover sin tool_calls (#21)
+- *(openspec)* Archiva add-toolcall-failover (#21)
+
+### Features
+
+- *(proxy)* Failover cuando la respuesta no trae tool_calls (#21)
 ## [0.3.3] - 2026-11-07
 
 ### Documentation
