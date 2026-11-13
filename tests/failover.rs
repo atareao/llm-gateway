@@ -28,7 +28,7 @@ async fn spawn_echo_backend() -> String {
         axum::Json(value).into_response()
     }
     let app = Router::new().route("/v1/chat/completions", post(echo));
-    spawn(app).await
+    common::spawn(app).await
 }
 
 /// Mock que cuenta peticiones y responde `200`.
@@ -41,7 +41,7 @@ async fn spawn_counting_backend() -> (String, Arc<AtomicUsize>) {
     let app = Router::new()
         .route("/v1/chat/completions", post(reply))
         .with_state(Arc::clone(&counter));
-    (spawn(app).await, counter)
+    (common::spawn(app).await, counter)
 }
 
 /// Mock que acepta la conexión pero **nunca responde** (se queda colgado hasta
@@ -52,7 +52,7 @@ async fn spawn_hang_backend() -> String {
         unreachable!()
     }
     let app = Router::new().route("/v1/chat/completions", post(hang));
-    spawn(app).await
+    common::spawn(app).await
 }
 
 /// Mock que responde `200` con cabeceras `application/json` pero un cuerpo que
@@ -68,7 +68,7 @@ async fn spawn_hang_body_backend() -> String {
             .expect("respuesta")
     }
     let app = Router::new().route("/v1/chat/completions", post(hang_body));
-    spawn(app).await
+    common::spawn(app).await
 }
 
 /// Mock que responde siempre con un `status` y cuerpo fijos.
@@ -79,18 +79,7 @@ async fn spawn_status_backend(status: StatusCode, body: Value) -> String {
     let app = Router::new()
         .route("/v1/chat/completions", post(reply))
         .with_state((status, Arc::new(body)));
-    spawn(app).await
-}
-
-async fn spawn(app: Router) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve mock");
-    });
-    format!("http://{addr}/v1")
+    common::spawn(app).await
 }
 
 struct Backends {
@@ -460,6 +449,293 @@ fn backend_id_format_is_base_url_hash_model() {
         backend_id(&backend),
         "http://localhost:11434/v1#qwen2.5:7b-instruct"
     );
+}
+
+/// Cuerpo de petición con `tools` no vacío y el `tool_choice` indicado.
+fn tool_request(tool_choice: Value) -> Value {
+    json!({
+        "model": "mech-writer",
+        "messages": [{"role": "user", "content": "¿Qué tiempo hace?"}],
+        "tools": [{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}}
+        }],
+        "tool_choice": tool_choice
+    })
+}
+
+/// Scenario: `tool_choice: "required"` y el primario responde `200` sin
+/// `tool_calls` → se considera intento fallido y responde el fallback.
+#[tokio::test]
+async fn required_tool_choice_fails_over_when_primary_has_no_tool_calls() {
+    let (primary, _primary_hits) = common::spawn_json_backend(common::text_body()).await;
+    let (fallback, fallback_hits) = common::spawn_json_backend(common::tool_call_body()).await;
+    let b = Backends {
+        primary,
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback: fallback.clone(),
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway(&b).await;
+
+    let response = post_chat(&gateway, tool_request(json!("required"))).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend_header(&response),
+        format!("{fallback}#qwen/qwen3-8b")
+    );
+    assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+
+    let body: Value = response.json().await.expect("json de respuesta");
+    assert_eq!(
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        json!("get_weather")
+    );
+}
+
+/// Scenario: `tool_choice: "auto"` con primario `200` sin `tool_calls` → NO se
+/// aplica la condición post-respuesta ni se contacta el fallback.
+#[tokio::test]
+async fn auto_tool_choice_does_not_fail_over() {
+    let primary_body = common::text_body();
+    let (primary, _primary_hits) = common::spawn_json_backend(primary_body.clone()).await;
+    let (fallback, fallback_hits) = common::spawn_json_backend(common::tool_call_body()).await;
+    let b = Backends {
+        primary: primary.clone(),
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback,
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway(&b).await;
+
+    let response = post_chat(&gateway, tool_request(json!("auto"))).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend_header(&response),
+        format!("{primary}#qwen2.5:7b-instruct")
+    );
+    assert_eq!(
+        fallback_hits.load(Ordering::SeqCst),
+        0,
+        "con tool_choice auto no debe contactarse el fallback"
+    );
+    let body: Value = response.json().await.expect("json de respuesta");
+    assert_eq!(body, primary_body);
+}
+
+/// Scenario: `tool_choice` ausente → NO se contacta el fallback.
+#[tokio::test]
+async fn missing_tool_choice_does_not_fail_over() {
+    let (primary, _primary_hits) = common::spawn_json_backend(common::text_body()).await;
+    let (fallback, fallback_hits) = common::spawn_json_backend(common::tool_call_body()).await;
+    let b = Backends {
+        primary: primary.clone(),
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback,
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway(&b).await;
+
+    let response = post_chat(
+        &gateway,
+        json!({
+            "model": "mech-writer",
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}]
+        }),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend_header(&response),
+        format!("{primary}#qwen2.5:7b-instruct")
+    );
+    assert_eq!(
+        fallback_hits.load(Ordering::SeqCst),
+        0,
+        "sin tool_choice no debe contactarse el fallback"
+    );
+}
+
+/// Scenario: `tool_choice` como objeto que nombra una función → failover.
+#[tokio::test]
+async fn function_tool_choice_fails_over() {
+    let (primary, _primary_hits) = common::spawn_json_backend(common::text_body()).await;
+    let (fallback, fallback_hits) = common::spawn_json_backend(common::tool_call_body()).await;
+    let b = Backends {
+        primary,
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback: fallback.clone(),
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway(&b).await;
+
+    let response = post_chat(
+        &gateway,
+        tool_request(json!({"type": "function", "function": {"name": "get_weather"}})),
+    )
+    .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend_header(&response),
+        format!("{fallback}#qwen/qwen3-8b")
+    );
+    assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+}
+
+/// Scenario: todos los backends responden `200` sin `tool_calls` → `502` con
+/// código `no_tool_call`.
+#[tokio::test]
+async fn all_backends_without_tool_calls_return_502_no_tool_call() {
+    let (primary, _primary_hits) = common::spawn_json_backend(common::text_body()).await;
+    let (fallback, fallback_hits) = common::spawn_json_backend(common::text_body()).await;
+    let b = Backends {
+        primary,
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback,
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway(&b).await;
+
+    let response = post_chat(&gateway, tool_request(json!("any"))).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+
+    let body: Value = response.json().await.expect("json de error");
+    assert_eq!(body["error"]["type"], json!("api_error"));
+    assert_eq!(body["error"]["code"], json!("no_tool_call"));
+}
+
+/// Scenario: el primario responde `200` **con** `tool_calls` → no hay failover.
+#[tokio::test]
+async fn primary_with_tool_calls_does_not_fail_over() {
+    let (primary, _primary_hits) = common::spawn_json_backend(common::tool_call_body()).await;
+    let (fallback, fallback_hits) = common::spawn_json_backend(common::tool_call_body()).await;
+    let b = Backends {
+        primary: primary.clone(),
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback,
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway(&b).await;
+
+    let response = post_chat(&gateway, tool_request(json!("required"))).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        backend_header(&response),
+        format!("{primary}#qwen2.5:7b-instruct")
+    );
+    assert_eq!(
+        fallback_hits.load(Ordering::SeqCst),
+        0,
+        "con tool_calls en la respuesta no debe contactarse el fallback"
+    );
+}
+
+/// Scenario: un `4xx` cuyo cuerpo, aunque "parezca" una completion sin
+/// `tool_calls`, NO dispara el failover por tool_choice: se devuelve tal cual.
+#[tokio::test]
+async fn error_status_without_tool_calls_is_passed_through() {
+    let error_body = json!({
+        "error": {
+            "message": "upstream 4xx",
+            "type": "invalid_request_error",
+            "code": "bad_request"
+        },
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": "sin tools"}
+        }]
+    });
+    let primary = spawn_status_backend(StatusCode::BAD_REQUEST, error_body.clone()).await;
+    let (fallback, fallback_hits) = common::spawn_json_backend(common::tool_call_body()).await;
+    let b = Backends {
+        primary,
+        primary_model: "qwen2.5:7b-instruct".to_owned(),
+        fallback,
+        fallback_model: "qwen/qwen3-8b".to_owned(),
+    };
+    let gateway = spawn_gateway(&b).await;
+
+    let response = post_chat(&gateway, tool_request(json!("required"))).await;
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "un 4xx no debe convertirse en failover ni en 502 no_tool_call"
+    );
+    assert_eq!(
+        fallback_hits.load(Ordering::SeqCst),
+        0,
+        "un 4xx no debe contactar el fallback"
+    );
+    let body: Value = response.json().await.expect("json de error");
+    assert_eq!(body, error_body);
+}
+
+/// Scenario: la condición post-respuesta solo aplica con `tools` no vacío **y**
+/// `tool_choice` exigente; estas variantes NO disparan failover aunque el
+/// primario responda sin `tool_calls`.
+#[tokio::test]
+async fn tool_choice_condition_does_not_apply_to_other_shapes() {
+    let cases = [
+        // `tools` como lista vacía.
+        json!({
+            "model": "mech-writer",
+            "messages": [],
+            "tools": [],
+            "tool_choice": "required"
+        }),
+        // `tools` ausente.
+        json!({
+            "model": "mech-writer",
+            "messages": [],
+            "tool_choice": "required"
+        }),
+        // `tool_choice` objeto sin clave `function`.
+        json!({
+            "model": "mech-writer",
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "tool_choice": {"type": "function"}
+        }),
+    ];
+
+    for body in cases {
+        let (primary, _) = common::spawn_json_backend(common::text_body()).await;
+        let (fallback, fallback_hits) = common::spawn_json_backend(common::tool_call_body()).await;
+        let b = Backends {
+            primary: primary.clone(),
+            primary_model: "qwen2.5:7b-instruct".to_owned(),
+            fallback,
+            fallback_model: "qwen/qwen3-8b".to_owned(),
+        };
+        let gateway = spawn_gateway(&b).await;
+
+        let response = post_chat(&gateway, body.clone()).await;
+
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "body inesperado: {body}"
+        );
+        assert_eq!(
+            backend_header(&response),
+            format!("{primary}#qwen2.5:7b-instruct"),
+            "body inesperado: {body}"
+        );
+        assert_eq!(
+            fallback_hits.load(Ordering::SeqCst),
+            0,
+            "no debe contactarse el fallback para el body: {body}"
+        );
+    }
 }
 
 /// Scenario: el puerto reservado por `dead_backend()` no puede reutilizarlo

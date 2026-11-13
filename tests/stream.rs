@@ -436,3 +436,48 @@ async fn mid_stream_cut_does_not_fail_over() {
         "un corte a mitad de stream no debe provocar failover"
     );
 }
+
+/// Scenario: `stream: true` con `tools` no vacío y `tool_choice: "required"` →
+/// el gateway reenvía el stream del primario sin inspeccionar `tool_calls` y sin
+/// failover por esta causa.
+#[tokio::test]
+async fn streaming_ignores_missing_tool_calls() {
+    let primary = spawn_sse_backend().await;
+    let (fallback, counter) = spawn_counting_backend().await;
+    let gateway = spawn_gateway(&[
+        (&primary, "qwen2.5:7b-instruct"),
+        (&fallback, "qwen/qwen3-8b"),
+    ])
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .json(&json!({
+            "model": "mech-writer",
+            "stream": true,
+            "messages": [],
+            "tools": [{"type": "function", "function": {"name": "get_weather"}}],
+            "tool_choice": "required"
+        }))
+        .send()
+        .await
+        .expect("request al gateway");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-gateway-backend")
+            .and_then(|v| v.to_str().ok()),
+        Some(format!("{primary}#qwen2.5:7b-instruct").as_str()),
+        "en streaming debe responder el primario, sin failover"
+    );
+
+    let body = response.text().await.expect("cuerpo del stream");
+    assert!(body.contains("Hola"), "stream inesperado: {body}");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        0,
+        "en streaming no debe contactarse el fallback por falta de tool_calls"
+    );
+}
