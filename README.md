@@ -15,7 +15,7 @@ Escrito en **Rust** (axum + tokio + reqwest). Pensado para que [OpenCode](https:
 | 🛠️ **Tools** | Paso transparente de `tools`, `tool_choice` y `tool_calls` |
 | 📡 **Streaming SSE** | Reenvío sin bufferizar de los chunks `data:` |
 | 🔑 **Secretos por entorno** | Las claves se referencian con `api_key_env`; nunca en el YAML ni en los logs |
-| 📊 **Observabilidad** | `/metrics` en formato Prometheus, logs correlacionados por `x-request-id` y salida JSON opcional |
+| 📊 **Observabilidad** | `/metrics` en formato Prometheus, logs correlacionados por `x-request-id`, salida JSON opcional y exportación OTLP (métricas, logs y trazas) a OpenObserve |
 
 ## 🚧 Estado
 
@@ -140,6 +140,37 @@ envía uno válido (ASCII visible, 1–128 bytes) se reutiliza; si no, se genera
 GATEWAY_LOG_FORMAT=json llm-gateway   # una línea JSON por evento
 RUST_LOG=debug llm-gateway            # incluye los intentos con éxito
 ```
+
+### Exportación OTLP a OpenObserve (opcional)
+
+Además de `/metrics`, el gateway puede **empujar** métricas, logs y trazas por
+OTLP/HTTP a un colector como **OpenObserve**. Es *opt-in*: sin el bloque
+`observability.otlp` no se exporta nada y el comportamiento es idéntico al de
+antes (Prometheus sigue igual).
+
+`/metrics` y la exportación OTLP beben de la **misma** fuente: un único
+`MeterProvider` con el `PrometheusExporter` (siempre) y un `PeriodicReader` OTLP
+(solo si `signals.metrics`). Las series mantienen los nombres `llm_gateway_*`.
+
+```yaml
+observability:
+  otlp:
+    endpoint: "http://localhost:5080"     # base, sin /api/<org>
+    organization: "default"
+    protocol: http                        # único soportado hoy (grpc se rechaza)
+    token_env: "OPENOBSERVE_TOKEN"        # el token se lee del entorno, no del YAML
+    interval_ms: 15000                    # default 15000
+    timeout_ms: 10000                     # default 10000
+    signals:
+      metrics: true
+      logs: true
+      traces: true
+```
+
+Con trazas activas se instala el propagador W3C y el gateway propaga
+`traceparent` al backend. El token se envía como
+`Authorization: Basic <token>`. 📄 Detalles, verificación en OpenObserve,
+decisiones y limitaciones: [`docs/openobserve-otlp.md`](docs/openobserve-otlp.md).
 
 ## ▶️ Uso
 
