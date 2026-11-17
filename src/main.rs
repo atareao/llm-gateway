@@ -8,22 +8,18 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8080";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let json = std::env::var("GATEWAY_LOG_FORMAT")
-        .map(|value| value.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
-
-    if json {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
-
+    // La configuración se lee antes de instalar el subscriber: si falla, el
+    // error se propaga igualmente (exit code ≠ 0) sin necesidad de logging.
     let config = llm_gateway_rs::config::load_default()?;
+
+    // `telemetry::init` instala el subscriber de `tracing` (texto o JSON según
+    // `GATEWAY_LOG_FORMAT`) más los layers OTLP que pida la config, y deja los
+    // `MeterProvider`/`TracerProvider`/`LoggerProvider` globales listos. Debe
+    // ir ANTES de construir `AppState`, cuyos instrumentos los toman del
+    // `MeterProvider` global.
+    let telemetry =
+        llm_gateway_rs::telemetry::init(&config).context("no se pudo inicializar la telemetría")?;
+
     tracing::info!(routes = config.route.len(), "configuración cargada");
 
     let addr: SocketAddr = std::env::var("GATEWAY_LISTEN")
@@ -47,10 +43,14 @@ async fn main() -> Result<()> {
         .await
         .context("error en el servidor HTTP")?;
 
-    // Apagado ordenado: no dejar tareas de keep-alive activas durante el cierre.
+    // Apagado ordenado: primero se detiene el keep-alive para que ningún warmup
+    // en vuelo registre señales contra instrumentos ya cerrados, y después se
+    // vacían las señales OTLP pendientes. Aunque este flush no llegase a
+    // ejecutarse, `TelemetryGuard` lo repite al dropearse.
     for handle in &warmup_handles {
         handle.abort();
     }
+    telemetry.flush();
     tracing::info!(tasks = warmup_handles.len(), "cierre ordenado completado");
 
     Ok(())

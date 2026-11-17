@@ -17,3 +17,28 @@ route:
         # Opcional. No-stream: timeout total (default 120s si se omite).
         # Streaming: timeout de primer byte (default 5s).
         timeout_ms: 30000
+
+# Observabilidad (opcional). Ausente → el gateway no exporta nada por OTLP y
+# solo expone /metrics en formato Prometheus, como antes.
+# observability:
+#   otlp:
+#     # Base del colector, sin `/api/<organización>`.
+#     endpoint: "http://localhost:5080"
+#     organization: "default"
+#     # Solo `http` está soportado hoy; `grpc` se rechaza al validar.
+#     protocol: http
+#     # Nombre de la variable de entorno con el token de ingesta. NUNCA se
+#     # escribe el token aquí: el gateway lo lee del entorno y lo envía como
+#     # `Authorization: Basic <token>`. Si la variable no existe, el arranque falla.
+#     token_env: "OPENOBSERVE_TOKEN"
+#     # Nombre de servicio reportado como recurso OTel (opcional).
+#     service_name: "llm-gateway"
+#     # Intervalo de exportación en ms (default 15000) y timeout por export (opcional).
+#     interval_ms: 15000
+#     # timeout_ms: 10000
+#     # Al menos una señal debe estar activa; si el bloque existe con todas a
+#     # false, la carga de la configuración falla.
+#     signals:
+#       metrics: true
+#       logs: true
+#       traces: true

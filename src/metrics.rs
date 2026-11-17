@@ -1,18 +1,34 @@
-//! Métricas del gateway en formato de exposición de Prometheus.
+//! Métricas del gateway sobre instrumentos OpenTelemetry.
 //!
 //! El conjunto de series es finito y se conoce al arrancar (rutas y backends de
-//! `gateway.yaml`), así que el registro se pre-registra en [`Metrics::new`] y
-//! cada serie es un `AtomicU64`: no hay `HashMap` ni `Mutex` en la ruta caliente.
+//! `gateway.yaml`), así que en [`Metrics::new`] se **pre-registran** los
+//! conjuntos de atributos de cada serie: la ruta caliente solo recorre índices
+//! y llama a `add`/`record`, sin `HashMap` ni `Mutex`.
+//!
+//! Los instrumentos viven en el `MeterProvider` global instalado por
+//! [`crate::telemetry`], que lleva dos readers: el `PrometheusExporter`
+//! (siempre; sirve `GET /metrics`) y, si `signals.metrics`, un `PeriodicReader`
+//! que los exporta por OTLP. Una única fuente de verdad para scrape y export.
+//!
+//! Los nombres de serie `llm_gateway_*` son contrato observable: los counters
+//! se nombran **sin** el sufijo `_total` porque el `PrometheusExporter` lo
+//! añade al renderizar.
 
-use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
+use prometheus::Encoder as _;
 
 use crate::config::GatewayConfig;
 use crate::proxy::backend_id;
+use crate::telemetry;
 
 /// Límites superiores de los buckets del histograma, en segundos.
 const BUCKETS: [f64; 11] = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0];
+
+/// Nombre del `Meter` (scope de instrumentación).
+const SCOPE_NAME: &str = "llm-gateway";
 
 const OUTCOMES: [Outcome; 2] = [Outcome::Success, Outcome::AllFailed];
 const GLOBAL_OUTCOMES: [GlobalOutcome; 2] =
@@ -115,108 +131,204 @@ impl AttemptResult {
     }
 }
 
-/// Histograma acumulativo con buckets fijos.
-struct Histogram {
-    buckets: [AtomicU64; BUCKETS.len()],
-    sum_nanos: AtomicU64,
-    count: AtomicU64,
-}
-
-impl Histogram {
-    fn new() -> Self {
-        Self {
-            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
-            sum_nanos: AtomicU64::new(0),
-            count: AtomicU64::new(0),
-        }
-    }
-
-    /// Registra una observación. Los buckets son acumulativos: se incrementa
-    /// cada límite superior mayor o igual que el valor observado.
-    fn observe(&self, elapsed: Duration) {
-        let secs = elapsed.as_secs_f64();
-        for (index, bound) in BUCKETS.iter().enumerate() {
-            if secs <= *bound {
-                self.buckets[index].fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        self.sum_nanos.fetch_add(
-            elapsed.as_nanos().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
-        self.count.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn bucket(&self, index: usize) -> u64 {
-        self.buckets[index].load(Ordering::Relaxed)
-    }
-
-    fn count(&self) -> u64 {
-        self.count.load(Ordering::Relaxed)
-    }
-
-    fn sum_seconds(&self) -> f64 {
-        self.sum_nanos.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
-    }
-}
-
+/// Atributos pre-registrados de un backend.
 struct BackendMetrics {
-    id: String,
-    attempts: [AtomicU64; 7],
-    duration: Histogram,
+    /// `[result]` → atributos `route`, `backend`, `result`.
+    attempts: [Vec<KeyValue>; 7],
+    /// Atributos `route`, `backend`.
+    duration: Vec<KeyValue>,
     /// El backend declara un bloque `warmup`.
     warmup_enabled: bool,
-    /// Estado del último warmup: `1` si respondió `2xx`, `0` en caso contrario.
-    warm: AtomicU64,
-    /// Warmups por resultado: `[success, failure]`.
-    warmups: [AtomicU64; 2],
+    /// `[success, failure]` → atributos `route`, `backend`, `result`.
+    warmups: [Vec<KeyValue>; 2],
 }
 
+/// Atributos pre-registrados de una ruta.
 struct RouteMetrics {
-    name: String,
-    /// `[streaming][outcome]`
-    requests: [[AtomicU64; 2]; 2],
-    failovers: AtomicU64,
-    /// Por `streaming`.
-    duration: [Histogram; 2],
+    /// `[streaming][outcome]` → atributos `route`, `streaming`, `outcome`.
+    requests: [[Vec<KeyValue>; 2]; 2],
+    /// Atributos `route`.
+    failover: Vec<KeyValue>,
+    /// `[streaming]` → atributos `route`, `streaming`.
+    duration: [Vec<KeyValue>; 2],
     backends: Vec<BackendMetrics>,
 }
 
 /// Registro de métricas pre-registrado a partir de la configuración.
 pub struct Metrics {
+    requests: Counter<u64>,
+    request_duration: Histogram<f64>,
+    failover: Counter<u64>,
+    backend_attempts: Counter<u64>,
+    backend_duration: Histogram<f64>,
+    errors: Counter<u64>,
+    backend_warm: Gauge<u64>,
+    warmup: Counter<u64>,
     routes: Vec<RouteMetrics>,
-    errors: [AtomicU64; 2],
+    /// `[kind]` → atributos `kind`.
+    error_kinds: [Vec<KeyValue>; 2],
+}
+
+/// Atributos `route`, `streaming`, `outcome`.
+fn request_attrs(route: &str, streaming: bool, outcome: Outcome) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new("route", route.to_owned()),
+        KeyValue::new("streaming", streaming.to_string()),
+        KeyValue::new("outcome", outcome.label()),
+    ]
+}
+
+/// Atributos `route`, `streaming`.
+fn duration_attrs(route: &str, streaming: bool) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new("route", route.to_owned()),
+        KeyValue::new("streaming", streaming.to_string()),
+    ]
 }
 
 impl Metrics {
     /// Pre-registra una serie por ruta, por backend y por resultado posible.
+    ///
+    /// Se registra un `0` en cada serie pre-registrada para que `/metrics`
+    /// emita el conjunto completo de series desde el primer scrape, igual que
+    /// hacía el registro de atómicos.
     pub fn new(config: &GatewayConfig) -> Self {
+        // Sin `telemetry::init` (tests, usos embebidos) garantiza al menos el
+        // reader Prometheus para que `/metrics` funcione.
+        telemetry::ensure_meter_provider();
+        let meter = opentelemetry::global::meter(SCOPE_NAME);
+
+        let requests = meter
+            .u64_counter("llm_gateway_requests")
+            .with_description("Peticiones a /v1/chat/completions por ruta y resultado.")
+            .build();
+        let request_duration = meter
+            .f64_histogram("llm_gateway_request_duration_seconds")
+            .with_description(
+                "Latencia total de las peticiones (en streaming, tiempo hasta la primera cabecera).",
+            )
+            .with_boundaries(BUCKETS.to_vec())
+            .build();
+        let failover = meter
+            .u64_counter("llm_gateway_failover")
+            .with_description("Peticiones que necesitaron más de un intento.")
+            .build();
+        let backend_attempts = meter
+            .u64_counter("llm_gateway_backend_attempts")
+            .with_description("Intentos contra cada backend por resultado.")
+            .build();
+        let backend_duration = meter
+            .f64_histogram("llm_gateway_backend_duration_seconds")
+            .with_description(
+                "Latencia de cada intento contra un backend (en streaming, tiempo hasta la primera cabecera).",
+            )
+            .with_boundaries(BUCKETS.to_vec())
+            .build();
+        let errors = meter
+            .u64_counter("llm_gateway_errors")
+            .with_description("Peticiones rechazadas antes de resolver la ruta.")
+            .build();
+        let backend_warm = meter
+            .u64_gauge("llm_gateway_backend_warm")
+            .with_description("Si el último warmup del backend respondió 2xx (1) o no (0).")
+            .build();
+        let warmup = meter
+            .u64_counter("llm_gateway_warmup")
+            .with_description("Warmups ejecutados por backend y resultado.")
+            .build();
+
+        let error_kinds = std::array::from_fn(|index| {
+            vec![KeyValue::new("kind", GLOBAL_OUTCOMES[index].label())]
+        });
+        for attrs in &error_kinds {
+            errors.add(0, attrs);
+        }
+
         let routes = config
             .route
             .iter()
-            .map(|route| RouteMetrics {
-                name: route.name.clone(),
-                requests: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
-                failovers: AtomicU64::new(0),
-                duration: std::array::from_fn(|_| Histogram::new()),
-                backends: route
+            .map(|route| {
+                let requests = std::array::from_fn(|streaming| {
+                    std::array::from_fn(|outcome| {
+                        request_attrs(&route.name, streaming == 1, OUTCOMES[outcome])
+                    })
+                });
+                let failover = vec![KeyValue::new("route", route.name.clone())];
+                let duration =
+                    std::array::from_fn(|streaming| duration_attrs(&route.name, streaming == 1));
+                let backends = route
                     .backend
                     .iter()
-                    .map(|backend| BackendMetrics {
-                        id: backend_id(backend),
-                        attempts: std::array::from_fn(|_| AtomicU64::new(0)),
-                        duration: Histogram::new(),
-                        warmup_enabled: backend.warmup.is_some(),
-                        warm: AtomicU64::new(0),
-                        warmups: std::array::from_fn(|_| AtomicU64::new(0)),
+                    .map(|backend| {
+                        let id = backend_id(backend);
+                        let attempts = std::array::from_fn(|result| {
+                            vec![
+                                KeyValue::new("route", route.name.clone()),
+                                KeyValue::new("backend", id.clone()),
+                                KeyValue::new("result", ATTEMPT_RESULTS[result].label()),
+                            ]
+                        });
+                        let duration = vec![
+                            KeyValue::new("route", route.name.clone()),
+                            KeyValue::new("backend", id.clone()),
+                        ];
+                        let warmups = std::array::from_fn(|result| {
+                            vec![
+                                KeyValue::new("route", route.name.clone()),
+                                KeyValue::new("backend", id.clone()),
+                                KeyValue::new(
+                                    "result",
+                                    if result == 0 { "success" } else { "failure" },
+                                ),
+                            ]
+                        });
+                        BackendMetrics {
+                            attempts,
+                            duration,
+                            warmup_enabled: backend.warmup.is_some(),
+                            warmups,
+                        }
                     })
-                    .collect(),
+                    .collect();
+                RouteMetrics {
+                    requests,
+                    failover,
+                    duration,
+                    backends,
+                }
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        // Pre-registro: emite las series en cero desde el primer scrape.
+        for route in &routes {
+            for attrs in route.requests.iter().flatten() {
+                requests.add(0, attrs);
+            }
+            failover.add(0, &route.failover);
+            for backend in &route.backends {
+                for attrs in &backend.attempts {
+                    backend_attempts.add(0, attrs);
+                }
+                if backend.warmup_enabled {
+                    backend_warm.record(0, &backend.duration);
+                    for attrs in &backend.warmups {
+                        warmup.add(0, attrs);
+                    }
+                }
+            }
+        }
 
         Self {
+            requests,
+            request_duration,
+            failover,
+            backend_attempts,
+            backend_duration,
+            errors,
+            backend_warm,
+            warmup,
             routes,
-            errors: std::array::from_fn(|_| AtomicU64::new(0)),
+            error_kinds,
         }
     }
 
@@ -229,8 +341,11 @@ impl Metrics {
         elapsed: Duration,
     ) {
         if let Some(route) = self.routes.get(route) {
-            route.requests[usize::from(streaming)][outcome.index()].fetch_add(1, Ordering::Relaxed);
-            route.duration[usize::from(streaming)].observe(elapsed);
+            let streaming = usize::from(streaming);
+            self.requests
+                .add(1, &route.requests[streaming][outcome.index()]);
+            self.request_duration
+                .record(elapsed.as_secs_f64(), &route.duration[streaming]);
         }
     }
 
@@ -245,8 +360,10 @@ impl Metrics {
         if let Some(route) = self.routes.get(route)
             && let Some(backend) = route.backends.get(backend)
         {
-            backend.attempts[result.index()].fetch_add(1, Ordering::Relaxed);
-            backend.duration.observe(elapsed);
+            self.backend_attempts
+                .add(1, &backend.attempts[result.index()]);
+            self.backend_duration
+                .record(elapsed.as_secs_f64(), &backend.duration);
         }
     }
 
@@ -256,213 +373,49 @@ impl Metrics {
         if let Some(route) = self.routes.get(route)
             && let Some(backend) = route.backends.get(backend)
         {
-            backend.warm.store(u64::from(ok), Ordering::Relaxed);
-            backend.warmups[usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
+            self.backend_warm.record(u64::from(ok), &backend.duration);
+            self.warmup.add(1, &backend.warmups[usize::from(!ok)]);
         }
     }
 
     /// Registra que una petición necesitó más de un intento.
     pub fn record_failover(&self, route: usize) {
         if let Some(route) = self.routes.get(route) {
-            route.failovers.fetch_add(1, Ordering::Relaxed);
+            self.failover.add(1, &route.failover);
         }
     }
 
     /// Registra un rechazo anterior a la resolución de ruta.
     pub fn record_global(&self, outcome: GlobalOutcome) {
-        self.errors[outcome.index()].fetch_add(1, Ordering::Relaxed);
+        self.errors.add(1, &self.error_kinds[outcome.index()]);
     }
 
     /// Renderiza todas las series en formato de exposición de Prometheus.
+    ///
+    /// Lee del mismo registro OTel que alimenta la exportación OTLP, así que
+    /// scrape y export comparten una única fuente de verdad.
     pub fn render(&self) -> String {
-        let mut out = String::new();
-
-        out.push_str("# HELP llm_gateway_requests_total Peticiones a /v1/chat/completions por ruta y resultado.\n");
-        out.push_str("# TYPE llm_gateway_requests_total counter\n");
-        for route in &self.routes {
-            for streaming in [false, true] {
-                for outcome in OUTCOMES {
-                    let value = route.requests[usize::from(streaming)][outcome.index()]
-                        .load(Ordering::Relaxed);
-                    let _ = writeln!(
-                        out,
-                        "llm_gateway_requests_total{{route=\"{}\",streaming=\"{}\",outcome=\"{}\"}} {value}",
-                        escape(&route.name),
-                        streaming,
-                        outcome.label()
-                    );
-                }
-            }
+        let families = telemetry::prometheus_registry().gather();
+        let mut buffer = Vec::new();
+        if let Err(err) = prometheus::TextEncoder::new().encode(&families, &mut buffer) {
+            tracing::error!(error = %err, "no se pudieron codificar las métricas");
+            return String::new();
         }
-
-        out.push_str(
-            "# HELP llm_gateway_request_duration_seconds Latencia total de las peticiones (en streaming, tiempo hasta la primera cabecera).\n",
-        );
-        out.push_str("# TYPE llm_gateway_request_duration_seconds histogram\n");
-        for route in &self.routes {
-            for streaming in [false, true] {
-                let labels = format!(
-                    "route=\"{}\",streaming=\"{}\"",
-                    escape(&route.name),
-                    streaming
-                );
-                render_histogram_series(
-                    &mut out,
-                    "llm_gateway_request_duration_seconds",
-                    &labels,
-                    &route.duration[usize::from(streaming)],
-                );
-            }
-        }
-
-        out.push_str(
-            "# HELP llm_gateway_failover_total Peticiones que necesitaron más de un intento.\n",
-        );
-        out.push_str("# TYPE llm_gateway_failover_total counter\n");
-        for route in &self.routes {
-            let value = route.failovers.load(Ordering::Relaxed);
-            let _ = writeln!(
-                out,
-                "llm_gateway_failover_total{{route=\"{}\"}} {value}",
-                escape(&route.name)
-            );
-        }
-
-        out.push_str("# HELP llm_gateway_backend_attempts_total Intentos contra cada backend por resultado.\n");
-        out.push_str("# TYPE llm_gateway_backend_attempts_total counter\n");
-        for route in &self.routes {
-            for backend in &route.backends {
-                for result in ATTEMPT_RESULTS {
-                    let value = backend.attempts[result.index()].load(Ordering::Relaxed);
-                    let _ = writeln!(
-                        out,
-                        "llm_gateway_backend_attempts_total{{route=\"{}\",backend=\"{}\",result=\"{}\"}} {value}",
-                        escape(&route.name),
-                        escape(&backend.id),
-                        result.label()
-                    );
-                }
-            }
-        }
-
-        out.push_str("# HELP llm_gateway_backend_duration_seconds Latencia de cada intento contra un backend (en streaming, tiempo hasta la primera cabecera).\n");
-        out.push_str("# TYPE llm_gateway_backend_duration_seconds histogram\n");
-        for route in &self.routes {
-            for backend in &route.backends {
-                let labels = format!(
-                    "route=\"{}\",backend=\"{}\"",
-                    escape(&route.name),
-                    escape(&backend.id)
-                );
-                render_histogram_series(
-                    &mut out,
-                    "llm_gateway_backend_duration_seconds",
-                    &labels,
-                    &backend.duration,
-                );
-            }
-        }
-
-        out.push_str(
-            "# HELP llm_gateway_errors_total Peticiones rechazadas antes de resolver la ruta.\n",
-        );
-        out.push_str("# TYPE llm_gateway_errors_total counter\n");
-        for outcome in GLOBAL_OUTCOMES {
-            let value = self.errors[outcome.index()].load(Ordering::Relaxed);
-            let _ = writeln!(
-                out,
-                "llm_gateway_errors_total{{kind=\"{}\"}} {value}",
-                outcome.label()
-            );
-        }
-
-        // Las familias de warmup solo existen si algún backend declara `warmup`:
-        // sin muestras, no se emiten sus directivas `# HELP`/`# TYPE`.
-        let any_warmup = self
-            .routes
-            .iter()
-            .any(|route| route.backends.iter().any(|backend| backend.warmup_enabled));
-
-        if any_warmup {
-            out.push_str("# HELP llm_gateway_backend_warm Si el último warmup del backend respondió 2xx (1) o no (0).\n");
-            out.push_str("# TYPE llm_gateway_backend_warm gauge\n");
-            for route in &self.routes {
-                for backend in &route.backends {
-                    if !backend.warmup_enabled {
-                        continue;
-                    }
-                    let value = backend.warm.load(Ordering::Relaxed);
-                    let _ = writeln!(
-                        out,
-                        "llm_gateway_backend_warm{{route=\"{}\",backend=\"{}\"}} {value}",
-                        escape(&route.name),
-                        escape(&backend.id)
-                    );
-                }
-            }
-
-            out.push_str(
-                "# HELP llm_gateway_warmup_total Warmups ejecutados por backend y resultado.\n",
-            );
-            out.push_str("# TYPE llm_gateway_warmup_total counter\n");
-            for route in &self.routes {
-                for backend in &route.backends {
-                    if !backend.warmup_enabled {
-                        continue;
-                    }
-                    for (result, index) in [("success", 0usize), ("failure", 1usize)] {
-                        let value = backend.warmups[index].load(Ordering::Relaxed);
-                        let _ = writeln!(
-                            out,
-                            "llm_gateway_warmup_total{{route=\"{}\",backend=\"{}\",result=\"{result}\"}} {value}",
-                            escape(&route.name),
-                            escape(&backend.id)
-                        );
-                    }
-                }
-            }
-        }
-
-        out
+        String::from_utf8_lossy(&buffer).into_owned()
     }
-}
-
-/// Emite las líneas `_bucket`, `_sum` y `_count` de una serie de histograma.
-fn render_histogram_series(out: &mut String, name: &str, labels: &str, histogram: &Histogram) {
-    for (index, bound) in BUCKETS.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "{name}_bucket{{{labels},le=\"{bound}\"}} {}",
-            histogram.bucket(index)
-        );
-    }
-    let count = histogram.count();
-    let _ = writeln!(out, "{name}_bucket{{{labels},le=\"+Inf\"}} {count}");
-    let _ = writeln!(out, "{name}_sum{{{labels}}} {}", histogram.sum_seconds());
-    let _ = writeln!(out, "{name}_count{{{labels}}} {count}");
-}
-
-/// Escapa un valor de etiqueta según el formato de exposición de Prometheus.
-fn escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => {}
-            _ => out.push(ch),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Backend, GatewayConfig, Route};
+    use crate::config::{Backend, GatewayConfig, Route, Warmup};
 
-    fn config(route_name: &str) -> GatewayConfig {
+    /// Construye una config con una ruta y un backend; si `warmup`, lo declara.
+    ///
+    /// El nombre de ruta es único por test: los instrumentos viven en el
+    /// `MeterProvider` global compartido por todo el proceso, así que la
+    /// aislamiento entre tests se consigue con conjuntos de etiquetas únicos.
+    fn config(route_name: &str, warmup: bool) -> GatewayConfig {
         GatewayConfig {
             route: vec![Route {
                 name: route_name.to_owned(),
@@ -471,26 +424,77 @@ mod tests {
                     model: "m".to_owned(),
                     api_key_env: None,
                     timeout_ms: None,
-                    warmup: None,
+                    warmup: warmup.then_some(Warmup {
+                        interval_ms: 1_000,
+                        timeout_ms: None,
+                    }),
                 }],
             }],
+            observability: None,
+        }
+    }
+
+    /// Línea de `text` para la serie `name` con `route="<route>"`, si existe.
+    fn line_for<'a>(text: &'a str, name: &str, route: &str) -> Option<&'a str> {
+        text.lines()
+            .find(|line| line.starts_with(name) && line.contains(&format!(r#"route="{route}""#)))
+    }
+
+    /// Valor (último campo) de una línea de serie.
+    fn value(line: &str) -> &str {
+        line.rsplit(' ').next().unwrap_or_default()
+    }
+
+    /// Valor de una serie o `None` si la serie no está presente.
+    fn series_value<'a>(text: &'a str, name: &str, route: &str) -> Option<&'a str> {
+        line_for(text, name, route).map(value)
+    }
+
+    #[test]
+    fn render_emits_zero_series_from_the_first_scrape() {
+        let metrics = Metrics::new(&config("scrape-vacio", false));
+        let text = metrics.render();
+
+        assert!(
+            text.contains("# TYPE llm_gateway_requests_total counter"),
+            "falta el TYPE del counter:\n{text}"
+        );
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| {
+                line.starts_with("llm_gateway_requests_total")
+                    && line.contains(r#"route="scrape-vacio""#)
+            })
+            .collect();
+        assert_eq!(
+            lines.len(),
+            4,
+            "deben emitirse las 4 combinaciones:\n{text}"
+        );
+        assert!(
+            lines.iter().all(|line| value(line) == "0"),
+            "todas las series deben estar en cero:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_keeps_the_llm_gateway_series_names() {
+        let metrics = Metrics::new(&config("nombres-de-serie", false));
+        let text = metrics.render();
+
+        for name in [
+            "llm_gateway_requests_total",
+            "llm_gateway_failover_total",
+            "llm_gateway_backend_attempts_total",
+            "llm_gateway_errors_total",
+        ] {
+            assert!(text.contains(name), "falta la serie {name}:\n{text}");
         }
     }
 
     #[test]
-    fn histogram_buckets_are_cumulative() {
-        let h = Histogram::new();
-        h.observe(Duration::from_millis(30));
-        h.observe(Duration::from_millis(300));
-
-        assert_eq!(h.bucket(0), 1, "0.05 s solo cuenta la primera");
-        assert_eq!(h.bucket(3), 2, "0.5 s cuenta ambas");
-        assert_eq!(h.count(), 2);
-    }
-
-    #[test]
     fn render_escapes_label_values() {
-        let metrics = Metrics::new(&config("a\"b\\c"));
+        let metrics = Metrics::new(&config("a\"b\\c", false));
         let text = metrics.render();
         assert!(
             text.contains(r#"route="a\"b\\c""#),
@@ -499,39 +503,204 @@ mod tests {
     }
 
     #[test]
-    fn render_emits_zero_series() {
-        let metrics = Metrics::new(&config("mech-writer"));
+    fn render_escapes_newline() {
+        let metrics = Metrics::new(&config("a\nb", false));
         let text = metrics.render();
-        assert!(text.contains("# TYPE llm_gateway_requests_total counter"));
-        assert!(text.contains(
-            r#"llm_gateway_requests_total{route="mech-writer",streaming="false",outcome="success"} 0"#
-        ));
+        assert!(
+            text.contains(r#"route="a\nb""#),
+            "salto de línea sin escapar:\n{text}"
+        );
+    }
+
+    #[test]
+    fn histogram_buckets_are_cumulative() {
+        let route = "buckets-acumulativos";
+        let metrics = Metrics::new(&config(route, false));
+        metrics.record_request(0, false, Outcome::Success, Duration::from_millis(30));
+        metrics.record_request(0, false, Outcome::Success, Duration::from_millis(300));
+
+        let text = metrics.render();
+        let bucket = |bound: &str| {
+            text.lines()
+                .find(|line| {
+                    line.starts_with("llm_gateway_request_duration_seconds_bucket")
+                        && line.contains(&format!(r#"route="{route}""#))
+                        && line.contains(&format!(r#"le="{bound}""#))
+                })
+                .map(value)
+        };
+
+        assert_eq!(
+            bucket("0.05"),
+            Some("1"),
+            "0.05 s solo cuenta la primera:\n{text}"
+        );
+        assert_eq!(bucket("0.5"), Some("2"), "0.5 s cuenta ambas:\n{text}");
     }
 
     #[test]
     fn render_inf_matches_count() {
-        let metrics = Metrics::new(&config("mech-writer"));
+        let route = "inf-y-count";
+        let metrics = Metrics::new(&config(route, false));
         metrics.record_request(0, false, Outcome::Success, Duration::from_millis(10));
         metrics.record_request(0, false, Outcome::Success, Duration::from_millis(20));
 
         let text = metrics.render();
-        assert!(
-            text.contains(r#"llm_gateway_request_duration_seconds_bucket{route="mech-writer",streaming="false",le="+Inf"} 2"#),
-            "bucket +Inf:\n{text}"
-        );
-        assert!(
-            text.contains(r#"llm_gateway_request_duration_seconds_count{route="mech-writer",streaming="false"} 2"#),
+        let inf = text
+            .lines()
+            .find(|line| {
+                line.starts_with("llm_gateway_request_duration_seconds_bucket")
+                    && line.contains(&format!(r#"route="{route}""#))
+                    && line.contains(r#"le="+Inf""#)
+            })
+            .map(value);
+        assert_eq!(inf, Some("2"), "bucket +Inf:\n{text}");
+        assert_eq!(
+            series_value(&text, "llm_gateway_request_duration_seconds_count", route),
+            Some("2"),
             "count:\n{text}"
         );
     }
 
     #[test]
-    fn render_escapes_newline() {
-        let metrics = Metrics::new(&config("a\nb"));
+    fn requests_counter_increments_by_route_streaming_and_outcome() {
+        let route = "counter-por-combinacion";
+        let metrics = Metrics::new(&config(route, false));
+        metrics.record_request(0, false, Outcome::Success, Duration::from_millis(5));
+        metrics.record_request(0, true, Outcome::AllFailed, Duration::from_millis(5));
+
         let text = metrics.render();
-        assert!(
-            text.contains(r#"route="a\nb""#),
-            "salto de línea sin escapar:\n{text}"
+        let series = |streaming: &str, outcome: &str| {
+            text.lines()
+                .find(|line| {
+                    line.starts_with("llm_gateway_requests_total")
+                        && line.contains(&format!(r#"route="{route}""#))
+                        && line.contains(&format!(r#"streaming="{streaming}""#))
+                        && line.contains(&format!(r#"outcome="{outcome}""#))
+                })
+                .map(value)
+        };
+
+        assert_eq!(
+            series("false", "success"),
+            Some("1"),
+            "success no-stream:\n{text}"
+        );
+        assert_eq!(
+            series("true", "all_failed"),
+            Some("1"),
+            "all_failed streaming:\n{text}"
+        );
+        assert_eq!(
+            series("true", "success"),
+            Some("0"),
+            "resto en cero:\n{text}"
+        );
+        assert_eq!(
+            series("false", "all_failed"),
+            Some("0"),
+            "resto en cero:\n{text}"
+        );
+    }
+
+    #[test]
+    fn global_outcomes_are_recorded_by_kind() {
+        let metrics = Metrics::new(&config("outcome-global", false));
+        metrics.record_global(GlobalOutcome::ModelNotFound);
+
+        let text = metrics.render();
+        let line = text
+            .lines()
+            .find(|line| {
+                line.starts_with("llm_gateway_errors_total")
+                    && line.contains(r#"kind="model_not_found""#)
+            })
+            .expect("errors_total con kind=model_not_found");
+        assert_eq!(value(line), "1", "errors_total:\n{text}");
+    }
+
+    #[test]
+    fn warmup_families_only_exist_for_backends_that_declare_warmup() {
+        let route = "sin-warmup";
+        let metrics = Metrics::new(&config(route, false));
+        let text = metrics.render();
+
+        for name in ["llm_gateway_backend_warm", "llm_gateway_warmup_total"] {
+            assert!(
+                line_for(&text, name, route).is_none(),
+                "{name} no debe tener series para una ruta sin warmup:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn warmup_gauge_and_counter_are_recorded() {
+        let route = "con-warmup";
+        let metrics = Metrics::new(&config(route, true));
+        metrics.record_warmup(0, 0, true);
+        metrics.record_warmup(0, 0, false);
+
+        let text = metrics.render();
+        assert_eq!(
+            series_value(&text, "llm_gateway_backend_warm", route),
+            Some("0"),
+            "el gauge warm debe quedar a 0 tras el fallo:\n{text}"
+        );
+
+        let warmup = |result: &str| {
+            text.lines()
+                .find(|line| {
+                    line.starts_with("llm_gateway_warmup_total")
+                        && line.contains(&format!(r#"route="{route}""#))
+                        && line.contains(&format!(r#"result="{result}""#))
+                })
+                .map(value)
+        };
+        assert_eq!(warmup("success"), Some("1"), "warmup success:\n{text}");
+        assert_eq!(warmup("failure"), Some("1"), "warmup failure:\n{text}");
+    }
+
+    #[test]
+    fn attempt_results_are_recorded_per_backend() {
+        let route = "attempts-por-backend";
+        let metrics = Metrics::new(&config(route, false));
+        metrics.record_attempt(
+            0,
+            0,
+            AttemptResult::TransportError,
+            Duration::from_millis(2),
+        );
+        metrics.record_attempt(0, 0, AttemptResult::Success, Duration::from_millis(3));
+
+        let text = metrics.render();
+        let attempt = |result: &str| {
+            text.lines()
+                .find(|line| {
+                    line.starts_with("llm_gateway_backend_attempts_total")
+                        && line.contains(&format!(r#"route="{route}""#))
+                        && line.contains(&format!(r#"result="{result}""#))
+                })
+                .map(value)
+        };
+        assert_eq!(
+            attempt("transport_error"),
+            Some("1"),
+            "intento fallido:\n{text}"
+        );
+        assert_eq!(attempt("success"), Some("1"), "intento con éxito:\n{text}");
+    }
+
+    #[test]
+    fn failover_counter_is_recorded_per_route() {
+        let route = "failover-por-ruta";
+        let metrics = Metrics::new(&config(route, false));
+        metrics.record_failover(0);
+
+        let text = metrics.render();
+        assert_eq!(
+            series_value(&text, "llm_gateway_failover_total", route),
+            Some("1"),
+            "failover_total:\n{text}"
         );
     }
 }

@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use llm_gateway_rs::config::load;
+use llm_gateway_rs::config::{Protocol, load};
 
 const VALID_YAML: &str = r#"
 route:
@@ -213,6 +213,357 @@ route:
     assert!(
         msg.contains("warmup-timeout-zero"),
         "el error debe nombrar el backend afectado, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bloque opcional `observability.otlp` (change add-otlp-observability)
+// ---------------------------------------------------------------------------
+
+fn with_observability(block: &str) -> String {
+    format!(
+        r#"
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://localhost:11434/v1"
+        model: "qwen2.5:7b-instruct"
+{block}
+"#
+    )
+}
+
+/// Scenario: Ausencia del bloque no cambia nada → `observability` es `None`.
+#[test]
+fn observability_absent_is_none() {
+    let file = write_temp(VALID_YAML);
+
+    let config = load(file.path()).expect("valid config should load");
+
+    assert!(
+        config.observability.is_none(),
+        "sin bloque `observability`, debe quedar en None"
+    );
+}
+
+/// Scenario: bloque válido se parsea con todos sus campos.
+#[test]
+fn observability_otlp_is_parsed() {
+    // Nombre de variable único por test: varios tests corren en paralelo en el
+    // mismo proceso y una variable compartida se pisaría entre ellos.
+    let token_var = format!("GATEWAY_TEST_PARSED_OTLP_TOKEN_{}", std::process::id());
+    let yaml = with_observability(&format!(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: "default"
+    protocol: http
+    token_env: "{token_var}"
+    service_name: "llm-gateway"
+    interval_ms: 5000
+    timeout_ms: 1000
+    signals:
+      metrics: true
+      logs: false
+      traces: true
+"#
+    ));
+    // La variable referenciada debe existir para que la validación pase.
+    // SAFETY: nombre único por test; el valor no contiene datos sensibles.
+    unsafe { std::env::set_var(&token_var, "abc123") };
+    let file = write_temp(&yaml);
+
+    let config = load(file.path()).expect("bloque válido debe cargar");
+    unsafe { std::env::remove_var(&token_var) };
+
+    let otlp = config
+        .observability
+        .as_ref()
+        .and_then(|observability| observability.otlp.as_ref())
+        .expect("el bloque otlp debe conservarse");
+
+    assert_eq!(otlp.endpoint, "http://localhost:5080");
+    assert_eq!(otlp.organization, "default");
+    assert_eq!(otlp.protocol, Protocol::Http);
+    assert_eq!(otlp.token_env.as_deref(), Some(token_var.as_str()));
+    assert_eq!(otlp.service_name.as_deref(), Some("llm-gateway"));
+    assert_eq!(otlp.interval_ms, Some(5_000));
+    assert_eq!(otlp.timeout_ms, Some(1_000));
+    assert!(otlp.signals.metrics, "signals.metrics debe ser true");
+    assert!(!otlp.signals.logs, "signals.logs debe ser false");
+    assert!(otlp.signals.traces, "signals.traces debe ser true");
+}
+
+/// Scenario: `protocol: grpc` se rechaza mientras no esté implementado.
+#[test]
+fn observability_grpc_protocol_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: "default"
+    protocol: grpc
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("grpc aún no soportado debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("grpc") && msg.contains("soportado"),
+        "el error debe explicar que grpc no está soportado, got: {msg}"
+    );
+}
+
+/// Scenario: `protocol` ausente → por defecto `Http`.
+#[test]
+fn observability_protocol_defaults_to_http() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: "default"
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let config = load(file.path()).expect("bloque válido debe cargar");
+    let otlp = config.observability.unwrap().otlp.unwrap();
+
+    assert_eq!(otlp.protocol, Protocol::Http);
+    assert_eq!(otlp.token_env, None);
+    assert_eq!(otlp.service_name, None);
+    assert_eq!(otlp.interval_ms, None);
+    assert_eq!(otlp.timeout_ms, None);
+}
+
+/// Scenario: Endpoint vacío se rechaza.
+#[test]
+fn observability_endpoint_empty_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: ""
+    organization: "default"
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("endpoint vacío debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("endpoint"),
+        "el error debe mencionar endpoint, got: {msg}"
+    );
+}
+
+/// Scenario: Endpoint en blanco se rechaza.
+#[test]
+fn observability_endpoint_blank_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "   "
+    organization: "default"
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("endpoint en blanco debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("endpoint"),
+        "el error debe mencionar endpoint, got: {msg}"
+    );
+}
+
+/// Scenario: Organization vacía se rechaza.
+#[test]
+fn observability_organization_empty_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: ""
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("organization vacía debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("organization"),
+        "el error debe mencionar organization, got: {msg}"
+    );
+}
+
+/// Scenario: endpoint sin esquema `http`/`https` se rechaza.
+#[test]
+fn observability_endpoint_without_scheme_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "localhost:5080"
+    organization: "default"
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("endpoint sin esquema debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("endpoint") && msg.contains("http"),
+        "el error debe pedir un endpoint http/https, got: {msg}"
+    );
+}
+
+/// Scenario: `organization` con espacios se rechaza.
+#[test]
+fn observability_organization_with_space_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: "mi org"
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("organization con espacios debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("organization"),
+        "el error debe mencionar organization, got: {msg}"
+    );
+}
+
+/// Scenario: `organization` con `/` se rechaza (rompería la URL por señal).
+#[test]
+fn observability_organization_with_slash_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: "mi/org"
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("organization con '/' debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("organization"),
+        "el error debe mencionar organization, got: {msg}"
+    );
+}
+
+/// Scenario: Intervalo cero se rechaza.
+#[test]
+fn observability_interval_zero_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: "default"
+    interval_ms: 0
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("interval_ms = 0 debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("interval_ms"),
+        "el error debe mencionar interval_ms, got: {msg}"
+    );
+}
+
+/// Scenario: Timeout cero se rechaza.
+#[test]
+fn observability_timeout_zero_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: "default"
+    timeout_ms: 0
+    signals:
+      metrics: true
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("timeout_ms = 0 debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("timeout_ms"),
+        "el error debe mencionar timeout_ms, got: {msg}"
+    );
+}
+
+/// Scenario: todas las señales a `false` se rechaza.
+#[test]
+fn observability_all_signals_false_is_rejected() {
+    let yaml = with_observability(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: "default"
+    signals:
+      metrics: false
+      logs: false
+      traces: false
+"#,
+    );
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("sin señales activas debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("signal") || msg.contains("señal"),
+        "el error debe mencionar las señales, got: {msg}"
+    );
+}
+
+/// Scenario: Token de ingesta inexistente se rechaza.
+#[test]
+fn observability_token_env_missing_is_rejected() {
+    let var = format!("GATEWAY_TEST_MISSING_OTLP_TOKEN_{}", std::process::id());
+    let yaml = with_observability(&format!(
+        r#"observability:
+  otlp:
+    endpoint: "http://localhost:5080"
+    organization: "default"
+    token_env: "{var}"
+    signals:
+      metrics: true
+"#
+    ));
+    let file = write_temp(&yaml);
+
+    let err = load(file.path()).expect_err("token_env sin variable debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&var),
+        "el error debe nombrar la variable, got: {msg}"
     );
 }
 

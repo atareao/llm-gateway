@@ -16,6 +16,74 @@ pub const DEFAULT_CONFIG_PATH: &str = "gateway.yaml";
 pub struct GatewayConfig {
     /// Rutas lógicas que el cliente puede pedir como `model`.
     pub route: Vec<Route>,
+    /// Bloque opcional de observabilidad (exportación OTLP).
+    pub observability: Option<Observability>,
+}
+
+/// Configuración de observabilidad. Ausente en el YAML → `None` y el gateway
+/// no inicializa ningún exportador.
+#[derive(Debug, Deserialize)]
+pub struct Observability {
+    /// Exportación OTLP opcional.
+    pub otlp: Option<Otlp>,
+}
+
+/// Exportación OTLP hacia un colector (p. ej. OpenObserve).
+#[derive(Debug, Deserialize)]
+pub struct Otlp {
+    /// Base del colector, sin el sufijo `/api/<organización>`. El gateway
+    /// compone `{endpoint}/api/{organization}/v1/{metrics|logs|traces}`.
+    pub endpoint: String,
+    /// Organización destino del colector.
+    pub organization: String,
+    /// Protocolo de transporte; por defecto [`Protocol::Http`].
+    #[serde(default)]
+    pub protocol: Protocol,
+    /// Nombre de la variable de entorno con el token de ingesta (opcional).
+    /// El token se envía como `Authorization: Basic <token>`.
+    pub token_env: Option<String>,
+    /// Nombre de servicio reportado como recurso OTel (opcional).
+    pub service_name: Option<String>,
+    /// Intervalo de exportación de métricas y logs, en milisegundos
+    /// (opcional; por defecto `telemetry::DEFAULT_OTLP_INTERVAL_MS`).
+    pub interval_ms: Option<u64>,
+    /// Timeout de cada exportación, en milisegundos (opcional).
+    pub timeout_ms: Option<u64>,
+    /// Señales a exportar; al menos una debe estar activa.
+    pub signals: Signals,
+}
+
+/// Protocolo de transporte OTLP.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    /// OTLP sobre HTTP con codificación protobuf.
+    #[default]
+    Http,
+    /// OTLP sobre gRPC. **Aún no soportado**: se parsea para poder dar un error
+    /// de configuración explícito (ver `validate_otlp`).
+    Grpc,
+}
+
+/// Señales de telemetría a exportar. Cada campo ausente queda a `false`.
+#[derive(Debug, Default, Deserialize)]
+pub struct Signals {
+    /// Exportar métricas por OTLP.
+    #[serde(default)]
+    pub metrics: bool,
+    /// Exportar logs por OTLP.
+    #[serde(default)]
+    pub logs: bool,
+    /// Exportar trazas por OTLP.
+    #[serde(default)]
+    pub traces: bool,
+}
+
+impl Signals {
+    /// `true` si al menos una señal está activa.
+    pub fn any(&self) -> bool {
+        self.metrics || self.logs || self.traces
+    }
 }
 
 /// Ruta lógica: un nombre y una cadena ordenada de backends (primario primero).
@@ -95,7 +163,8 @@ fn yaml_error(err: serde_saphyr::Error, path: &Path) -> anyhow::Error {
 }
 
 /// Valida las invariantes semánticas que el deserializador no puede comprobar
-/// por sí solo: cada ruta debe declarar al menos un backend.
+/// por sí solo: cada ruta debe declarar al menos un backend, y el bloque
+/// opcional `observability.otlp` debe ser coherente.
 fn validate(config: &GatewayConfig) -> Result<()> {
     for route in &config.route {
         if route.backend.is_empty() {
@@ -121,6 +190,65 @@ fn validate(config: &GatewayConfig) -> Result<()> {
                 }
             }
         }
+    }
+
+    if let Some(observability) = &config.observability
+        && let Some(otlp) = &observability.otlp
+    {
+        validate_otlp(otlp)?;
+    }
+
+    Ok(())
+}
+
+/// Valida el bloque `observability.otlp`: endpoint y organización no vacíos,
+/// intervalos positivos, al menos una señal activa y, si `token_env` está
+/// definido, que la variable de entorno exista y no esté vacía.
+fn validate_otlp(otlp: &Otlp) -> Result<()> {
+    let endpoint = otlp.endpoint.trim();
+    if endpoint.is_empty() {
+        bail!("config: observability.otlp.endpoint no puede estar vacío");
+    }
+    // Sin esquema, el exportador OTLP/HTTP no podría construir la URL de envío.
+    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+        bail!(
+            "config: observability.otlp.endpoint debe empezar por http:// o https://, got '{endpoint}'"
+        );
+    }
+    let organization = otlp.organization.trim();
+    if organization.is_empty() {
+        bail!("config: observability.otlp.organization no puede estar vacía");
+    }
+    // La organización se interpola en la ruta `/api/{organization}/v1/{signal}`:
+    // un espacio o una barra romperían la URL por señal.
+    if organization.contains('/') || organization.chars().any(char::is_whitespace) {
+        bail!("config: observability.otlp.organization no puede contener espacios ni '/'");
+    }
+    // `protocol: grpc` se parsea (el valor existe en el enum), pero el
+    // transporte implementado es solo OTLP/HTTP: rechazarlo es mejor que
+    // ignorarlo en silencio.
+    if otlp.protocol == Protocol::Grpc {
+        bail!("config: observability.otlp.protocol: 'grpc' aún no está soportado; usa 'http'");
+    }
+    if otlp.interval_ms == Some(0) {
+        bail!("config: observability.otlp.interval_ms = 0; debe ser mayor que 0");
+    }
+    if otlp.timeout_ms == Some(0) {
+        bail!("config: observability.otlp.timeout_ms = 0; debe ser mayor que 0");
+    }
+    if !otlp.signals.any() {
+        bail!(
+            "config: observability.otlp.signals requiere al menos una señal activa (metrics, logs o traces)"
+        );
+    }
+    if let Some(var) = &otlp.token_env
+        && std::env::var(var)
+            .map(|value| value.is_empty())
+            .unwrap_or(true)
+    {
+        bail!(
+            "config: observability.otlp.token_env='{var}' pero la variable de entorno no existe o está vacía"
+        );
     }
     Ok(())
 }

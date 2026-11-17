@@ -130,20 +130,33 @@ async fn get_metrics(gateway: &str) -> String {
 }
 
 /// `true` si `metrics` expone alguna **serie** (línea de muestra, no las
-/// directivas `# HELP`/`# TYPE`, que se emiten siempre) con ese nombre.
-fn has_series(metrics: &str, name: &str) -> bool {
-    let sample_prefix = format!("{name}{{");
-    metrics.lines().any(|line| line.starts_with(&sample_prefix))
-}
-
-/// Extrae el valor numérico de la primera serie que empiece por `series`
-/// (p. ej. `llm_gateway_warmup_total{route="mech-writer",...result="failure"}`).
-fn metric_value(metrics: &str, series: &str) -> Option<f64> {
+/// directivas `# HELP`/`# TYPE`, que se emiten siempre) con ese nombre y cuyas
+/// etiquetas contienen *todos* los `needles`.
+///
+/// El registro es global al proceso (compartido con la exportación OTLP), así
+/// que la pertenencia a un backend se comprueba por la etiqueta `backend`, no
+/// por la mera presencia de la familia.
+fn has_series(metrics: &str, name: &str, needles: &[&str]) -> bool {
+    let prefix = format!("{name}{{");
     metrics
         .lines()
-        .find(|line| line.starts_with(series))
+        .any(|line| line.starts_with(&prefix) && needles.iter().all(|n| line.contains(n)))
+}
+
+/// Valor numérico de la primera serie `name{...}` cuyas etiquetas contienen
+/// *todos* los `needles`; `None` si no existe.
+fn metric_value(metrics: &str, name: &str, needles: &[&str]) -> Option<f64> {
+    let prefix = format!("{name}{{");
+    metrics
+        .lines()
+        .find(|line| line.starts_with(&prefix) && needles.iter().all(|n| line.contains(n)))
         .and_then(|line| line.rsplit(' ').next())
         .and_then(|value| value.parse().ok())
+}
+
+/// Etiqueta `backend="<id>"`.
+fn backend_label(id: &str) -> String {
+    format!(r#"backend="{id}""#)
 }
 
 /// Construye el YAML de una ruta `mech-writer` con **dos** backends, ambos con
@@ -258,6 +271,7 @@ async fn backend_without_warmup_receives_no_requests() {
     let (backend, requests) = spawn_capturing_backend().await;
     let yaml = config_yaml(&backend, "qwen2.5:7b-instruct", None, None);
     let (gateway, state) = spawn_gateway(&yaml).await;
+    let id_label = backend_label(&backend_id(&state.config.route[0].backend[0]));
 
     let handles = spawn_warmup(state);
 
@@ -271,11 +285,11 @@ async fn backend_without_warmup_receives_no_requests() {
 
     let body = get_metrics(&gateway).await;
     assert!(
-        !has_series(&body, "llm_gateway_backend_warm"),
+        !has_series(&body, "llm_gateway_backend_warm", &[&id_label]),
         "un backend sin warmup no debe exponer la serie backend_warm:\n{body}"
     );
     assert!(
-        !has_series(&body, "llm_gateway_warmup_total"),
+        !has_series(&body, "llm_gateway_warmup_total", &[&id_label]),
         "un backend sin warmup no debe exponer la serie warmup_total:\n{body}"
     );
     drop(handles);
@@ -313,16 +327,19 @@ async fn warmup_once_success_sends_minimal_request_and_records_metrics() {
     }
 
     let body = get_metrics(&gateway).await;
-    assert!(
-        body.contains(&format!(
-            r#"llm_gateway_backend_warm{{route="mech-writer",backend="{id}"}} 1"#
-        )),
+    let id_label = backend_label(&id);
+    assert_eq!(
+        metric_value(&body, "llm_gateway_backend_warm", &[&id_label]),
+        Some(1.0),
         "gauge backend_warm esperado a 1:\n{body}"
     );
-    assert!(
-        body.contains(&format!(
-            r#"llm_gateway_warmup_total{{route="mech-writer",backend="{id}",result="success"}} 1"#
-        )),
+    assert_eq!(
+        metric_value(
+            &body,
+            "llm_gateway_warmup_total",
+            &[&id_label, r#"result="success""#]
+        ),
+        Some(1.0),
         "counter warmup_total success esperado a 1:\n{body}"
     );
 }
@@ -339,16 +356,19 @@ async fn warmup_once_failure_records_failure_metrics() {
 
     let id = backend_id(&state.config.route[0].backend[0]);
     let body = get_metrics(&gateway).await;
-    assert!(
-        body.contains(&format!(
-            r#"llm_gateway_backend_warm{{route="mech-writer",backend="{id}"}} 0"#
-        )),
+    let id_label = backend_label(&id);
+    assert_eq!(
+        metric_value(&body, "llm_gateway_backend_warm", &[&id_label]),
+        Some(0.0),
         "gauge backend_warm debe valer 0:\n{body}"
     );
-    assert!(
-        body.contains(&format!(
-            r#"llm_gateway_warmup_total{{route="mech-writer",backend="{id}",result="failure"}} 1"#
-        )),
+    assert_eq!(
+        metric_value(
+            &body,
+            "llm_gateway_warmup_total",
+            &[&id_label, r#"result="failure""#]
+        ),
+        Some(1.0),
         "counter warmup_total failure esperado a 1:\n{body}"
     );
 }
@@ -391,11 +411,12 @@ async fn failed_warmup_keeps_retrying_and_does_not_affect_healthy_backend() {
     let body = get_metrics(&gateway).await;
 
     // El backend caído repite: ≥2 fallos registrados en ~200 ms con interval_ms=50.
-    let failure_series = format!(
-        r#"llm_gateway_warmup_total{{route="mech-writer",backend="{dead_id}",result="failure"}}"#
-    );
-    let failures = metric_value(&body, &failure_series)
-        .expect("serie warmup_total failure del backend caído esperada");
+    let failures = metric_value(
+        &body,
+        "llm_gateway_warmup_total",
+        &[&backend_label(&dead_id), r#"result="failure""#],
+    )
+    .expect("serie warmup_total failure del backend caído esperada");
     assert!(
         failures >= 2.0,
         "un warmup fallido no debe abortar el bucle: se esperaban ≥2 fallos, hubo {failures}\n{body}"
@@ -407,11 +428,12 @@ async fn failed_warmup_keeps_retrying_and_does_not_affect_healthy_backend() {
         healthy_seen >= 2,
         "el backend sano no debe verse afectado: se esperaban ≥2 warmups, hubo {healthy_seen}"
     );
-    let success_series = format!(
-        r#"llm_gateway_warmup_total{{route="mech-writer",backend="{healthy_id}",result="success"}}"#
-    );
-    let healthy_ok = metric_value(&body, &success_series)
-        .expect("serie warmup_total success del backend sano esperada");
+    let healthy_ok = metric_value(
+        &body,
+        "llm_gateway_warmup_total",
+        &[&backend_label(&healthy_id), r#"result="success""#],
+    )
+    .expect("serie warmup_total success del backend sano esperada");
     assert!(
         healthy_ok >= 2.0,
         "el backend sano debe registrar ≥2 warmups con éxito, hubo {healthy_ok}\n{body}"
@@ -464,10 +486,13 @@ async fn warmup_missing_env_fails_without_http_request() {
 
     let id = backend_id(&state.config.route[0].backend[0]);
     let body = get_metrics(&gateway).await;
-    assert!(
-        body.contains(&format!(
-            r#"llm_gateway_warmup_total{{route="mech-writer",backend="{id}",result="failure"}} 1"#
-        )),
+    assert_eq!(
+        metric_value(
+            &body,
+            "llm_gateway_warmup_total",
+            &[&backend_label(&id), r#"result="failure""#]
+        ),
+        Some(1.0),
         "counter warmup_total failure esperado a 1:\n{body}"
     );
 
@@ -519,10 +544,13 @@ async fn warmup_respects_configured_timeout() {
     );
     let id = backend_id(&state.config.route[0].backend[0]);
     let body = get_metrics(&gateway).await;
-    assert!(
-        body.contains(&format!(
-            r#"llm_gateway_warmup_total{{route="mech-writer",backend="{id}",result="success"}} 1"#
-        )),
+    assert_eq!(
+        metric_value(
+            &body,
+            "llm_gateway_warmup_total",
+            &[&backend_label(&id), r#"result="success""#]
+        ),
+        Some(1.0),
         "counter warmup_total success esperado a 1:\n{body}"
     );
 
@@ -537,10 +565,13 @@ async fn warmup_respects_configured_timeout() {
     );
     let id = backend_id(&state.config.route[0].backend[0]);
     let body = get_metrics(&gateway).await;
-    assert!(
-        body.contains(&format!(
-            r#"llm_gateway_warmup_total{{route="mech-writer",backend="{id}",result="failure"}} 1"#
-        )),
+    assert_eq!(
+        metric_value(
+            &body,
+            "llm_gateway_warmup_total",
+            &[&backend_label(&id), r#"result="failure""#]
+        ),
+        Some(1.0),
         "counter warmup_total failure esperado a 1:\n{body}"
     );
 }
@@ -569,11 +600,13 @@ async fn spawn_warmup_missing_env_records_single_failure_without_http() {
     let body = get_metrics(&gateway).await;
     drop(handles);
 
-    let failure_series = format!(
-        r#"llm_gateway_warmup_total{{route="mech-writer",backend="{id}",result="failure"}}"#
-    );
+    let id_label = backend_label(&id);
     assert_eq!(
-        metric_value(&body, &failure_series),
+        metric_value(
+            &body,
+            "llm_gateway_warmup_total",
+            &[&id_label, r#"result="failure""#]
+        ),
         Some(1.0),
         "la clave sin resolver debe registrar exactamente un `failure` (no uno por tick):\n{body}"
     );

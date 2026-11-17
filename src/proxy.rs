@@ -37,6 +37,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::{Value, json};
 use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::{Backend, GatewayConfig, Route};
 use crate::error::AppError;
@@ -162,6 +163,34 @@ async fn chat_completions(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let request_id = resolve_request_id(&headers);
+
+    // Span de servidor para la petición completa, incluidos los rechazos
+    // previos a resolver la ruta. Si la petición entrante trae un `traceparent`
+    // válido se enlaza como hijo (traza distribuida); `route`/`streaming` se
+    // rellenan más abajo con `Span::record`.
+    let span = tracing::info_span!(
+        "request",
+        request_id = %request_id,
+        route = tracing::field::Empty,
+        streaming = tracing::field::Empty,
+        "otel.kind" = "server",
+    );
+    link_remote_parent(&span, &headers);
+
+    let handler_span = span.clone();
+    handle_chat_completions(state, body, request_id, &handler_span)
+        .instrument(span)
+        .await
+}
+
+/// Cuerpo del handler, cubierto por el span de servidor que crea
+/// [`chat_completions`].
+async fn handle_chat_completions(
+    state: AppState,
+    body: Result<Json<Value>, JsonRejection>,
+    request_id: String,
+    span: &tracing::Span,
+) -> Response {
     let started = Instant::now();
 
     let body = match body {
@@ -209,15 +238,9 @@ async fn chat_completions(
     let route = &state.config.route[route_idx];
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
-    let span = tracing::info_span!(
-        "request",
-        request_id = %request_id,
-        route = %route.name,
-        streaming
-    );
-    let result = route_with_failover(&state, route_idx, route, &body, streaming)
-        .instrument(span)
-        .await;
+    span.record("route", tracing::field::display(&route.name));
+    span.record("streaming", streaming);
+    let result = route_with_failover(&state, route_idx, route, &body, streaming, &request_id).await;
 
     let elapsed = started.elapsed();
     let outcome = if result.is_ok() {
@@ -251,6 +274,11 @@ async fn chat_completions(
 /// [`AppError::NoToolCallFromAllBackends`] sobre cualquier otro motivo
 /// (p. ej. [`AppError::AllBackendsFailed`]).
 ///
+/// Los eventos resumen ("petición completada", "petición fallida") repiten
+/// `request_id`, `route` y `streaming` como campos del **evento**: el bridge de
+/// `opentelemetry-appender-tracing` exporta los campos del evento y **no**
+/// hereda los del span que lo cubre, y la spec exige conservarlos en el log.
+///
 /// En modo `streaming`, al primer backend OK se devuelve su stream sin
 /// consumir; a partir de ahí ya no hay failover.
 async fn route_with_failover(
@@ -259,6 +287,7 @@ async fn route_with_failover(
     route: &Route,
     body: &Value,
     streaming: bool,
+    request_id: &str,
 ) -> Result<Response, AppError> {
     let started = Instant::now();
     let mut attempts = 0usize;
@@ -331,6 +360,9 @@ async fn route_with_failover(
                         state.metrics.record_failover(route_idx);
                     }
                     tracing::info!(
+                        request_id = %request_id,
+                        route = %route.name,
+                        streaming,
                         outcome = Outcome::Success.label(),
                         attempts,
                         latency_ms = started.elapsed().as_millis() as u64,
@@ -376,6 +408,9 @@ async fn route_with_failover(
                             state.metrics.record_failover(route_idx);
                         }
                         tracing::info!(
+                            request_id = %request_id,
+                            route = %route.name,
+                            streaming,
                             outcome = Outcome::Success.label(),
                             attempts,
                             latency_ms = started.elapsed().as_millis() as u64,
@@ -426,6 +461,9 @@ async fn route_with_failover(
         state.metrics.record_failover(route_idx);
     }
     tracing::warn!(
+        request_id = %request_id,
+        route = %route.name,
+        streaming,
         outcome = Outcome::AllFailed.label(),
         attempts,
         considered,
@@ -564,17 +602,33 @@ async fn send(
     streaming: bool,
     api_key: Option<&str>,
 ) -> Result<reqwest::Response, SendError> {
+    // Span de cliente por cada POST a un backend. Se crea antes de enviar para
+    // poder inyectar su contexto (`traceparent`) en las cabeceras salientes.
+    let span = tracing::info_span!(
+        "backend_request",
+        backend = %backend_id(backend),
+        model = %backend.model,
+        streaming,
+        "otel.kind" = "client",
+    );
+
     let mut request = client.post(chat_url(&backend.base_url)).json(&payload);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
+    let mut trace_headers = HeaderMap::new();
+    inject_traceparent(&span, &mut trace_headers);
+    request = request.headers(trace_headers);
 
     if streaming {
         let budget = backend
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT);
-        match tokio::time::timeout(budget, request.send()).await {
+        match tokio::time::timeout(budget, request.send())
+            .instrument(span)
+            .await
+        {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => Err(SendError::Transport(err)),
             Err(_elapsed) => Err(SendError::FirstByteTimeout(budget)),
@@ -585,7 +639,11 @@ async fn send(
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
         request = request.timeout(budget);
-        request.send().await.map_err(SendError::Transport)
+        request
+            .send()
+            .instrument(span)
+            .await
+            .map_err(SendError::Transport)
     }
 }
 
@@ -681,6 +739,31 @@ pub(crate) fn chat_url(base_url: &str) -> String {
 /// Se acepta un valor ASCII visible de 1 a 128 bytes; cualquier otra cosa se
 /// descarta para no propagar cabeceras malformadas ni valores arbitrariamente
 /// largos a los logs.
+/// Enlaza `span` con el contexto de traza de las cabeceras entrantes
+/// (`traceparent`) si es válido; si no, el span queda como raíz de la traza.
+///
+/// `set_parent` devuelve error si no hay layer de `tracing-opentelemetry`
+/// instalado (p. ej. sin `signals.traces`): es benigno y se ignora.
+fn link_remote_parent(span: &tracing::Span, headers: &HeaderMap) {
+    use opentelemetry::trace::TraceContextExt as _;
+
+    let parent = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&opentelemetry_http::HeaderExtractor(headers))
+    });
+    if parent.span().span_context().is_valid() {
+        let _ = span.set_parent(parent);
+    }
+}
+
+/// Inyecta el contexto de traza de `span` en las cabeceras salientes
+/// (`traceparent`) para que el backend continúe la traza distribuida.
+fn inject_traceparent(span: &tracing::Span, headers: &mut HeaderMap) {
+    let context = span.context();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut opentelemetry_http::HeaderInjector(headers))
+    });
+}
+
 fn resolve_request_id(headers: &HeaderMap) -> String {
     if let Some(value) = headers
         .get(REQUEST_ID_HEADER)

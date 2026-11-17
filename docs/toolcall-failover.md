@@ -14,7 +14,7 @@ cliente como éxito, rompiendo el contrato que el cliente pidió. Con este cambi
 el gateway reintenta con el siguiente backend y, si ninguno cumple, responde un
 error explícito en formato OpenAI.
 
-Change OpenSpec: `openspec/changes/add-toolcall-failover/` (proposal, design,
+Change OpenSpec: `openspec/changes/archive/2026-11-13-add-toolcall-failover/` (proposal, design,
 spec delta, tasks).
 
 ## Ficheros implicados
