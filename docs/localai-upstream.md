@@ -30,6 +30,8 @@ route:
         timeout_ms: 120000
 ```
 
+La ruta incorpora `warmup` (interval 240 s, timeout 300 s): mantiene el modelo residente en LocalAI enviando una petición periódica, de modo que la siguiente consulta no paga el cold start (~6 s). El intervalo es inferior al watchdog de inactividad de LocalAI (5 min).
+
 ## Variables / configuración
 
 - No requiere variables nuevas. El fallback usa `OPENROUTER_API_KEY` (ya presente en `~/.config/opencode/llm-gateway.env`).

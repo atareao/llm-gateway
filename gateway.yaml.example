@@ -24,6 +24,9 @@ route:
       - base_url: "http://127.0.0.1:9090/v1"
         model: "qwen3-1.7b"
         timeout_ms: 120000
+        warmup:
+          interval_ms: 240000
+          timeout_ms: 300000
       - base_url: "https://openrouter.ai/api/v1"
         model: "qwen/qwen3-8b"
         api_key_env: "OPENROUTER_API_KEY"
