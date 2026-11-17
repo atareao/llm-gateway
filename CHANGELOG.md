@@ -1,4 +1,15 @@
 # Changelog
+## [0.5.0] - 2026-11-17
+
+### Documentation
+
+- Alinea README con el failover post-respuesta sin tool_calls (#21)
+- *(openspec)* Propone add-otlp-observability y PLAN-006 (#25)
+- *(openspec)* Archiva add-otlp-observability y PLAN-006 (#25)
+
+### Features
+
+- *(observability)* Exporta métricas, logs y trazas por OTLP a OpenObserve (#25)
 ## [0.4.0] - 2026-11-13
 
 ### Documentation
