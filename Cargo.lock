@@ -788,6 +788,7 @@ dependencies = [
  "axum",
  "futures-util",
  "http-body-util",
+ "httpdate",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-http",

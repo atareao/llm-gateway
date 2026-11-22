@@ -328,13 +328,24 @@ fn blacklist_if_needed(
     );
 }
 
-/// Interpreta el encabezado `Retry-After` como número de segundos.
+/// Interpreta el encabezado `Retry-After`, en segundos o como fecha HTTP.
 ///
-/// Las fechas HTTP (`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`) no se
-/// interpretan; en ese caso se usa el cooldown configurado.
+/// Acepta el formato numérico (`Retry-After: 30`) y el de fecha IMF-fixdate
+/// (`Retry-After: Wed, 21 Oct 2099 07:28:00 GMT`), que se traduce al delta hasta
+/// esa fecha. Una fecha ya pasada se interpreta como `0` (nunca un delta
+/// negativo), de modo que el cooldown efectivo cae al configurado. Un valor no
+/// interpretable devuelve `None`.
 fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
-    let seconds = value?.to_str().ok()?.trim().parse::<u64>().ok()?;
-    Some(Duration::from_secs(seconds))
+    let text = value?.to_str().ok()?.trim();
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let deadline = httpdate::parse_http_date(text).ok()?;
+    Some(
+        deadline
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
 }
 
 /// Recorre la cadena de backends de `route` en orden hasta obtener una
@@ -932,14 +943,36 @@ mod tests {
             parse_retry_after(Some(&HeaderValue::from_static("0"))),
             Some(Duration::ZERO)
         );
-        // Fecha HTTP: no se interpreta.
+        assert_eq!(parse_retry_after(None), None);
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("no-es-una-fecha"))),
+            None
+        );
+    }
+
+    /// M4: `Retry-After` en formato fecha HTTP futura se interpreta como delta.
+    #[test]
+    fn parse_retry_after_reads_future_http_date() {
+        let parsed = parse_retry_after(Some(&HeaderValue::from_static(
+            "Wed, 21 Oct 2099 07:28:00 GMT",
+        )))
+        .expect("una fecha HTTP futura debe interpretarse");
+        assert!(
+            parsed > Duration::from_secs(3600),
+            "el delta hasta 2099 es grande, got {parsed:?}"
+        );
+    }
+
+    /// M4: una fecha HTTP ya pasada se interpreta como 0 (nunca negativa), para
+    /// que el cooldown efectivo caiga al configurado.
+    #[test]
+    fn parse_retry_after_past_http_date_is_zero() {
         assert_eq!(
             parse_retry_after(Some(&HeaderValue::from_static(
                 "Wed, 21 Oct 2015 07:28:00 GMT"
             ))),
-            None
+            Some(Duration::ZERO)
         );
-        assert_eq!(parse_retry_after(None), None);
     }
 
     #[test]
