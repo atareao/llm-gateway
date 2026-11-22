@@ -115,6 +115,44 @@ fn cache(base_url: &str, ttl: Duration) -> Arc<CatalogCache> {
     ))
 }
 
+/// Caché con un timeout de fetch corto, para tests que no deben colgarse.
+fn cache_with_timeout(base_url: &str, ttl: Duration, timeout: Duration) -> Arc<CatalogCache> {
+    Arc::new(
+        CatalogCache::new(reqwest::Client::new(), base_url.to_owned(), ttl, metrics())
+            .with_timeout(timeout),
+    )
+}
+
+/// Respuesta guionizada de un servidor simulado.
+enum Reply {
+    /// `200` con este JSON.
+    Json(Value),
+    /// Nunca responde a tiempo (duerme mucho más que cualquier timeout).
+    Hang,
+}
+
+/// Servidor que atiende `/v1/models` según `replies` (n-ésima entrada, repite la
+/// última al agotarse) y cuenta las peticiones recibidas.
+async fn spawn_scripted_server(replies: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
+    async fn handler(State(state): State<Arc<(Vec<Reply>, Arc<AtomicUsize>)>>) -> Response {
+        let (replies, counter) = &*state;
+        let idx = counter.fetch_add(1, Ordering::SeqCst);
+        match &replies[idx.min(replies.len() - 1)] {
+            Reply::Json(body) => axum::Json(body.clone()).into_response(),
+            Reply::Hang => {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                (StatusCode::OK, "late").into_response()
+            }
+        }
+    }
+    let counter = Arc::new(AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/models", get(handler))
+        .with_state(Arc::new((replies, Arc::clone(&counter))));
+    let base = spawn(app).await;
+    (base, counter)
+}
+
 /// Scenario: Descubrimiento inicial → consulta `/models`, puebla la caché y
 /// resuelve con los modelos elegibles.
 #[tokio::test]
@@ -270,4 +308,43 @@ route:
         handle.abort();
     }
     assert!(populated, "el refresco de arranque debe poblar la caché");
+}
+
+/// M1: el fetch del catálogo aplica un timeout total y no se cuelga cuando el
+/// upstream acepta la conexión pero no responde.
+#[tokio::test]
+async fn catalog_fetch_times_out_and_does_not_hang() {
+    let (base, _count) = spawn_scripted_server(vec![Reply::Hang]).await;
+    let cache = cache_with_timeout(&base, Duration::from_secs(300), Duration::from_millis(150));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), cache.refresh()).await;
+    let result = outcome.expect("refresh debe respetar el timeout, no colgarse");
+    assert!(
+        result.is_err(),
+        "un upstream que no responde debe dar error de timeout"
+    );
+}
+
+/// M1: con TTL vencido y upstream lento, `ensure` responde con la caché
+/// existente sin bloquearse (stale-while-error).
+#[tokio::test]
+async fn ensure_with_expired_ttl_does_not_hang_on_slow_upstream() {
+    let (base, _count) = spawn_scripted_server(vec![Reply::Json(catalog()), Reply::Hang]).await;
+    let cache = cache_with_timeout(&base, Duration::from_millis(50), Duration::from_millis(150));
+
+    let first = cache.ensure().await.expect("primera carga");
+    assert_eq!(first.len(), 3);
+
+    // Vence el TTL para que `ensure` dispare un refresco en segundo plano.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let stale = tokio::time::timeout(Duration::from_secs(5), cache.ensure())
+        .await
+        .expect("ensure no debe colgarse")
+        .expect("debe conservar la caché");
+    assert_eq!(
+        stale.len(),
+        3,
+        "un upstream lento no debe vaciar la caché válida"
+    );
 }

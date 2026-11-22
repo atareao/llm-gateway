@@ -25,6 +25,13 @@ use crate::classify::classify;
 use crate::config::{ClassifyOverrides, DEFAULT_REFRESH_INTERVAL_MS, GatewayConfig, Profile};
 use crate::metrics::Metrics;
 
+/// Timeout total (conexión + respuesta + cuerpo) de la consulta del catálogo.
+///
+/// El cliente HTTP compartido solo fija `connect_timeout`; sin un timeout total,
+/// un upstream que acepta la conexión y no responde dejaría colgada la rama
+/// síncrona de [`CatalogCache::ensure`] (y el ticker de refresco).
+pub const CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Entrada del catálogo `GET /models` de OpenRouter.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelEntry {
@@ -131,15 +138,20 @@ pub fn eligible_models(models: &[ModelEntry]) -> Vec<ModelEntry> {
 
 /// Consulta `GET {base_url}/models` y devuelve el catálogo completo.
 ///
+/// Aplica `timeout` como límite total de la petición (conexión, respuesta y
+/// lectura del cuerpo).
+///
 /// # Errors
-/// Devuelve [`DiscoveryError`] si falla el transporte, el status no es exitoso
-/// o el cuerpo no decodifica.
+/// Devuelve [`DiscoveryError`] si falla el transporte (incluido el timeout), el
+/// status no es exitoso o el cuerpo no decodifica.
 pub async fn fetch_catalog(
     client: &reqwest::Client,
     base_url: &str,
+    timeout: Duration,
 ) -> Result<Vec<ModelEntry>, DiscoveryError> {
     let response = client
         .get(models_url(base_url))
+        .timeout(timeout)
         .send()
         .await
         .map_err(DiscoveryError::Transport)?;
@@ -167,6 +179,7 @@ pub struct CatalogCache {
     client: reqwest::Client,
     base_url: String,
     ttl: Duration,
+    timeout: Duration,
     state: RwLock<Option<Snapshot>>,
     refreshing: AtomicBool,
     metrics: Arc<Metrics>,
@@ -174,6 +187,8 @@ pub struct CatalogCache {
 
 impl CatalogCache {
     /// Construye una caché vacía para `base_url` con el TTL indicado.
+    ///
+    /// El fetch del catálogo usa [`CATALOG_TIMEOUT`] como timeout total.
     pub fn new(
         client: reqwest::Client,
         base_url: String,
@@ -184,10 +199,18 @@ impl CatalogCache {
             client,
             base_url,
             ttl,
+            timeout: CATALOG_TIMEOUT,
             state: RwLock::new(None),
             refreshing: AtomicBool::new(false),
             metrics,
         }
+    }
+
+    /// Sobrescribe el timeout total del fetch del catálogo.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Devuelve el catálogo cacheado (aunque esté vencido), o `None`.
@@ -246,7 +269,7 @@ impl CatalogCache {
     /// # Errors
     /// Propaga el [`DiscoveryError`] del fetch.
     pub async fn refresh(&self) -> Result<(), DiscoveryError> {
-        match fetch_catalog(&self.client, &self.base_url).await {
+        match fetch_catalog(&self.client, &self.base_url, self.timeout).await {
             Ok(models) => {
                 let total = models.len();
                 let eligible = models.iter().filter(|model| is_eligible(model)).count();
