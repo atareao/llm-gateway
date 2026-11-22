@@ -35,5 +35,5 @@
 
 ## 7. Verificación de integración
 
-- [ ] 7.1 Ejecutar la suite completa y los linters: `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check`, sin errores ni warnings
+- [x] 7.1 Ejecutar la suite completa y los linters: `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check`, sin errores ni warnings
 - [ ] 7.2 Prueba end-to-end local con las tres rutas contra OpenRouter y comprobar el failover free→pago y las métricas expuestas
