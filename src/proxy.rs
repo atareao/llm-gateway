@@ -69,6 +69,12 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// primera cabecera, el stream fluye sin deadline.
 const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Cota superior del cooldown derivado de `Retry-After`.
+///
+/// Un `Retry-After` en formato fecha puede apuntar a años vista; sin cota, un
+/// único `429`/`5xx` con una fecha lejana blacklistearía el modelo durante años.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+
 /// Fallo al contactar con un backend, antes de tener su respuesta.
 enum SendError {
     /// Error de transporte de `reqwest` (conexión, TLS, lectura…).
@@ -303,22 +309,28 @@ async fn expand_backends(state: &AppState, route_idx: usize, route: &Route) -> V
 }
 
 /// Marca `backend` (dinámico) en la blacklist global si su respuesta lo exige:
-/// `429`, `5xx` o presencia de `Retry-After`. El cooldown efectivo es el mayor
-/// entre el configurado y el indicado por `Retry-After`.
+/// `429`, `5xx` o presencia de un `Retry-After` **positivo**. El cooldown
+/// efectivo es el mayor entre el configurado y el indicado por `Retry-After`,
+/// acotado a [`MAX_RETRY_AFTER`].
+///
+/// Un `Retry-After` que se traduce a duración cero (p. ej. una fecha HTTP ya
+/// pasada) no es informativo: no fuerza por sí solo la blacklist de un status no
+/// reintentable.
 fn blacklist_if_needed(
     state: &AppState,
     backend: &Backend,
     response: &reqwest::Response,
     cooldown: Duration,
 ) {
-    let retry_after = parse_retry_after(response.headers().get(header::RETRY_AFTER));
+    let retry_after = parse_retry_after(response.headers().get(header::RETRY_AFTER))
+        .filter(|delay| !delay.is_zero());
     if !is_retryable(response.status()) && retry_after.is_none() {
         return;
     }
     let Some(model) = backend.model.as_deref() else {
         return;
     };
-    let effective = retry_after.map_or(cooldown, |retry| cooldown.max(retry));
+    let effective = effective_cooldown(retry_after, cooldown);
     state.discovery.blacklist().mark(model, effective);
     tracing::warn!(
         model = %model,
@@ -326,6 +338,14 @@ fn blacklist_if_needed(
         cooldown_ms = effective.as_millis() as u64,
         "modelo dinámico en blacklist"
     );
+}
+
+/// Cooldown efectivo de blacklist: el mayor entre el configurado y el
+/// `Retry-After`, nunca por encima de [`MAX_RETRY_AFTER`].
+fn effective_cooldown(retry_after: Option<Duration>, cooldown: Duration) -> Duration {
+    cooldown
+        .max(retry_after.unwrap_or(Duration::ZERO))
+        .min(MAX_RETRY_AFTER)
 }
 
 /// Interpreta el encabezado `Retry-After`, en segundos o como fecha HTTP.
@@ -924,7 +944,10 @@ async fn healthz() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_url, parse_retry_after, request_requires_tool_call, response_has_tool_call};
+    use super::{
+        MAX_RETRY_AFTER, chat_url, effective_cooldown, parse_retry_after,
+        request_requires_tool_call, response_has_tool_call,
+    };
     use axum::http::HeaderValue;
     use serde_json::json;
     use std::time::Duration;
@@ -972,6 +995,27 @@ mod tests {
                 "Wed, 21 Oct 2015 07:28:00 GMT"
             ))),
             Some(Duration::ZERO)
+        );
+    }
+
+    /// A2: un `Retry-After` muy lejano se acota al cap, no blacklistea años.
+    #[test]
+    fn effective_cooldown_caps_a_far_future_retry_after() {
+        // ~10 años: mucho más que el cap, debe recortarse.
+        let far = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+        assert_eq!(
+            effective_cooldown(Some(far), Duration::from_secs(30)),
+            MAX_RETRY_AFTER,
+            "una fecha muy lejana no debe blacklistear el modelo durante años"
+        );
+    }
+
+    /// A2: un `Retry-After` positivo por debajo del cap manda sobre el cooldown.
+    #[test]
+    fn effective_cooldown_uses_retry_after_when_larger() {
+        assert_eq!(
+            effective_cooldown(Some(Duration::from_secs(120)), Duration::from_secs(30)),
+            Duration::from_secs(120)
         );
     }
 

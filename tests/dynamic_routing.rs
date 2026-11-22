@@ -26,7 +26,7 @@ const KEY_ENV: &str = "OPENROUTER_FREE_ROUTING_TEST_KEY";
 #[derive(Clone)]
 struct Behaviour {
     status: StatusCode,
-    retry_after: Option<u64>,
+    retry_after: Option<String>,
 }
 
 impl Behaviour {
@@ -68,7 +68,18 @@ impl OpenRouterMock {
             model.to_owned(),
             Behaviour {
                 status,
-                retry_after: Some(seconds),
+                retry_after: Some(seconds.to_string()),
+            },
+        );
+    }
+
+    /// Fija un `Retry-After` con un valor literal (p. ej. una fecha HTTP).
+    fn set_retry_after_value(&self, model: &str, status: StatusCode, value: &str) {
+        self.behaviours.lock().expect("lock behaviours").insert(
+            model.to_owned(),
+            Behaviour {
+                status,
+                retry_after: Some(value.to_owned()),
             },
         );
     }
@@ -115,8 +126,8 @@ async fn chat_handler(State(mock): State<Arc<OpenRouterMock>>, body: Bytes) -> R
     let behaviour = mock.behaviour(&model);
 
     let mut headers = HeaderMap::new();
-    if let Some(seconds) = behaviour.retry_after
-        && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+    if let Some(value) = &behaviour.retry_after
+        && let Ok(value) = HeaderValue::from_str(value)
     {
         headers.insert(header::RETRY_AFTER, value);
     }
@@ -429,6 +440,87 @@ route:
         mock.count("dyn/aa:free"),
         1,
         "con Retry-After el modelo sigue en blacklist pasados 200 ms"
+    );
+}
+
+/// A1: un `Retry-After` con fecha HTTP ya pasada no fuerza la blacklist.
+#[tokio::test]
+async fn past_http_date_retry_after_does_not_blacklist() {
+    let (base, mock) = spawn_openrouter(one_model_catalog()).await;
+    // 200 (no reintentable) + `Retry-After` en fecha pasada: no debe marcar.
+    mock.set_retry_after_value(
+        "dyn/aa:free",
+        StatusCode::OK,
+        "Wed, 21 Oct 2015 07:28:00 GMT",
+    );
+
+    let yaml = r#"
+route:
+  - name: free-code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+"#;
+    let gateway = spawn_gateway(yaml, &base, 60_000).await;
+
+    assert_eq!(
+        chat(&gateway, "free-code").await.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        chat(&gateway, "free-code").await.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        mock.count("dyn/aa:free"),
+        2,
+        "una fecha pasada no debe blacklistear el modelo"
+    );
+}
+
+/// A1: un `Retry-After` con fecha HTTP futura sí marca el modelo.
+#[tokio::test]
+async fn future_http_date_retry_after_blacklists() {
+    let (base, mock) = spawn_openrouter(one_model_catalog()).await;
+    mock.set_retry_after_value(
+        "dyn/aa:free",
+        StatusCode::OK,
+        "Wed, 21 Oct 2099 07:28:00 GMT",
+    );
+
+    let yaml = r#"
+route:
+  - name: free-code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+"#;
+    let gateway = spawn_gateway(yaml, &base, 50).await;
+
+    assert_eq!(
+        chat(&gateway, "free-code").await.status(),
+        reqwest::StatusCode::OK
+    );
+    // Muy por encima del cooldown configurado (50 ms): sigue en blacklist.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        chat(&gateway, "free-code").await.status(),
+        reqwest::StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        mock.count("dyn/aa:free"),
+        1,
+        "con Retry-After futuro el modelo queda en blacklist"
     );
 }
 
