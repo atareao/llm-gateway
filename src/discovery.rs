@@ -184,6 +184,9 @@ pub struct CatalogCache {
     /// Serializa los refrescos: el ticker y el refresco on-demand lo consultan
     /// para no lanzar fetches duplicados concurrentes.
     refresh_lock: tokio::sync::Mutex<()>,
+    /// Número de refrescos lanzados en segundo plano; solo para tests.
+    #[cfg(test)]
+    spawns: AtomicUsize,
     metrics: Arc<Metrics>,
 }
 
@@ -204,6 +207,8 @@ impl CatalogCache {
             timeout: CATALOG_TIMEOUT,
             state: RwLock::new(None),
             refresh_lock: tokio::sync::Mutex::new(()),
+            #[cfg(test)]
+            spawns: AtomicUsize::new(0),
             metrics,
         }
     }
@@ -323,11 +328,26 @@ impl CatalogCache {
     }
 
     /// Lanza un refresco en segundo plano si no hay otro en vuelo.
+    ///
+    /// Fast-path con `try_lock`: si el lock está ocupado (ya hay un refresco en
+    /// curso, p. ej. el ticker o un `ensure` anterior) no se crea una tarea
+    /// nueva; el refresco en vuelo ya cubrirá el TTL vencido.
     fn spawn_refresh(self: &Arc<Self>) {
+        if self.refresh_lock.try_lock().is_err() {
+            return;
+        }
+        #[cfg(test)]
+        self.spawns.fetch_add(1, Ordering::Relaxed);
         let this = Arc::clone(self);
         tokio::spawn(async move {
             this.refresh_guarded().await;
         });
+    }
+
+    /// Refrescos en segundo plano lanzados (solo para tests).
+    #[cfg(test)]
+    fn spawn_count(&self) -> usize {
+        self.spawns.load(Ordering::Relaxed)
     }
 }
 
@@ -753,5 +773,55 @@ route:
         let other = Arc::clone(&blacklist);
         blacklist.mark("m", Duration::from_secs(60));
         assert!(other.is_blocked("m"), "la blacklist es global/compartida");
+    }
+
+    /// Caché con `base_url` inválido y una instantánea ya vencida (TTL 0), para
+    /// ejercitar la rama de refresco en segundo plano sin tocar la red.
+    fn expired_cache() -> Arc<CatalogCache> {
+        let cache = Arc::new(CatalogCache::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1/v1".to_owned(),
+            Duration::ZERO,
+            metrics(),
+        ));
+        *cache
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Snapshot {
+            models: Arc::new(Vec::new()),
+            fetched_at: Instant::now(),
+        });
+        cache
+    }
+
+    /// A3: con el lock de refresco ocupado, `ensure` no crea una tarea nueva.
+    #[tokio::test]
+    async fn ensure_does_not_spawn_refresh_while_lock_is_held() {
+        let cache = expired_cache();
+        let _held = cache.refresh_lock.lock().await;
+
+        let before = cache.spawn_count();
+        let _ = cache.ensure().await;
+
+        assert_eq!(
+            cache.spawn_count(),
+            before,
+            "con el lock ocupado no debe lanzarse una tarea nueva"
+        );
+    }
+
+    /// A3: sin refresco en vuelo, `ensure` sí lanza un refresco en segundo plano.
+    #[tokio::test]
+    async fn ensure_spawns_refresh_when_idle() {
+        let cache = expired_cache();
+
+        let before = cache.spawn_count();
+        let _ = cache.ensure().await;
+
+        assert_eq!(
+            cache.spawn_count(),
+            before + 1,
+            "sin refresco en vuelo debe lanzarse uno"
+        );
     }
 }
