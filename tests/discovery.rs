@@ -127,6 +127,8 @@ fn cache_with_timeout(base_url: &str, ttl: Duration, timeout: Duration) -> Arc<C
 enum Reply {
     /// `200` con este JSON.
     Json(Value),
+    /// `200` con este JSON tras `Duration`.
+    JsonAfter(Duration, Value),
     /// Nunca responde a tiempo (duerme mucho más que cualquier timeout).
     Hang,
 }
@@ -139,6 +141,10 @@ async fn spawn_scripted_server(replies: Vec<Reply>) -> (String, Arc<AtomicUsize>
         let idx = counter.fetch_add(1, Ordering::SeqCst);
         match &replies[idx.min(replies.len() - 1)] {
             Reply::Json(body) => axum::Json(body.clone()).into_response(),
+            Reply::JsonAfter(delay, body) => {
+                tokio::time::sleep(*delay).await;
+                axum::Json(body.clone()).into_response()
+            }
             Reply::Hang => {
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 (StatusCode::OK, "late").into_response()
@@ -346,5 +352,38 @@ async fn ensure_with_expired_ttl_does_not_hang_on_slow_upstream() {
         stale.len(),
         3,
         "un upstream lento no debe vaciar la caché válida"
+    );
+}
+
+/// M2: dos refrescos concurrentes no duplican el fetch del catálogo.
+#[tokio::test]
+async fn concurrent_refreshes_fetch_once() {
+    let (base, count) =
+        spawn_scripted_server(vec![Reply::JsonAfter(Duration::from_millis(80), catalog())]).await;
+    let cache = cache(&base, Duration::from_secs(300));
+
+    let (first, second) = tokio::join!(cache.refresh_guarded(), cache.refresh_guarded());
+
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "solo debe haber un GET /models"
+    );
+    assert!(first || second, "al menos uno debe haber refrescado");
+}
+
+/// M2: N peticiones en arranque en frío comparten un único fetch.
+#[tokio::test]
+async fn concurrent_cold_start_ensure_fetches_once() {
+    let (base, count) =
+        spawn_scripted_server(vec![Reply::JsonAfter(Duration::from_millis(80), catalog())]).await;
+    let cache = cache(&base, Duration::from_secs(300));
+
+    let (a, b) = tokio::join!(cache.ensure(), cache.ensure());
+
+    assert_eq!(count.load(Ordering::SeqCst), 1, "un solo fetch en frío");
+    assert!(
+        a.is_some() && b.is_some(),
+        "ambas peticiones deben recibir el catálogo"
     );
 }

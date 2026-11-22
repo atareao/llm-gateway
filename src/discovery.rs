@@ -12,7 +12,7 @@
 //! depurados.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -181,7 +181,9 @@ pub struct CatalogCache {
     ttl: Duration,
     timeout: Duration,
     state: RwLock<Option<Snapshot>>,
-    refreshing: AtomicBool,
+    /// Serializa los refrescos: el ticker y el refresco on-demand lo consultan
+    /// para no lanzar fetches duplicados concurrentes.
+    refresh_lock: tokio::sync::Mutex<()>,
     metrics: Arc<Metrics>,
 }
 
@@ -201,7 +203,7 @@ impl CatalogCache {
             ttl,
             timeout: CATALOG_TIMEOUT,
             state: RwLock::new(None),
-            refreshing: AtomicBool::new(false),
+            refresh_lock: tokio::sync::Mutex::new(()),
             metrics,
         }
     }
@@ -255,6 +257,13 @@ impl CatalogCache {
                 Some(snapshot.models)
             }
             None => {
+                // Arranque en frío: N peticiones concurrentes comparten un único
+                // fetch (se serializan con `refresh_lock` y la segunda reutiliza
+                // la caché ya poblada).
+                let _guard = self.refresh_lock.lock().await;
+                if let Some(snapshot) = self.snapshot() {
+                    return Some(snapshot.models);
+                }
                 self.refresh().await.ok()?;
                 self.cached()
             }
@@ -293,21 +302,31 @@ impl CatalogCache {
         }
     }
 
+    /// Refresca el catálogo si no hay otro refresco en vuelo.
+    ///
+    /// Devuelve `true` si este llamante realizó el refresco y `false` si lo
+    /// omitió porque ya había uno en curso. Es el punto de entrada que comparten
+    /// el ticker de [`Registry::spawn_refresh`] y el refresco on-demand, de modo
+    /// que nunca se solapan dos fetches de `/models`.
+    pub async fn refresh_guarded(&self) -> bool {
+        let Ok(_guard) = self.refresh_lock.try_lock() else {
+            return false;
+        };
+        if let Err(err) = self.refresh().await {
+            tracing::debug!(
+                base_url = %self.base_url,
+                error = %err,
+                "refresco del catálogo fallido; se conserva la caché"
+            );
+        }
+        true
+    }
+
     /// Lanza un refresco en segundo plano si no hay otro en vuelo.
     fn spawn_refresh(self: &Arc<Self>) {
-        if self.refreshing.swap(true, Ordering::AcqRel) {
-            return;
-        }
         let this = Arc::clone(self);
         tokio::spawn(async move {
-            if let Err(err) = this.refresh().await {
-                tracing::debug!(
-                    base_url = %this.base_url,
-                    error = %err,
-                    "refresco del catálogo en segundo plano fallido; se conserva la caché"
-                );
-            }
-            this.refreshing.store(false, Ordering::Release);
+            this.refresh_guarded().await;
         });
     }
 }
@@ -562,13 +581,9 @@ impl Registry {
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 loop {
                     ticker.tick().await;
-                    if let Err(err) = cache.refresh().await {
-                        tracing::debug!(
-                            base_url = %cache.base_url(),
-                            error = %err,
-                            "refresco del catálogo fallido; se conserva la caché"
-                        );
-                    }
+                    // Pasa por el mismo guardián que el refresco on-demand para
+                    // no solapar dos fetches de `/models`.
+                    cache.refresh_guarded().await;
                 }
             }));
         }
