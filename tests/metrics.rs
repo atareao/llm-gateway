@@ -123,6 +123,29 @@ async fn metrics_endpoint_exposes_prometheus_text() {
     assert!(body.contains("# TYPE llm_gateway_requests_total counter"));
 }
 
+/// El pre-registro del gauge de blacklist no depende de que haya backends
+/// dinámicos: con una config solo estática, el primer scrape ya publica el
+/// gauge a `0` por la rama de producción de `Metrics::new` (este binario
+/// compila la lib sin `cfg(test)`).
+#[tokio::test]
+async fn discovery_blacklist_gauge_preregistered_without_dynamic_backends() {
+    let backend = spawn_echo_backend().await;
+    let gateway = spawn_gateway("route-preregistro-blacklist", &[(&backend, "m")]).await;
+
+    let (status, content_type, body) = get_metrics(&gateway).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("text/plain; version=0.0.4"),
+        "content-type inesperado: {content_type}"
+    );
+    assert_eq!(
+        series_value(&body, &["llm_gateway_discovery_blacklist"]),
+        Some("0"),
+        "el scrape inicial debe publicar llm_gateway_discovery_blacklist 0"
+    );
+}
+
 /// Sin bloque `observability` no se inicializa ningún exportador OTLP y
 /// `/metrics` sigue sirviendo el contrato actual (`text/plain; version=0.0.4` y
 /// series `llm_gateway_*`).

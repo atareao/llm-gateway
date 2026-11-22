@@ -162,7 +162,7 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// cabecera `x-gateway-backend` en las respuestas con éxito.
 pub fn backend_id(backend: &Backend) -> String {
     let model = backend.model.as_deref().unwrap_or("dynamic");
-    format!("{}#{}", backend.base_url, model)
+    crate::config::format_id(&backend.base_url, model)
 }
 
 /// `POST /v1/chat/completions` (no-stream o streaming SSE).
@@ -271,54 +271,104 @@ async fn handle_chat_completions(
 }
 
 /// Candidato concreto tras expandir un backend de la ruta.
+///
+/// Contiene solo los campos que el enrutado necesita, para no clonar el
+/// [`Backend`] completo (con su `discovery`, `warmup`, etc.) en el hot path.
 struct Candidate {
     /// Índice del backend en la configuración (slot para métricas).
     slot: usize,
-    /// Backend a contactar, con el `model` ya resuelto si es dinámico.
-    backend: Backend,
+    /// Modelo real a enviar; en dinámicos, el modelo expandido del catálogo.
+    model: String,
+    /// URL base del backend al que se envía la petición.
+    base_url: String,
+    /// Timeout en milisegundos, si el backend lo define.
+    timeout_ms: Option<u64>,
+    /// Variable de entorno de la API key, si el backend la declara.
+    api_key_env: Option<String>,
     /// Cooldown de blacklist si el candidato procede de un backend dinámico.
     dynamic_cooldown: Option<Duration>,
+}
+
+impl Candidate {
+    /// Construye un candidato a partir de un backend de configuración, copiando
+    /// solo los campos necesarios. Un backend sin `model` usa `"dynamic"`, igual
+    /// que [`backend_id`]; solo los backends dinámicos pueden carecer de `model`
+    /// (los estáticos lo exigen en `validate`).
+    fn from_backend(slot: usize, backend: &Backend) -> Self {
+        debug_assert!(
+            backend.model.is_some() || backend.is_dynamic(),
+            "backend estático sin model: {backend:?}"
+        );
+        Self {
+            slot,
+            model: backend
+                .model
+                .clone()
+                .unwrap_or_else(|| "dynamic".to_owned()),
+            base_url: backend.base_url.clone(),
+            timeout_ms: backend.timeout_ms,
+            api_key_env: backend.api_key_env.clone(),
+            dynamic_cooldown: None,
+        }
+    }
+
+    /// Sustituye el modelo del candidato (expansión de un backend dinámico).
+    fn with_model(mut self, model: String) -> Self {
+        self.model = model;
+        self
+    }
+
+    /// Marca el candidato como procedente de un backend dinámico, de modo que
+    /// sus fallos puedan blacklistear el modelo.
+    fn with_dynamic_cooldown(mut self, cooldown: Option<Duration>) -> Self {
+        self.dynamic_cooldown = cooldown;
+        self
+    }
+
+    /// Identificador determinista del candidato, en el formato
+    /// `<base_url>#<model>`, idéntico al de [`backend_id`].
+    fn id(&self) -> String {
+        crate::config::format_id(&self.base_url, &self.model)
+    }
 }
 
 /// Expande cada backend de la ruta en su posición: los estáticos aportan un
 /// único candidato y los dinámicos (`openrouter_free`) se expanden a sus modelos
 /// elegibles, en orden y con rotación round-robin.
+///
+/// No clona el [`Backend`] completo: los candidatos se construyen campo a campo
+/// con [`Candidate::from_backend`].
 async fn expand_backends(state: &AppState, route_idx: usize, route: &Route) -> Vec<Candidate> {
     let mut candidates = Vec::new();
     for (slot, backend) in route.backend.iter().enumerate() {
         if backend.is_dynamic() {
             let cooldown = state.discovery.cooldown(route_idx, slot);
+            // Un candidato ligero por modelo elegible.
             for model in state.discovery.expand(route_idx, slot).await {
-                let mut expanded = backend.clone();
-                expanded.model = Some(model);
-                candidates.push(Candidate {
-                    slot,
-                    backend: expanded,
-                    dynamic_cooldown: cooldown,
-                });
+                candidates.push(
+                    Candidate::from_backend(slot, backend)
+                        .with_model(model)
+                        .with_dynamic_cooldown(cooldown),
+                );
             }
         } else {
-            candidates.push(Candidate {
-                slot,
-                backend: backend.clone(),
-                dynamic_cooldown: None,
-            });
+            candidates.push(Candidate::from_backend(slot, backend));
         }
     }
     candidates
 }
 
-/// Marca `backend` (dinámico) en la blacklist global si su respuesta lo exige:
-/// `429`, `5xx` o presencia de un `Retry-After` **positivo**. El cooldown
-/// efectivo es el mayor entre el configurado y el indicado por `Retry-After`,
-/// acotado a [`MAX_RETRY_AFTER`].
+/// Marca `model` (de un backend dinámico) en la blacklist global si su respuesta
+/// lo exige: `429`, `5xx` o presencia de un `Retry-After` **positivo**. El
+/// cooldown efectivo es el mayor entre el configurado y el indicado por
+/// `Retry-After`, acotado a [`MAX_RETRY_AFTER`].
 ///
 /// Un `Retry-After` que se traduce a duración cero (p. ej. una fecha HTTP ya
 /// pasada) no es informativo: no fuerza por sí solo la blacklist de un status no
 /// reintentable.
 fn blacklist_if_needed(
     state: &AppState,
-    backend: &Backend,
+    model: &str,
     response: &reqwest::Response,
     cooldown: Duration,
 ) {
@@ -327,9 +377,6 @@ fn blacklist_if_needed(
     if !is_retryable(response.status()) && retry_after.is_none() {
         return;
     }
-    let Some(model) = backend.model.as_deref() else {
-        return;
-    };
     let effective = effective_cooldown(retry_after, cooldown);
     state.discovery.blacklist().mark(model, effective);
     tracing::warn!(
@@ -412,10 +459,13 @@ async fn route_with_failover(
     for candidate in &candidates {
         considered += 1;
         let backend_idx = candidate.slot;
-        let backend = &candidate.backend;
+        // Resuelto una vez por intento: alimenta los logs de todos los caminos y
+        // la cabecera `x-gateway-backend`, sin `format!` repetidos.
+        let candidate_id = candidate.id();
         let attempt_started = Instant::now();
 
-        let Some(api_key) = resolve_api_key(backend) else {
+        let Some(api_key) = resolve_api_key_env(candidate.api_key_env.as_deref(), &candidate_id)
+        else {
             state.metrics.record_attempt(
                 route_idx,
                 backend_idx,
@@ -423,7 +473,7 @@ async fn route_with_failover(
                 attempt_started.elapsed(),
             );
             tracing::warn!(
-                backend = %backend_id(backend),
+                backend = %candidate_id,
                 result = AttemptResult::MissingApiKey.label(),
                 latency_ms = attempt_started.elapsed().as_millis() as u64,
                 "backend sin api_key; probando el siguiente"
@@ -432,10 +482,11 @@ async fn route_with_failover(
         };
         attempts += 1;
 
-        let payload = body_for_backend(body, backend);
+        let payload = body_for_model(body, &candidate.model);
         let send_result = send(
             &state.client,
-            backend,
+            candidate,
+            &candidate_id,
             payload,
             streaming,
             api_key.as_deref(),
@@ -444,7 +495,7 @@ async fn route_with_failover(
 
         // Blacklist dinámica: un `429`/`5xx`/`Retry-After` marca el modelo.
         if let (Ok(response), Some(cooldown)) = (&send_result, candidate.dynamic_cooldown) {
-            blacklist_if_needed(state, backend, response, cooldown);
+            blacklist_if_needed(state, &candidate.model, response, cooldown);
         }
 
         match send_result {
@@ -456,7 +507,7 @@ async fn route_with_failover(
                     attempt_started.elapsed(),
                 );
                 tracing::warn!(
-                    backend = %backend_id(backend),
+                    backend = %candidate_id,
                     status = %response.status(),
                     result = AttemptResult::RetryableStatus.label(),
                     latency_ms = attempt_started.elapsed().as_millis() as u64,
@@ -472,7 +523,7 @@ async fn route_with_failover(
                         attempt_started.elapsed(),
                     );
                     tracing::debug!(
-                        backend = %backend_id(backend),
+                        backend = %candidate_id,
                         result = AttemptResult::Success.label(),
                         latency_ms = attempt_started.elapsed().as_millis() as u64,
                         "intento completado"
@@ -489,10 +540,10 @@ async fn route_with_failover(
                         latency_ms = started.elapsed().as_millis() as u64,
                         "petición completada"
                     );
-                    return Ok(stream_response(response, backend));
+                    return Ok(stream_response(response, &candidate_id));
                 }
 
-                match full_response(response, backend).await {
+                match full_response(response, &candidate_id).await {
                     Ok((response, body_bytes)) => {
                         if requires_tool_call
                             && response.status().is_success()
@@ -505,7 +556,7 @@ async fn route_with_failover(
                                 attempt_started.elapsed(),
                             );
                             tracing::warn!(
-                                backend = %backend_id(backend),
+                                backend = %candidate_id,
                                 result = AttemptResult::NoToolCall.label(),
                                 latency_ms = attempt_started.elapsed().as_millis() as u64,
                                 "respuesta sin tool_calls cuando la petición los exige; probando el siguiente"
@@ -520,7 +571,7 @@ async fn route_with_failover(
                             attempt_started.elapsed(),
                         );
                         tracing::debug!(
-                            backend = %backend_id(backend),
+                            backend = %candidate_id,
                             result = AttemptResult::Success.label(),
                             latency_ms = attempt_started.elapsed().as_millis() as u64,
                             "intento completado"
@@ -547,7 +598,7 @@ async fn route_with_failover(
                             attempt_started.elapsed(),
                         );
                         tracing::warn!(
-                            backend = %backend_id(backend),
+                            backend = %candidate_id,
                             result = AttemptResult::BodyError.label(),
                             error = %err,
                             latency_ms = attempt_started.elapsed().as_millis() as u64,
@@ -568,7 +619,7 @@ async fn route_with_failover(
                     attempt_started.elapsed(),
                 );
                 tracing::warn!(
-                    backend = %backend_id(backend),
+                    backend = %candidate_id,
                     result = result.label(),
                     error = %err,
                     latency_ms = attempt_started.elapsed().as_millis() as u64,
@@ -617,13 +668,19 @@ async fn route_with_failover(
 /// Nunca registra el valor de la clave; solo, si acaso, el nombre de la
 /// variable y el identificador del backend.
 pub(crate) fn resolve_api_key(backend: &Backend) -> Option<Option<String>> {
-    match backend.api_key_env.as_deref() {
+    resolve_api_key_env(backend.api_key_env.as_deref(), &backend_id(backend))
+}
+
+/// Implementación común de [`resolve_api_key`] para backends de configuración y
+/// candidatos ya expandidos. `backend_label` solo se usa para los logs.
+fn resolve_api_key_env(api_key_env: Option<&str>, backend_label: &str) -> Option<Option<String>> {
+    match api_key_env {
         None => Some(None),
         Some(var) => match std::env::var(var) {
             Ok(value) if !value.is_empty() => Some(Some(value)),
             _ => {
                 tracing::warn!(
-                    backend = %backend_id(backend),
+                    backend = %backend_label,
                     env_var = %var,
                     "api_key_env sin resolver; se salta el backend"
                 );
@@ -704,9 +761,13 @@ fn response_has_tool_call(bytes: &[u8]) -> bool {
     !absence_confirmed
 }
 
-/// Envía la petición al backend y devuelve la respuesta con las cabeceras ya
-/// disponibles, **sin** consumir el cuerpo (permite decidir el failover antes
-/// del primer byte). Si `api_key` es `Some`, añade `Authorization: Bearer`.
+/// Envía la petición al `candidate` y devuelve la respuesta con las cabeceras
+/// ya disponibles, **sin** consumir el cuerpo (permite decidir el failover antes
+/// del primer byte). `backend_label` es el identificador ya resuelto del
+/// candidato (para el span). Si `api_key` es `Some`, añade `Authorization: Bearer`.
+///
+/// **Invariante:** `backend_label == candidate.id()`; el llamante lo resuelve una
+/// vez y lo comparte con los logs y la cabecera `x-gateway-backend`.
 ///
 /// - **No-stream**: se aplica **siempre** un timeout total (`request.timeout(budget)`),
 ///   con `budget = timeout_ms` si el backend lo define, o [`DEFAULT_REQUEST_TIMEOUT`]
@@ -718,7 +779,8 @@ fn response_has_tool_call(bytes: &[u8]) -> bool {
 ///   deadline. **No** se usa un timeout global, que abortaría respuestas largas.
 async fn send(
     client: &reqwest::Client,
-    backend: &Backend,
+    candidate: &Candidate,
+    backend_label: &str,
     payload: Value,
     streaming: bool,
     api_key: Option<&str>,
@@ -727,13 +789,13 @@ async fn send(
     // poder inyectar su contexto (`traceparent`) en las cabeceras salientes.
     let span = tracing::info_span!(
         "backend_request",
-        backend = %backend_id(backend),
-        model = %backend.model.as_deref().unwrap_or(""),
+        backend = %backend_label,
+        model = %candidate.model,
         streaming,
         "otel.kind" = "client",
     );
 
-    let mut request = client.post(chat_url(&backend.base_url)).json(&payload);
+    let mut request = client.post(chat_url(&candidate.base_url)).json(&payload);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
@@ -742,7 +804,7 @@ async fn send(
     request = request.headers(trace_headers);
 
     if streaming {
-        let budget = backend
+        let budget = candidate
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_FIRST_BYTE_TIMEOUT);
@@ -755,7 +817,7 @@ async fn send(
             Err(_elapsed) => Err(SendError::FirstByteTimeout(budget)),
         }
     } else {
-        let budget = backend
+        let budget = candidate
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT);
@@ -777,7 +839,7 @@ async fn send(
 /// idéntico al upstream.
 async fn full_response(
     response: reqwest::Response,
-    backend: &Backend,
+    backend_label: &str,
 ) -> Result<(Response, Bytes), AppError> {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
@@ -788,7 +850,7 @@ async fn full_response(
         content_type,
         Body::from(body.clone()),
         DEFAULT_CONTENT_TYPE,
-        backend,
+        backend_label,
     );
 
     Ok((response, body))
@@ -799,7 +861,7 @@ async fn full_response(
 ///
 /// Si el upstream se corta a mitad, el error del stream propaga al cliente y
 /// la conexión se cierra con error; no se reintenta (limitación documentada).
-fn stream_response(response: reqwest::Response, backend: &Backend) -> Response {
+fn stream_response(response: reqwest::Response, backend_label: &str) -> Response {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let body = Body::from_stream(response.bytes_stream());
@@ -809,7 +871,7 @@ fn stream_response(response: reqwest::Response, backend: &Backend) -> Response {
         content_type,
         body,
         DEFAULT_STREAM_CONTENT_TYPE,
-        backend,
+        backend_label,
     )
 }
 
@@ -821,7 +883,7 @@ fn assemble(
     content_type: Option<HeaderValue>,
     body: Body,
     default_content_type: &'static str,
-    backend: &Backend,
+    backend_label: &str,
 ) -> Response {
     let content_type =
         content_type.unwrap_or_else(|| HeaderValue::from_static(default_content_type));
@@ -829,7 +891,7 @@ fn assemble(
     let mut response = (status, [(header::CONTENT_TYPE, content_type)], body).into_response();
 
     if status.is_success()
-        && let Ok(value) = HeaderValue::from_str(&backend_id(backend))
+        && let Ok(value) = HeaderValue::from_str(backend_label)
     {
         response
             .headers_mut()
@@ -839,20 +901,26 @@ fn assemble(
     response
 }
 
+/// Clona `body` y sustituye su `model` por `model`. El resto de campos
+/// (incluidos los desconocidos) se conservan intactos.
+fn body_for_model(body: &Value, model: &str) -> Value {
+    let mut value = body.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("model".to_owned(), Value::String(model.to_owned()));
+    }
+    value
+}
+
 /// Clona `body` y sustituye su `model` por el del backend. El resto de campos
 /// (incluidos los desconocidos) se conservan intactos.
 ///
 /// Un backend sin `model` (p. ej. un dinámico sin expandir) devuelve el cuerpo
 /// tal cual.
 pub(crate) fn body_for_backend(body: &Value, backend: &Backend) -> Value {
-    let Some(model) = backend.model.as_deref() else {
-        return body.clone();
-    };
-    let mut value = body.clone();
-    if let Some(object) = value.as_object_mut() {
-        object.insert("model".to_owned(), Value::String(model.to_owned()));
+    match backend.model.as_deref() {
+        Some(model) => body_for_model(body, model),
+        None => body.clone(),
     }
-    value
 }
 
 /// Compone la URL del endpoint de chat a partir de la `base_url` del backend
@@ -945,12 +1013,195 @@ async fn healthz() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_RETRY_AFTER, chat_url, effective_cooldown, parse_retry_after,
-        request_requires_tool_call, response_has_tool_call,
+        AppState, Candidate, MAX_RETRY_AFTER, backend_id, chat_url, effective_cooldown,
+        expand_backends, parse_retry_after, request_requires_tool_call, response_has_tool_call,
     };
+    use crate::config::{Backend, BackendKind, GatewayConfig};
+    use crate::discovery::{ModelEntry, Pricing};
     use axum::http::HeaderValue;
     use serde_json::json;
     use std::time::Duration;
+
+    /// Modelo elegible (free + tool-calling) para precargar un catálogo.
+    fn eligible_model(id: &str, context_length: u32) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(context_length),
+            pricing: Some(Pricing {
+                prompt: Some(json!("0")),
+                completion: Some(json!("0")),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Backend estático de test con `model`, `timeout_ms` y `api_key_env`.
+    fn static_backend() -> Backend {
+        Backend {
+            kind: BackendKind::Static,
+            base_url: "http://localhost:11434/v1".to_owned(),
+            model: Some("qwen2.5:7b-instruct".to_owned()),
+            api_key_env: Some("K".to_owned()),
+            timeout_ms: Some(9000),
+            profile: None,
+            discovery: None,
+            warmup: None,
+        }
+    }
+
+    /// M5: `from_backend` copia solo los campos ligeros y conserva el id
+    /// `<base_url>#<model>` que emite el gateway.
+    #[test]
+    fn candidate_from_backend_copies_light_fields() {
+        let backend = static_backend();
+
+        let candidate = Candidate::from_backend(2, &backend);
+
+        assert_eq!(candidate.slot, 2);
+        assert_eq!(candidate.model, "qwen2.5:7b-instruct");
+        assert_eq!(candidate.base_url, "http://localhost:11434/v1");
+        assert_eq!(candidate.timeout_ms, Some(9000));
+        assert_eq!(candidate.api_key_env.as_deref(), Some("K"));
+        assert!(
+            candidate.dynamic_cooldown.is_none(),
+            "un backend estático no tiene cooldown dinámico"
+        );
+        assert_eq!(candidate.id(), backend_id(&backend));
+        assert_eq!(
+            candidate.id(),
+            "http://localhost:11434/v1#qwen2.5:7b-instruct"
+        );
+    }
+
+    /// M5: `with_model` sustituye solo el modelo de un candidato ya construido.
+    #[test]
+    fn candidate_with_model_only_replaces_model() {
+        let candidate =
+            Candidate::from_backend(4, &static_backend()).with_model("dyn/aa:free".to_owned());
+
+        assert_eq!(candidate.model, "dyn/aa:free");
+        assert_eq!(candidate.slot, 4);
+        assert_eq!(candidate.base_url, "http://localhost:11434/v1");
+        assert_eq!(candidate.timeout_ms, Some(9000));
+        assert_eq!(candidate.api_key_env.as_deref(), Some("K"));
+        assert!(candidate.dynamic_cooldown.is_none());
+        assert_eq!(candidate.id(), "http://localhost:11434/v1#dyn/aa:free");
+    }
+
+    /// M5: un dinámico sin `model` usa el mismo fallback `"dynamic"` que
+    /// [`backend_id`]; los estáticos exigen `model` en `validate`.
+    #[test]
+    fn candidate_without_model_uses_dynamic_fallback() {
+        let backend = Backend {
+            kind: BackendKind::OpenrouterFree,
+            model: None,
+            ..static_backend()
+        };
+
+        let candidate = Candidate::from_backend(0, &backend);
+
+        assert_eq!(candidate.model, "dynamic");
+        assert_eq!(candidate.id(), backend_id(&backend));
+    }
+
+    /// El identificador `<base_url>#<model>` es idéntico en las tres rutas que
+    /// lo producen: [`backend_id`], [`Backend::label`] y [`Candidate::id`].
+    #[test]
+    fn backend_identifiers_agree_across_formatters() {
+        let backend = static_backend();
+        let candidate = Candidate::from_backend(0, &backend);
+
+        assert_eq!(backend_id(&backend), backend.label());
+        assert_eq!(candidate.id(), backend.label());
+        assert_eq!(candidate.id(), backend_id(&backend));
+    }
+
+    /// M5: `expand_backends` expande la ruta en su posición: el estático aporta
+    /// un candidato y el dinámico (con `overrides` y `warmup`) uno por modelo
+    /// elegible, arrastrando `timeout_ms` y `api_key_env` del backend.
+    ///
+    /// El lock del gauge se mantiene durante la expansión para que las purgas de
+    /// la blacklist (que escriben el gauge global) no se crucen con otros tests;
+    /// el runtime es `current_thread`, así que no bloquea otra tarea.
+    #[tokio::test]
+    async fn expand_backends_expands_dynamic_in_place_with_light_fields() {
+        // El acceso a la blacklist toca el gauge global (sin etiquetas).
+        let _guard = crate::metrics::BlacklistGaugeGuard::lock();
+        let yaml = r#"
+route:
+  - name: expand-test
+    backend:
+      - base_url: "http://static.test/v1"
+        model: "local/static"
+        api_key_env: "STATIC_KEY"
+        timeout_ms: 9000
+      - kind: openrouter_free
+        base_url: "http://dynamic.test/v1"
+        api_key_env: "DYN_KEY"
+        timeout_ms: 5000
+        profile: code
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: 7000
+          overrides:
+            include: ["beta/two:free"]
+        warmup:
+          interval_ms: 1000
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        let state = AppState::new(config).expect("estado de test");
+        state
+            .discovery
+            .catalog("http://dynamic.test/v1")
+            .expect("caché del backend dinámico")
+            .seed(vec![
+                eligible_model("alpha/one:free", 2000),
+                eligible_model("beta/two:free", 4000),
+            ]);
+
+        let route = &state.config.route[0];
+        let candidates = expand_backends(&state, 0, route).await;
+
+        assert_eq!(candidates.len(), 3, "estático + dos modelos del catálogo");
+
+        let static_candidate = &candidates[0];
+        assert_eq!(static_candidate.slot, 0);
+        assert_eq!(static_candidate.model, "local/static");
+        assert_eq!(static_candidate.base_url, "http://static.test/v1");
+        assert_eq!(static_candidate.timeout_ms, Some(9000));
+        assert_eq!(static_candidate.api_key_env.as_deref(), Some("STATIC_KEY"));
+        assert!(
+            static_candidate.dynamic_cooldown.is_none(),
+            "un estático no lleva cooldown dinámico"
+        );
+
+        // `overrides.include` fuerza `beta/two:free` al principio del perfil.
+        assert_eq!(
+            candidates[1..]
+                .iter()
+                .map(|candidate| candidate.model.as_str())
+                .collect::<Vec<_>>(),
+            ["beta/two:free", "alpha/one:free"],
+            "los dinámicos se expanden en su posición y en orden de clasificación"
+        );
+        for candidate in &candidates[1..] {
+            assert_eq!(candidate.slot, 1, "mismo backend dinámico");
+            assert_eq!(candidate.base_url, "http://dynamic.test/v1");
+            assert_eq!(candidate.timeout_ms, Some(5000), "timeout arrastrado");
+            assert_eq!(
+                candidate.api_key_env.as_deref(),
+                Some("DYN_KEY"),
+                "api_key_env arrastrado"
+            );
+            assert_eq!(
+                candidate.dynamic_cooldown,
+                Some(Duration::from_millis(7000)),
+                "solo los dinámicos llevan el cooldown configurado"
+            );
+        }
+    }
 
     #[test]
     fn parse_retry_after_reads_seconds() {

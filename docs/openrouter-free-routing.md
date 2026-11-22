@@ -64,7 +64,10 @@ Dentro de cada tier se ordena por `context_length` **descendente** y, a
 igualdad, por `id` **ascendente** (orden determinista). Los modelos con
 `context_length` inferior a `discovery.min_context` se descartan, y los
 `overrides` permiten excluir (`exclude`) o anteponer (`include`) modelos
-concretos.
+concretos. Un `include` que no es elegible (ausente del catálogo, filtrado por
+`min_context` o excluido por `exclude`) se descarta y emite un
+`tracing::warn!` con el modelo, el perfil y la `base_url`; la lista resultante
+no cambia.
 
 ### Expansión y rotación
 
@@ -86,6 +89,9 @@ encabezado `Retry-After`, el modelo entra en una **blacklist global** (compartid
 entre todas las rutas) durante `blacklist_cooldown_ms`. Si `Retry-After` está
 presente, el cooldown efectivo es el mayor entre el configurado y el indicado
 (admitiendo segundos o fecha HTTP); al vencer, el modelo vuelve a ser elegible.
+El gauge `llm_gateway_discovery_blacklist` solo se reescribe cuando cambia el
+tamaño de la blacklist; los accesos sin cambios (la mayoría de purgas) no
+tocan la serie.
 
 ### Fallback y agotamiento
 
@@ -115,9 +121,16 @@ Notas:
 - Un backend `openrouter_free` requiere `base_url` y `api_key_env`; su `model`
   se ignora (lo resuelve el descubrimiento). Un `static` requiere `base_url` y
   `model`.
-- El bloque `discovery` es opcional. Si se declara, `refresh_interval_ms` y
-  `blacklist_cooldown_ms` son obligatorios y deben ser mayores que 0; si se
-  omite, se aplican los valores por defecto de la tabla.
+- El bloque `discovery` es opcional. Cada campo usa su propio default si se
+  omite (`refresh_interval_ms: 300000`, `blacklist_cooldown_ms: 60000`,
+  `min_context: None`, `overrides: None`), así que `discovery: { min_context:
+  32768 }` es válido. Un `0` explícito en los TTL sigue siendo error.
+- El catálogo se comparte por `base_url`: todos los backends `openrouter_free`
+  que usan la misma `base_url` deben declarar el **mismo TTL efectivo**
+  (explícito o por default), en la misma ruta o en rutas distintas. Un TTL
+  incoherente hace fallar la carga con un error que nombra la `base_url` y las
+  rutas implicadas (fail-fast). Detalle en
+  [`docs/openrouter-free-followups.md`](openrouter-free-followups.md).
 - El timeout de la consulta del catálogo (`CATALOG_TIMEOUT`, 10 s) es una
   constante del código, no configurable.
 
@@ -218,7 +231,10 @@ Resumen de las decisiones de `design.md`:
 
 ## Follow-ups
 
-Hallazgos no bloqueantes pendientes (no se corrigen aquí):
+Hallazgos no bloqueantes detectados en la implementación inicial. M5, M6, N1,
+N2, N3 y N4 se cerraron en el change `add-openrouter-free-followups`; ver
+[`docs/openrouter-free-followups.md`](openrouter-free-followups.md). Se
+conserva el histórico:
 
 - **M5 — clones de `Backend` en el hot path.** `expand_backends` clona el
   `Backend` una vez por modelo expandido (y también los estáticos), en cada

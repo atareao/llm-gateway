@@ -11,7 +11,7 @@
 //! clasificación por perfil ([`crate::classify`]) trabaje sobre modelos ya
 //! depurados.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::classify::classify;
+use crate::classify::{ClassifyContext, classify};
 use crate::config::{ClassifyOverrides, DEFAULT_REFRESH_INTERVAL_MS, GatewayConfig, Profile};
 use crate::metrics::Metrics;
 
@@ -223,6 +223,20 @@ impl CatalogCache {
     /// Devuelve el catálogo cacheado (aunque esté vencido), o `None`.
     pub fn cached(&self) -> Option<Arc<Vec<ModelEntry>>> {
         self.snapshot().map(|snapshot| snapshot.models)
+    }
+
+    /// Precarga la caché con `models` como si se acabaran de descargar.
+    ///
+    /// Solo para tests: permite ejercitar la expansión sin red.
+    #[cfg(test)]
+    pub(crate) fn seed(&self, models: Vec<ModelEntry>) {
+        *self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Snapshot {
+            models: Arc::new(models),
+            fetched_at: Instant::now(),
+        });
     }
 
     /// TTL configurado de la caché (usado como periodo de refresco).
@@ -436,14 +450,24 @@ fn purge_expired(entries: &mut HashMap<String, Instant>) {
 
 /// Backend dinámico registrado, con su estado de rotación.
 struct DynamicBackend {
-    route: usize,
-    backend: usize,
     profile: Profile,
     base_url: String,
     min_context: Option<u32>,
     cooldown: Duration,
     overrides: Option<ClassifyOverrides>,
     rotation: AtomicUsize,
+}
+
+impl DynamicBackend {
+    /// Contexto de clasificación derivado del estado del backend.
+    fn classify_context(&self) -> ClassifyContext<'_> {
+        ClassifyContext::new(
+            self.profile,
+            self.min_context,
+            self.overrides.as_ref(),
+            &self.base_url,
+        )
+    }
 }
 
 /// Registro de cachés de catálogo, una por `base_url` dinámica.
@@ -454,6 +478,8 @@ struct DynamicBackend {
 pub struct Registry {
     catalogs: HashMap<String, Arc<CatalogCache>>,
     dynamic: Vec<DynamicBackend>,
+    /// Posición en `dynamic` del backend dinámico `(route, backend)`.
+    index: HashMap<(usize, usize), usize>,
     blacklist: Arc<Blacklist>,
     metrics: Arc<Metrics>,
 }
@@ -463,6 +489,7 @@ impl Registry {
     pub fn new(config: &GatewayConfig, client: reqwest::Client, metrics: Arc<Metrics>) -> Self {
         let mut catalogs: HashMap<String, Arc<CatalogCache>> = HashMap::new();
         let mut dynamic = Vec::new();
+        let mut index = HashMap::new();
 
         for (route_idx, route) in config.route.iter().enumerate() {
             for (backend_idx, backend) in route.backend.iter().enumerate() {
@@ -481,9 +508,8 @@ impl Registry {
                         Arc::clone(&metrics),
                     ))
                 });
+                index.insert((route_idx, backend_idx), dynamic.len());
                 dynamic.push(DynamicBackend {
-                    route: route_idx,
-                    backend: backend_idx,
                     profile: backend.profile(),
                     base_url: backend.base_url.clone(),
                     min_context: discovery.and_then(|discovery| discovery.min_context),
@@ -501,6 +527,7 @@ impl Registry {
         Self {
             catalogs,
             dynamic,
+            index,
             blacklist: Arc::new(Blacklist::new(Arc::clone(&metrics))),
             metrics,
         }
@@ -518,9 +545,9 @@ impl Registry {
 
     /// Backend dinámico registrado en `(route, backend)`, si lo hay.
     fn dynamic(&self, route: usize, backend: usize) -> Option<&DynamicBackend> {
-        self.dynamic
-            .iter()
-            .find(|entry| entry.route == route && entry.backend == backend)
+        self.index
+            .get(&(route, backend))
+            .and_then(|position| self.dynamic.get(*position))
     }
 
     /// Cooldown configurado para el backend dinámico `(route, backend)`.
@@ -546,12 +573,7 @@ impl Registry {
         };
 
         let eligible = eligible_models(&catalog);
-        let ordered = classify(
-            &eligible,
-            entry.profile,
-            entry.min_context,
-            entry.overrides.as_ref(),
-        );
+        let ordered = classify(&eligible, entry.classify_context());
         self.metrics
             .record_discovery_profile(&entry.base_url, entry.profile, ordered.len());
 
@@ -566,8 +588,12 @@ impl Registry {
 
     /// Identificadores de modelos dinámicos elegibles (para `/v1/models`),
     /// deduplicados, sin rotación ni filtrado por blacklist.
+    ///
+    /// La deduplicación conserva el orden de primera aparición entre backends y
+    /// entre llamadas con el mismo catálogo.
     pub async fn eligible_model_ids(&self) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
         for entry in &self.dynamic {
             let Some(cache) = self.catalogs.get(&entry.base_url) else {
                 continue;
@@ -576,13 +602,9 @@ impl Registry {
                 continue;
             };
             let eligible = eligible_models(&catalog);
-            for id in classify(
-                &eligible,
-                entry.profile,
-                entry.min_context,
-                entry.overrides.as_ref(),
-            ) {
-                if !ids.contains(&id) {
+            for id in classify(&eligible, entry.classify_context()) {
+                if !seen.contains(&id) {
+                    seen.insert(id.clone());
                     ids.push(id);
                 }
             }
@@ -707,10 +729,8 @@ route:
     }
 
     /// Toma el lock compartido del gauge global de blacklist (sin etiquetas).
-    fn blacklist_gauge_guard() -> std::sync::MutexGuard<'static, ()> {
-        crate::metrics::BLACKLIST_GAUGE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn blacklist_gauge_guard() -> crate::metrics::BlacklistGaugeGuard {
+        crate::metrics::BlacklistGaugeGuard::lock()
     }
 
     /// M3: el gauge de blacklist vuelve a 0 al expirar el cooldown.
@@ -775,6 +795,74 @@ route:
         assert!(other.is_blocked("m"), "la blacklist es global/compartida");
     }
 
+    /// G6: el gauge solo se reescribe cuando cambia el tamaño de la blacklist.
+    #[test]
+    fn blacklist_size_updates_only_on_change() {
+        let _guard = blacklist_gauge_guard();
+        let metrics = metrics();
+        let blacklist = Blacklist::new(Arc::clone(&metrics));
+
+        assert_eq!(blacklist.len(), 0);
+        assert_eq!(
+            metrics.blacklist_size_updates(),
+            0,
+            "una blacklist vacía no reescribe el 0 ya publicado"
+        );
+
+        blacklist.mark("m", Duration::from_millis(500));
+        assert_eq!(
+            metrics.blacklist_size_updates(),
+            1,
+            "marcar un modelo escribe el nuevo tamaño"
+        );
+
+        let _ = blacklist.len();
+        let _ = blacklist.is_blocked("m");
+        let _ = blacklist.retain_eligible(&["m".to_owned()]);
+        assert_eq!(
+            metrics.blacklist_size_updates(),
+            1,
+            "accesos sin cambio de tamaño no reescriben"
+        );
+
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(blacklist.len(), 0);
+        assert_eq!(
+            metrics.blacklist_size_updates(),
+            2,
+            "la expiración vuelve a escribir el tamaño"
+        );
+    }
+
+    /// G6: marca, expiración y nueva marca actualizan el gauge correctamente.
+    #[test]
+    fn blacklist_gauge_tracks_mark_expire_and_remark() {
+        let _guard = blacklist_gauge_guard();
+        let metrics = metrics();
+        let blacklist = Blacklist::new(Arc::clone(&metrics));
+
+        blacklist.mark("a", Duration::from_millis(100));
+        assert_eq!(
+            gauge_value(&metrics, "llm_gateway_discovery_blacklist"),
+            "1"
+        );
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(blacklist.len(), 0);
+        assert_eq!(
+            gauge_value(&metrics, "llm_gateway_discovery_blacklist"),
+            "0",
+            "la expiración del cooldown refleja el tamaño real"
+        );
+
+        blacklist.mark("b", Duration::from_secs(60));
+        assert_eq!(
+            gauge_value(&metrics, "llm_gateway_discovery_blacklist"),
+            "1",
+            "una nueva marca tras la expiración se publica"
+        );
+    }
+
     /// Caché con `base_url` inválido y una instantánea ya vencida (TTL 0), para
     /// ejercitar la rama de refresco en segundo plano sin tocar la red.
     fn expired_cache() -> Arc<CatalogCache> {
@@ -822,6 +910,109 @@ route:
             cache.spawn_count(),
             before + 1,
             "sin refresco en vuelo debe lanzarse uno"
+        );
+    }
+
+    /// N3: `eligible_model_ids` deduplica modelos solapados entre perfiles y
+    /// mantiene el orden de primera aparición entre llamadas.
+    #[tokio::test]
+    async fn eligible_model_ids_dedups_and_is_stable() {
+        let yaml = r#"
+route:
+  - name: eligible-test
+    backend:
+      - kind: openrouter_free
+        base_url: "http://a.test/v1"
+        profile: code
+      - kind: openrouter_free
+        base_url: "http://b.test/v1"
+        profile: writer
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        let registry = Registry::new(&config, reqwest::Client::new(), metrics());
+        let free = |id: &str| entry(id, &["tools", "tool_choice"], json!("0"), json!("0"));
+        registry
+            .catalog("http://a.test/v1")
+            .expect("caché del primer backend")
+            .seed(vec![free("acme/coder-x:free"), free("shared/model:free")]);
+        registry
+            .catalog("http://b.test/v1")
+            .expect("caché del segundo backend")
+            .seed(vec![free("acme/coder-y:free"), free("shared/model:free")]);
+
+        let first = registry.eligible_model_ids().await;
+        let second = registry.eligible_model_ids().await;
+
+        assert_eq!(
+            first,
+            vec![
+                "acme/coder-x:free",
+                "shared/model:free",
+                "acme/coder-y:free"
+            ],
+            "orden de primera aparición: primero el perfil code y luego lo nuevo del writer"
+        );
+        assert_eq!(first, second, "el orden debe ser estable entre llamadas");
+        assert_eq!(
+            first
+                .iter()
+                .filter(|id| id.as_str() == "shared/model:free")
+                .count(),
+            1,
+            "un modelo solapado solo aparece una vez"
+        );
+    }
+
+    /// N3: el índice `(route, backend)` resuelve cada backend dinámico en su
+    /// ruta sin confundir posiciones homónimas de rutas distintas.
+    #[test]
+    fn registry_index_resolves_dynamic_backends_per_route() {
+        let yaml = r#"
+route:
+  - name: r0
+    backend:
+      - base_url: "http://static-0.test/v1"
+        model: "s0"
+      - kind: openrouter_free
+        base_url: "http://a.test/v1"
+        discovery:
+          blacklist_cooldown_ms: 7000
+  - name: r1
+    backend:
+      - kind: openrouter_free
+        base_url: "http://b.test/v1"
+        discovery:
+          blacklist_cooldown_ms: 9000
+      - base_url: "http://static-1.test/v1"
+        model: "s1"
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        let registry = Registry::new(&config, reqwest::Client::new(), metrics());
+
+        assert_eq!(
+            registry.cooldown(0, 1),
+            Some(Duration::from_millis(7000)),
+            "ruta 0: el dinámico ocupa el slot 1"
+        );
+        assert_eq!(
+            registry.cooldown(1, 0),
+            Some(Duration::from_millis(9000)),
+            "ruta 1: el dinámico ocupa el slot 0"
+        );
+        assert_ne!(
+            registry.cooldown(0, 1),
+            registry.cooldown(1, 0),
+            "cada entrada devuelve su propio cooldown"
+        );
+        assert_eq!(
+            registry.cooldown(0, 0),
+            None,
+            "un slot estático no está registrado"
+        );
+        assert_eq!(
+            registry.cooldown(1, 1),
+            None,
+            "un slot estático no está registrado"
         );
     }
 }

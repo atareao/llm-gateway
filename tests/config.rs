@@ -583,6 +583,10 @@ fn invalid_yaml_reports_line_information() {
         msg.contains("line"),
         "error must include line information, got: {msg}"
     );
+    assert!(
+        msg.contains("column"),
+        "error must include column information, got: {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
