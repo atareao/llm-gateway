@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-22
+goal: "Plan-008: descubrimiento + rutas dinámicas free con failover, rotación y
+  blacklist por perfil"
