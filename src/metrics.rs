@@ -817,4 +817,141 @@ mod tests {
             "failover_total:\n{text}"
         );
     }
+
+    /// Config con un único backend dinámico (`openrouter_free`) sobre `base_url`.
+    fn dynamic_config(base_url: &str) -> GatewayConfig {
+        GatewayConfig {
+            route: vec![Route {
+                name: "discovery-metrics".to_owned(),
+                backend: vec![Backend {
+                    kind: crate::config::BackendKind::OpenrouterFree,
+                    base_url: base_url.to_owned(),
+                    model: None,
+                    api_key_env: Some("OPENROUTER_API_KEY".to_owned()),
+                    timeout_ms: None,
+                    profile: Some(Profile::Code),
+                    discovery: Some(crate::config::Discovery {
+                        refresh_interval_ms: 300_000,
+                        blacklist_cooldown_ms: 60_000,
+                        min_context: None,
+                        overrides: None,
+                    }),
+                    warmup: None,
+                }],
+            }],
+            observability: None,
+        }
+    }
+
+    /// Serializa los tests que tocan el gauge global de blacklist, que al no
+    /// tener etiquetas es compartido por todo el proceso.
+    static BLACKLIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Línea de la serie `name` cuyo `base_url` es `base_url` (y opcionalmente
+    /// `profile`/`result`).
+    fn discovery_line<'a>(
+        text: &'a str,
+        name: &str,
+        base_url: &str,
+        extra: Option<(&str, &str)>,
+    ) -> Option<&'a str> {
+        text.lines().find(|line| {
+            line.starts_with(name)
+                && line.contains(&format!(r#"base_url="{base_url}""#))
+                && extra.is_none_or(|(key, value)| line.contains(&format!(r#"{key}="{value}""#)))
+        })
+    }
+
+    #[test]
+    fn discovery_metrics_are_preregistered_at_zero() {
+        let _guard = BLACKLIST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = "http://discovery-preregistro.invalid/v1";
+        let metrics = Metrics::new(&dynamic_config(base));
+        let text = metrics.render();
+
+        for (name, extra) in [
+            ("llm_gateway_discovery_models", None),
+            ("llm_gateway_discovery_free_models", None),
+            (
+                "llm_gateway_discovery_profile_models",
+                Some(("profile", "code")),
+            ),
+            (
+                "llm_gateway_discovery_refresh_total",
+                Some(("result", "success")),
+            ),
+            (
+                "llm_gateway_discovery_refresh_total",
+                Some(("result", "failure")),
+            ),
+        ] {
+            let line = discovery_line(&text, name, base, extra)
+                .unwrap_or_else(|| panic!("falta la serie {name} para {base}:\n{text}"));
+            assert_eq!(
+                value(line),
+                "0",
+                "{name} debe pre-registrarse en cero:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn discovery_metrics_are_recorded_and_increment() {
+        let _guard = BLACKLIST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let base = "http://discovery-registro.invalid/v1";
+        let metrics = Metrics::new(&dynamic_config(base));
+
+        metrics.record_discovery_catalog(base, 10, 3);
+        metrics.record_discovery_profile(base, Profile::Code, 2);
+        metrics.record_discovery_refresh(base, true);
+        metrics.record_discovery_refresh(base, false);
+        metrics.set_blacklist_size(4);
+
+        let text = metrics.render();
+
+        let catalog = discovery_line(&text, "llm_gateway_discovery_models", base, None)
+            .expect("serie de modelos");
+        assert_eq!(value(catalog), "10", "modelos totales:\n{text}");
+
+        let free = discovery_line(&text, "llm_gateway_discovery_free_models", base, None)
+            .expect("serie de modelos free");
+        assert_eq!(value(free), "3", "modelos free elegibles:\n{text}");
+
+        let profile = discovery_line(
+            &text,
+            "llm_gateway_discovery_profile_models",
+            base,
+            Some(("profile", "code")),
+        )
+        .expect("serie por perfil");
+        assert_eq!(value(profile), "2", "elegibles por perfil:\n{text}");
+
+        let success = discovery_line(
+            &text,
+            "llm_gateway_discovery_refresh_total",
+            base,
+            Some(("result", "success")),
+        )
+        .expect("serie de refrescos OK");
+        assert_eq!(value(success), "1", "refrescos con éxito:\n{text}");
+
+        let failure = discovery_line(
+            &text,
+            "llm_gateway_discovery_refresh_total",
+            base,
+            Some(("result", "failure")),
+        )
+        .expect("serie de refrescos fallidos");
+        assert_eq!(value(failure), "1", "refrescos fallidos:\n{text}");
+
+        let blacklist = text
+            .lines()
+            .find(|line| line.starts_with("llm_gateway_discovery_blacklist"))
+            .expect("serie de blacklist");
+        assert_eq!(value(blacklist), "4", "tamaño de blacklist:\n{text}");
+    }
 }

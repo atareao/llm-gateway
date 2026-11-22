@@ -26,7 +26,7 @@
 
 ## 5. Métricas
 
-- [ ] 5.1 Registrar las métricas `llm_gateway_discovery_*` en `src/metrics.rs` y verificar con un test de registro e incremento
+- [x] 5.1 Registrar las métricas `llm_gateway_discovery_*` en `src/metrics.rs` y verificar con un test de registro e incremento
 
 ## 6. Documentación
 
