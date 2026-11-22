@@ -264,6 +264,79 @@ async fn handle_chat_completions(
     }
 }
 
+/// Candidato concreto tras expandir un backend de la ruta.
+struct Candidate {
+    /// Índice del backend en la configuración (slot para métricas).
+    slot: usize,
+    /// Backend a contactar, con el `model` ya resuelto si es dinámico.
+    backend: Backend,
+    /// Cooldown de blacklist si el candidato procede de un backend dinámico.
+    dynamic_cooldown: Option<Duration>,
+}
+
+/// Expande cada backend de la ruta en su posición: los estáticos aportan un
+/// único candidato y los dinámicos (`openrouter_free`) se expanden a sus modelos
+/// elegibles, en orden y con rotación round-robin.
+async fn expand_backends(state: &AppState, route_idx: usize, route: &Route) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for (slot, backend) in route.backend.iter().enumerate() {
+        if backend.is_dynamic() {
+            let cooldown = state.discovery.cooldown(route_idx, slot);
+            for model in state.discovery.expand(route_idx, slot).await {
+                let mut expanded = backend.clone();
+                expanded.model = Some(model);
+                candidates.push(Candidate {
+                    slot,
+                    backend: expanded,
+                    dynamic_cooldown: cooldown,
+                });
+            }
+        } else {
+            candidates.push(Candidate {
+                slot,
+                backend: backend.clone(),
+                dynamic_cooldown: None,
+            });
+        }
+    }
+    candidates
+}
+
+/// Marca `backend` (dinámico) en la blacklist global si su respuesta lo exige:
+/// `429`, `5xx` o presencia de `Retry-After`. El cooldown efectivo es el mayor
+/// entre el configurado y el indicado por `Retry-After`.
+fn blacklist_if_needed(
+    state: &AppState,
+    backend: &Backend,
+    response: &reqwest::Response,
+    cooldown: Duration,
+) {
+    let retry_after = parse_retry_after(response.headers().get(header::RETRY_AFTER));
+    if !is_retryable(response.status()) && retry_after.is_none() {
+        return;
+    }
+    let Some(model) = backend.model.as_deref() else {
+        return;
+    };
+    let effective = retry_after.map_or(cooldown, |retry| cooldown.max(retry));
+    state.discovery.blacklist().mark(model, effective);
+    tracing::warn!(
+        model = %model,
+        status = %response.status(),
+        cooldown_ms = effective.as_millis() as u64,
+        "modelo dinámico en blacklist"
+    );
+}
+
+/// Interpreta el encabezado `Retry-After` como número de segundos.
+///
+/// Las fechas HTTP (`Retry-After: Wed, 21 Oct 2015 07:28:00 GMT`) no se
+/// interpretan; en ese caso se usa el cooldown configurado.
+fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
+    let seconds = value?.to_str().ok()?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
 /// Recorre la cadena de backends de `route` en orden hasta obtener una
 /// respuesta válida (**failover antes del primer byte**): reintenta en error de
 /// conexión, timeout, `429` o `5xx`; un `4xx` distinto de `429` se devuelve tal
@@ -302,8 +375,13 @@ async fn route_with_failover(
     let requires_tool_call = !streaming && request_requires_tool_call(body);
     let mut no_tool_call_seen = false;
 
-    for (backend_idx, backend) in route.backend.iter().enumerate() {
+    // Los backends dinámicos se expanden en su posición a modelos concretos.
+    let candidates = expand_backends(state, route_idx, route).await;
+
+    for candidate in &candidates {
         considered += 1;
+        let backend_idx = candidate.slot;
+        let backend = &candidate.backend;
         let attempt_started = Instant::now();
 
         let Some(api_key) = resolve_api_key(backend) else {
@@ -324,15 +402,21 @@ async fn route_with_failover(
         attempts += 1;
 
         let payload = body_for_backend(body, backend);
-        match send(
+        let send_result = send(
             &state.client,
             backend,
             payload,
             streaming,
             api_key.as_deref(),
         )
-        .await
-        {
+        .await;
+
+        // Blacklist dinámica: un `429`/`5xx`/`Retry-After` marca el modelo.
+        if let (Ok(response), Some(cooldown)) = (&send_result, candidate.dynamic_cooldown) {
+            blacklist_if_needed(state, backend, response, cooldown);
+        }
+
+        match send_result {
             Ok(response) if is_retryable(response.status()) => {
                 state.metrics.record_attempt(
                     route_idx,
@@ -805,14 +889,19 @@ fn with_request_id(mut response: Response, request_id: &str) -> Response {
     response
 }
 
-/// `GET /v1/models`: lista los nombres lógicos de ruta como modelos.
+/// `GET /v1/models`: lista los nombres lógicos de ruta y los modelos dinámicos
+/// elegibles del catálogo `openrouter_free`.
 async fn list_models(State(state): State<AppState>) -> Json<Value> {
-    let data: Vec<Value> = state
+    let mut data: Vec<Value> = state
         .config
         .route
         .iter()
         .map(|route| json!({"id": route.name, "object": "model"}))
         .collect();
+
+    for id in state.discovery.eligible_model_ids().await {
+        data.push(json!({"id": id, "object": "model"}));
+    }
 
     Json(json!({"object": "list", "data": data}))
 }
@@ -824,8 +913,34 @@ async fn healthz() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_url, request_requires_tool_call, response_has_tool_call};
+    use super::{chat_url, parse_retry_after, request_requires_tool_call, response_has_tool_call};
+    use axum::http::HeaderValue;
     use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn parse_retry_after_reads_seconds() {
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("30"))),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static(" 5 "))),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("0"))),
+            Some(Duration::ZERO)
+        );
+        // Fecha HTTP: no se interpreta.
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static(
+                "Wed, 21 Oct 2015 07:28:00 GMT"
+            ))),
+            None
+        );
+        assert_eq!(parse_retry_after(None), None);
+    }
 
     #[test]
     fn chat_url_joins_slashes() {

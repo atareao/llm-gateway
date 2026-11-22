@@ -19,10 +19,10 @@
 
 ## 4. Integración en el enrutado
 
-- [ ] 4.1 Expandir backends dinámicos en su posición con rotación round-robin dentro de `route_with_failover` y verificar con tests de expansión y rotación entre peticiones
-- [ ] 4.2 Implementar la blacklist global con cooldown y `Retry-After` y verificar con tests para `429`, `5xx`, `Retry-After` y expiración del cooldown
-- [ ] 4.3 Asegurar el fallback a backends de pago y `AllBackendsFailed` al agotar la ruta, verificado con tests de agotamiento
-- [ ] 4.4 Reflejar los modelos dinámicos elegibles en `list_models` (`src/proxy.rs`) y verificar con un test del endpoint
+- [x] 4.1 Expandir backends dinámicos en su posición con rotación round-robin dentro de `route_with_failover` y verificar con tests de expansión y rotación entre peticiones
+- [x] 4.2 Implementar la blacklist global con cooldown y `Retry-After` y verificar con tests para `429`, `5xx`, `Retry-After` y expiración del cooldown
+- [x] 4.3 Asegurar el fallback a backends de pago y `AllBackendsFailed` al agotar la ruta, verificado con tests de agotamiento
+- [x] 4.4 Reflejar los modelos dinámicos elegibles en `list_models` (`src/proxy.rs`) y verificar con un test del endpoint
 
 ## 5. Métricas
 

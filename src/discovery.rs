@@ -12,7 +12,7 @@
 //! depurados.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,8 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::config::{DEFAULT_REFRESH_INTERVAL_MS, GatewayConfig};
+use crate::classify::classify;
+use crate::config::{ClassifyOverrides, DEFAULT_REFRESH_INTERVAL_MS, GatewayConfig, Profile};
 use crate::metrics::Metrics;
 
 /// Entrada del catálogo `GET /models` de OpenRouter.
@@ -288,27 +289,117 @@ impl CatalogCache {
     }
 }
 
+/// Blacklist global de modelos dinámicos.
+///
+/// Un modelo entra en la blacklist durante un cooldown cuando su petición
+/// devuelve `429`, un `5xx` o un `Retry-After`. La blacklist es **global**: se
+/// comparte entre todas las rutas, porque un `429` es por combinación
+/// modelo+clave.
+pub struct Blacklist {
+    entries: RwLock<HashMap<String, Instant>>,
+    metrics: Arc<Metrics>,
+}
+
+impl Blacklist {
+    /// Crea una blacklist vacía.
+    pub fn new(metrics: Arc<Metrics>) -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+            metrics,
+        }
+    }
+
+    /// Marca `model` como no elegible durante `cooldown`.
+    pub fn mark(&self, model: &str, cooldown: Duration) {
+        let until = Instant::now() + cooldown;
+        self.entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(model.to_owned(), until);
+        self.metrics.set_blacklist_size(self.len());
+    }
+
+    /// `true` si `model` está actualmente en blacklist (purgando expirados).
+    pub fn is_blocked(&self, model: &str) -> bool {
+        let mut entries = self.write();
+        purge_expired(&mut entries);
+        entries.contains_key(model)
+    }
+
+    /// Número de modelos actualmente en blacklist (purgando expirados).
+    pub fn len(&self) -> usize {
+        let mut entries = self.write();
+        purge_expired(&mut entries);
+        entries.len()
+    }
+
+    /// `true` si la blacklist está vacía.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Devuelve los modelos de `models` que **no** están en blacklist.
+    pub fn retain_eligible(&self, models: &[String]) -> Vec<String> {
+        let mut entries = self.write();
+        purge_expired(&mut entries);
+        models
+            .iter()
+            .filter(|model| !entries.contains_key(*model))
+            .cloned()
+            .collect()
+    }
+
+    /// Toma el lock de escritura, ignorando un posible envenenamiento.
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Instant>> {
+        self.entries
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Elimina de `entries` las marcas cuyo cooldown ya venció.
+fn purge_expired(entries: &mut HashMap<String, Instant>) {
+    let now = Instant::now();
+    entries.retain(|_, until| *until > now);
+}
+
+/// Backend dinámico registrado, con su estado de rotación.
+struct DynamicBackend {
+    route: usize,
+    backend: usize,
+    profile: Profile,
+    base_url: String,
+    min_context: Option<u32>,
+    cooldown: Duration,
+    overrides: Option<ClassifyOverrides>,
+    rotation: AtomicUsize,
+}
+
 /// Registro de cachés de catálogo, una por `base_url` dinámica.
 ///
 /// Agrupa el descubrimiento de todos los backends `openrouter_free` de la
 /// configuración en un único `/models` por `base_url` (los perfiles comparten
-/// catálogo).
+/// catálogo) y mantiene la blacklist global y el estado de rotación.
 pub struct Registry {
     catalogs: HashMap<String, Arc<CatalogCache>>,
+    dynamic: Vec<DynamicBackend>,
+    blacklist: Arc<Blacklist>,
+    metrics: Arc<Metrics>,
 }
 
 impl Registry {
     /// Construye el registro a partir de la configuración y el cliente HTTP.
     pub fn new(config: &GatewayConfig, client: reqwest::Client, metrics: Arc<Metrics>) -> Self {
         let mut catalogs: HashMap<String, Arc<CatalogCache>> = HashMap::new();
-        for route in &config.route {
-            for backend in &route.backend {
+        let mut dynamic = Vec::new();
+
+        for (route_idx, route) in config.route.iter().enumerate() {
+            for (backend_idx, backend) in route.backend.iter().enumerate() {
                 if !backend.is_dynamic() {
                     continue;
                 }
-                let ttl = backend
-                    .discovery
-                    .as_ref()
+                let discovery = backend.discovery.as_ref();
+                let ttl = discovery
                     .map(|discovery| discovery.refresh_interval())
                     .unwrap_or(Duration::from_millis(DEFAULT_REFRESH_INTERVAL_MS));
                 catalogs.entry(backend.base_url.clone()).or_insert_with(|| {
@@ -319,14 +410,113 @@ impl Registry {
                         Arc::clone(&metrics),
                     ))
                 });
+                dynamic.push(DynamicBackend {
+                    route: route_idx,
+                    backend: backend_idx,
+                    profile: backend.profile(),
+                    base_url: backend.base_url.clone(),
+                    min_context: discovery.and_then(|discovery| discovery.min_context),
+                    cooldown: discovery
+                        .map(|discovery| discovery.blacklist_cooldown())
+                        .unwrap_or(Duration::from_millis(
+                            crate::config::DEFAULT_BLACKLIST_COOLDOWN_MS,
+                        )),
+                    overrides: discovery.and_then(|discovery| discovery.overrides.clone()),
+                    rotation: AtomicUsize::new(0),
+                });
             }
         }
-        Self { catalogs }
+
+        Self {
+            catalogs,
+            dynamic,
+            blacklist: Arc::new(Blacklist::new(Arc::clone(&metrics))),
+            metrics,
+        }
     }
 
     /// Caché de catálogo asociada a una `base_url`, si existe.
     pub fn catalog(&self, base_url: &str) -> Option<&Arc<CatalogCache>> {
         self.catalogs.get(base_url)
+    }
+
+    /// Blacklist global compartida.
+    pub fn blacklist(&self) -> &Arc<Blacklist> {
+        &self.blacklist
+    }
+
+    /// Backend dinámico registrado en `(route, backend)`, si lo hay.
+    fn dynamic(&self, route: usize, backend: usize) -> Option<&DynamicBackend> {
+        self.dynamic
+            .iter()
+            .find(|entry| entry.route == route && entry.backend == backend)
+    }
+
+    /// Cooldown configurado para el backend dinámico `(route, backend)`.
+    pub fn cooldown(&self, route: usize, backend: usize) -> Option<Duration> {
+        self.dynamic(route, backend).map(|entry| entry.cooldown)
+    }
+
+    /// Expande el backend dinámico `(route, backend)` a los modelos concretos
+    /// elegibles de su perfil, en orden de preferencia, excluyendo los modelos en
+    /// blacklist y aplicando rotación round-robin entre peticiones sucesivas.
+    ///
+    /// Devuelve una lista vacía si el backend no es dinámico, no hay catálogo o
+    /// el perfil no aporta candidatos.
+    pub async fn expand(&self, route: usize, backend: usize) -> Vec<String> {
+        let Some(entry) = self.dynamic(route, backend) else {
+            return Vec::new();
+        };
+        let Some(cache) = self.catalogs.get(&entry.base_url) else {
+            return Vec::new();
+        };
+        let Some(catalog) = cache.ensure().await else {
+            return Vec::new();
+        };
+
+        let eligible = eligible_models(&catalog);
+        let ordered = classify(
+            &eligible,
+            entry.profile,
+            entry.min_context,
+            entry.overrides.as_ref(),
+        );
+        self.metrics
+            .record_discovery_profile(&entry.base_url, entry.profile, ordered.len());
+
+        let mut candidates = self.blacklist.retain_eligible(&ordered);
+        if candidates.is_empty() {
+            return candidates;
+        }
+        let offset = entry.rotation.fetch_add(1, Ordering::Relaxed) % candidates.len();
+        candidates.rotate_left(offset);
+        candidates
+    }
+
+    /// Identificadores de modelos dinámicos elegibles (para `/v1/models`),
+    /// deduplicados, sin rotación ni filtrado por blacklist.
+    pub async fn eligible_model_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        for entry in &self.dynamic {
+            let Some(cache) = self.catalogs.get(&entry.base_url) else {
+                continue;
+            };
+            let Some(catalog) = cache.ensure().await else {
+                continue;
+            };
+            let eligible = eligible_models(&catalog);
+            for id in classify(
+                &eligible,
+                entry.profile,
+                entry.min_context,
+                entry.overrides.as_ref(),
+            ) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
     }
 
     /// Lanza una tarea de refresco por cada catálogo, siguiendo el patrón de
@@ -421,5 +611,54 @@ mod tests {
             json!("0"),
             json!("0")
         )));
+    }
+
+    /// `Metrics` mínimo para construir una `Blacklist` en tests.
+    fn metrics() -> Arc<Metrics> {
+        let yaml = r#"
+route:
+  - name: blacklist-test
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "http://127.0.0.1:1/v1"
+        api_key_env: "KEY"
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        Arc::new(Metrics::new(&config))
+    }
+
+    #[test]
+    fn blacklist_marks_and_expires() {
+        let blacklist = Blacklist::new(metrics());
+        assert!(!blacklist.is_blocked("m"));
+        assert!(blacklist.is_empty());
+
+        blacklist.mark("m", Duration::from_millis(50));
+        assert!(blacklist.is_blocked("m"));
+        assert_eq!(blacklist.len(), 1);
+
+        std::thread::sleep(Duration::from_millis(90));
+        assert!(
+            !blacklist.is_blocked("m"),
+            "el cooldown vencido debe dejar de bloquear"
+        );
+        assert!(blacklist.is_empty());
+    }
+
+    #[test]
+    fn blacklist_retain_eligible_filters_blocked() {
+        let blacklist = Blacklist::new(metrics());
+        blacklist.mark("b", Duration::from_secs(60));
+        let models = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        assert_eq!(blacklist.retain_eligible(&models), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn blacklist_is_shared_through_arc() {
+        let blacklist = Arc::new(Blacklist::new(metrics()));
+        let other = Arc::clone(&blacklist);
+        blacklist.mark("m", Duration::from_secs(60));
+        assert!(other.is_blocked("m"), "la blacklist es global/compartida");
     }
 }
