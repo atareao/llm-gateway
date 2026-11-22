@@ -1,2 +1,6 @@
 /target
 .DS_Store
+
+# Artefactos locales de sesión
+HANDOFF.md
+HANDOFF.md.bak-*
