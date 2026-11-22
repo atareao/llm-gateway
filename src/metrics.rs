@@ -516,6 +516,12 @@ impl Metrics {
     }
 }
 
+/// Serializa, solo en tests, los que tocan el gauge global de blacklist: al no
+/// tener etiquetas es compartido por todo el proceso, así que cualquier test que
+/// lo lea o escriba debe tomar este lock para no interferir con otro.
+#[cfg(test)]
+pub(crate) static BLACKLIST_GAUGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,10 +849,6 @@ mod tests {
         }
     }
 
-    /// Serializa los tests que tocan el gauge global de blacklist, que al no
-    /// tener etiquetas es compartido por todo el proceso.
-    static BLACKLIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Línea de la serie `name` cuyo `base_url` es `base_url` (y opcionalmente
     /// `profile`/`result`).
     fn discovery_line<'a>(
@@ -864,7 +866,7 @@ mod tests {
 
     #[test]
     fn discovery_metrics_are_preregistered_at_zero() {
-        let _guard = BLACKLIST_LOCK
+        let _guard = BLACKLIST_GAUGE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = "http://discovery-preregistro.invalid/v1";
@@ -899,7 +901,7 @@ mod tests {
 
     #[test]
     fn discovery_metrics_are_recorded_and_increment() {
-        let _guard = BLACKLIST_LOCK
+        let _guard = BLACKLIST_GAUGE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = "http://discovery-registro.invalid/v1";

@@ -354,25 +354,22 @@ impl Blacklist {
     /// Marca `model` como no elegible durante `cooldown`.
     pub fn mark(&self, model: &str, cooldown: Duration) {
         let until = Instant::now() + cooldown;
-        self.entries
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(model.to_owned(), until);
-        self.metrics.set_blacklist_size(self.len());
+        let mut entries = self.write();
+        entries.insert(model.to_owned(), until);
+        self.purge_and_report(&mut entries);
     }
 
     /// `true` si `model` está actualmente en blacklist (purgando expirados).
     pub fn is_blocked(&self, model: &str) -> bool {
         let mut entries = self.write();
-        purge_expired(&mut entries);
+        self.purge_and_report(&mut entries);
         entries.contains_key(model)
     }
 
     /// Número de modelos actualmente en blacklist (purgando expirados).
     pub fn len(&self) -> usize {
         let mut entries = self.write();
-        purge_expired(&mut entries);
-        entries.len()
+        self.purge_and_report(&mut entries)
     }
 
     /// `true` si la blacklist está vacía.
@@ -383,12 +380,24 @@ impl Blacklist {
     /// Devuelve los modelos de `models` que **no** están en blacklist.
     pub fn retain_eligible(&self, models: &[String]) -> Vec<String> {
         let mut entries = self.write();
-        purge_expired(&mut entries);
+        self.purge_and_report(&mut entries);
         models
             .iter()
             .filter(|model| !entries.contains_key(*model))
             .cloned()
             .collect()
+    }
+
+    /// Purga los cooldowns vencidos y refleja el tamaño resultante en el gauge.
+    ///
+    /// Se invoca en cada acceso, de modo que el gauge
+    /// `llm_gateway_discovery_blacklist` deja de contar un modelo en cuanto
+    /// expira su cooldown, no solo cuando se marca.
+    fn purge_and_report(&self, entries: &mut HashMap<String, Instant>) -> usize {
+        purge_expired(entries);
+        let len = entries.len();
+        self.metrics.set_blacklist_size(len);
+        len
     }
 
     /// Toma el lock de escritura, ignorando un posible envenenamiento.
@@ -666,8 +675,52 @@ route:
         Arc::new(Metrics::new(&config))
     }
 
+    /// Valor de la serie `name` (sin etiquetas) en el render de `metrics`.
+    fn gauge_value(metrics: &Metrics, name: &str) -> String {
+        metrics
+            .render()
+            .lines()
+            .find(|line| line.starts_with(name))
+            .and_then(|line| line.rsplit(' ').next())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Toma el lock compartido del gauge global de blacklist (sin etiquetas).
+    fn blacklist_gauge_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::metrics::BLACKLIST_GAUGE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// M3: el gauge de blacklist vuelve a 0 al expirar el cooldown.
+    #[test]
+    fn blacklist_gauge_returns_to_zero_after_cooldown() {
+        let _guard = blacklist_gauge_guard();
+        let metrics = metrics();
+        let blacklist = Blacklist::new(Arc::clone(&metrics));
+
+        blacklist.mark("m", Duration::from_millis(50));
+        assert_eq!(
+            gauge_value(&metrics, "llm_gateway_discovery_blacklist"),
+            "1",
+            "tras marcar debe reflejarse en el gauge"
+        );
+
+        std::thread::sleep(Duration::from_millis(90));
+
+        // Cualquier acceso purga y debe reflejar la expiración en el gauge.
+        assert!(!blacklist.is_blocked("m"));
+        assert_eq!(
+            gauge_value(&metrics, "llm_gateway_discovery_blacklist"),
+            "0",
+            "el gauge debe volver a 0 tras expirar el cooldown"
+        );
+    }
+
     #[test]
     fn blacklist_marks_and_expires() {
+        let _guard = blacklist_gauge_guard();
         let blacklist = Blacklist::new(metrics());
         assert!(!blacklist.is_blocked("m"));
         assert!(blacklist.is_empty());
@@ -686,6 +739,7 @@ route:
 
     #[test]
     fn blacklist_retain_eligible_filters_blocked() {
+        let _guard = blacklist_gauge_guard();
         let blacklist = Blacklist::new(metrics());
         blacklist.mark("b", Duration::from_secs(60));
         let models = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
@@ -694,6 +748,7 @@ route:
 
     #[test]
     fn blacklist_is_shared_through_arc() {
+        let _guard = blacklist_gauge_guard();
         let blacklist = Arc::new(Blacklist::new(metrics()));
         let other = Arc::clone(&blacklist);
         blacklist.mark("m", Duration::from_secs(60));
