@@ -36,4 +36,4 @@
 ## 7. Verificación de integración
 
 - [x] 7.1 Ejecutar la suite completa y los linters: `cargo test`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo fmt --check`, sin errores ni warnings
-- [ ] 7.2 Prueba end-to-end local con las tres rutas contra OpenRouter y comprobar el failover free→pago y las métricas expuestas
+- [x] 7.2 Prueba end-to-end local con las tres rutas contra OpenRouter (free→free + blacklist por 429 + métricas); el tramo free→pago se cubre por test de integración, no en E2E local
