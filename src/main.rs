@@ -31,7 +31,9 @@ async fn main() -> Result<()> {
     let app = router(state.clone());
 
     // Se conservan los handles de keep-alive para abortarlos en el cierre.
-    let warmup_handles = llm_gateway_rs::warmup::spawn_warmup(state);
+    let warmup_handles = llm_gateway_rs::warmup::spawn_warmup(state.clone());
+    // Refresco en segundo plano del catálogo dinámico (patrón de `warmup`).
+    let discovery_handles = state.discovery.spawn_refresh();
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -50,8 +52,14 @@ async fn main() -> Result<()> {
     for handle in &warmup_handles {
         handle.abort();
     }
+    for handle in &discovery_handles {
+        handle.abort();
+    }
     telemetry.flush();
-    tracing::info!(tasks = warmup_handles.len(), "cierre ordenado completado");
+    tracing::info!(
+        tasks = warmup_handles.len() + discovery_handles.len(),
+        "cierre ordenado completado"
+    );
 
     Ok(())
 }

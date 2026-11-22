@@ -6,6 +6,7 @@
 //! sin duplicar lógica. `main.rs` queda como capa fina de arranque.
 
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod metrics;
 pub mod proxy;

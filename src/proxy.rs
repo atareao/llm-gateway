@@ -40,6 +40,7 @@ use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::{Backend, GatewayConfig, Route};
+use crate::discovery::Registry;
 use crate::error::AppError;
 use crate::metrics::{AttemptResult, GlobalOutcome, Metrics, Outcome};
 
@@ -97,6 +98,8 @@ pub struct AppState {
     pub client: reqwest::Client,
     /// Registro de métricas Prometheus.
     pub metrics: Arc<Metrics>,
+    /// Registro de descubrimiento del catálogo dinámico.
+    pub discovery: Arc<Registry>,
 }
 
 impl AppState {
@@ -114,11 +117,13 @@ impl AppState {
             .build()?;
 
         let metrics = Arc::new(Metrics::new(&config));
+        let discovery = Arc::new(Registry::new(&config, client.clone(), Arc::clone(&metrics)));
 
         Ok(Self {
             config: Arc::new(config),
             client,
             metrics,
+            discovery,
         })
     }
 }

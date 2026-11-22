@@ -2,14 +2,14 @@
 
 ## 1. Configuración y tipos
 
-- [ ] 1.1 Añadir `BackendKind`, `Profile` y `Discovery` a `src/config.rs` con defaults compatibles (`kind` default `static`) y verificar que un `gateway.yaml` existente sin `kind` carga igual (`cargo test`)
-- [ ] 1.2 Implementar validación semántica (static sin `model`, openrouter_free sin `api_key_env`, perfil inválido) y verificar con tests unitarios que cada caso devuelve error con ruta y backend identificados
+- [x] 1.1 Añadir `BackendKind`, `Profile` y `Discovery` a `src/config.rs` con defaults compatibles (`kind` default `static`) y verificar que un `gateway.yaml` existente sin `kind` carga igual (`cargo test`)
+- [x] 1.2 Implementar validación semántica (static sin `model`, openrouter_free sin `api_key_env`, perfil inválido) y verificar con tests unitarios que cada caso devuelve error con ruta y backend identificados
 
 ## 2. Descubrimiento
 
-- [ ] 2.1 Implementar `src/discovery.rs` (consulta `GET /models`, filtro free + tool-calling, caché con TTL) y verificar con tests que usan un servidor HTTP simulado
-- [ ] 2.2 Añadir refresco en segundo plano con `stale-while-error` y verificar con un test que un fallo de red conserva la caché válida
-- [ ] 2.3 Integrar el arranque del refresco siguiendo el patrón de `src/warmup.rs` y verificar el arranque local (`cargo run` con config de prueba)
+- [x] 2.1 Implementar `src/discovery.rs` (consulta `GET /models`, filtro free + tool-calling, caché con TTL) y verificar con tests que usan un servidor HTTP simulado
+- [x] 2.2 Añadir refresco en segundo plano con `stale-while-error` y verificar con un test que un fallo de red conserva la caché válida
+- [x] 2.3 Integrar el arranque del refresco siguiendo el patrón de `src/warmup.rs` y verificar el arranque local (`cargo run` con config de prueba)
 
 ## 3. Clasificación
 

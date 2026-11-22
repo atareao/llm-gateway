@@ -20,7 +20,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use prometheus::Encoder as _;
 
-use crate::config::GatewayConfig;
+use crate::config::{BackendKind, GatewayConfig, Profile};
 use crate::proxy::backend_id;
 use crate::telemetry;
 
@@ -167,6 +167,16 @@ pub struct Metrics {
     routes: Vec<RouteMetrics>,
     /// `[kind]` → atributos `kind`.
     error_kinds: [Vec<KeyValue>; 2],
+    /// Total de modelos del catálogo dinámico (por `base_url`).
+    discovery_models: Gauge<u64>,
+    /// Modelos free elegibles del catálogo (por `base_url`).
+    discovery_free: Gauge<u64>,
+    /// Modelos elegibles por perfil (por `base_url` y `profile`).
+    discovery_profile: Gauge<u64>,
+    /// Resultado de los refrescos del catálogo (por `base_url` y `result`).
+    discovery_refresh: Counter<u64>,
+    /// Tamaño actual de la blacklist global.
+    discovery_blacklist: Gauge<u64>,
 }
 
 /// Atributos `route`, `streaming`, `outcome`.
@@ -184,6 +194,41 @@ fn duration_attrs(route: &str, streaming: bool) -> Vec<KeyValue> {
         KeyValue::new("route", route.to_owned()),
         KeyValue::new("streaming", streaming.to_string()),
     ]
+}
+
+/// Atributos `base_url` de las métricas de descubrimiento.
+fn discovery_attrs(base_url: &str) -> Vec<KeyValue> {
+    vec![KeyValue::new("base_url", base_url.to_owned())]
+}
+
+/// Atributos `base_url`, `profile` de las métricas de descubrimiento.
+fn discovery_profile_attrs(base_url: &str, profile: Profile) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new("base_url", base_url.to_owned()),
+        KeyValue::new("profile", profile.label()),
+    ]
+}
+
+/// Atributos `base_url`, `result` de los refrescos de descubrimiento.
+fn discovery_refresh_attrs(base_url: &str, ok: bool) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new("base_url", base_url.to_owned()),
+        KeyValue::new("result", if ok { "success" } else { "failure" }),
+    ]
+}
+
+/// `base_url`s únicas de los backends dinámicos declarados en la config.
+fn dynamic_base_urls(config: &GatewayConfig) -> Vec<String> {
+    let mut bases: Vec<String> = config
+        .route
+        .iter()
+        .flat_map(|route| route.backend.iter())
+        .filter(|backend| backend.kind == BackendKind::OpenrouterFree)
+        .map(|backend| backend.base_url.clone())
+        .collect();
+    bases.sort();
+    bases.dedup();
+    bases
 }
 
 impl Metrics {
@@ -235,6 +280,26 @@ impl Metrics {
         let warmup = meter
             .u64_counter("llm_gateway_warmup")
             .with_description("Warmups ejecutados por backend y resultado.")
+            .build();
+        let discovery_models = meter
+            .u64_gauge("llm_gateway_discovery_models")
+            .with_description("Número total de modelos del catálogo dinámico.")
+            .build();
+        let discovery_free = meter
+            .u64_gauge("llm_gateway_discovery_free_models")
+            .with_description("Número de modelos free elegibles del catálogo.")
+            .build();
+        let discovery_profile = meter
+            .u64_gauge("llm_gateway_discovery_profile_models")
+            .with_description("Número de modelos elegibles por perfil.")
+            .build();
+        let discovery_refresh = meter
+            .u64_counter("llm_gateway_discovery_refresh")
+            .with_description("Refrescos del catálogo dinámico por resultado.")
+            .build();
+        let discovery_blacklist = meter
+            .u64_gauge("llm_gateway_discovery_blacklist")
+            .with_description("Número de modelos en blacklist dinámica.")
             .build();
 
         let error_kinds = std::array::from_fn(|index| {
@@ -318,6 +383,23 @@ impl Metrics {
             }
         }
 
+        // Pre-registro de las series de descubrimiento por cada `base_url`
+        // dinámica declarada, para que aparezcan en `/metrics` desde el arranque.
+        let bases = dynamic_base_urls(config);
+        for base in &bases {
+            discovery_models.record(0, &discovery_attrs(base));
+            discovery_free.record(0, &discovery_attrs(base));
+            for profile in [Profile::Architect, Profile::Code, Profile::Writer] {
+                discovery_profile.record(0, &discovery_profile_attrs(base, profile));
+            }
+            for ok in [true, false] {
+                discovery_refresh.add(0, &discovery_refresh_attrs(base, ok));
+            }
+        }
+        if !bases.is_empty() {
+            discovery_blacklist.record(0, &[]);
+        }
+
         Self {
             requests,
             request_duration,
@@ -329,6 +411,11 @@ impl Metrics {
             warmup,
             routes,
             error_kinds,
+            discovery_models,
+            discovery_free,
+            discovery_profile,
+            discovery_refresh,
+            discovery_blacklist,
         }
     }
 
@@ -388,6 +475,30 @@ impl Metrics {
     /// Registra un rechazo anterior a la resolución de ruta.
     pub fn record_global(&self, outcome: GlobalOutcome) {
         self.errors.add(1, &self.error_kinds[outcome.index()]);
+    }
+
+    /// Registra el tamaño total y elegible del catálogo dinámico de `base_url`.
+    pub fn record_discovery_catalog(&self, base_url: &str, total: usize, eligible: usize) {
+        let attrs = discovery_attrs(base_url);
+        self.discovery_models.record(total as u64, &attrs);
+        self.discovery_free.record(eligible as u64, &attrs);
+    }
+
+    /// Registra el número de modelos elegibles de un perfil.
+    pub fn record_discovery_profile(&self, base_url: &str, profile: Profile, count: usize) {
+        self.discovery_profile
+            .record(count as u64, &discovery_profile_attrs(base_url, profile));
+    }
+
+    /// Registra el resultado de un refresco del catálogo.
+    pub fn record_discovery_refresh(&self, base_url: &str, ok: bool) {
+        self.discovery_refresh
+            .add(1, &discovery_refresh_attrs(base_url, ok));
+    }
+
+    /// Fija el tamaño actual de la blacklist dinámica.
+    pub fn set_blacklist_size(&self, size: usize) {
+        self.discovery_blacklist.record(size as u64, &[]);
     }
 
     /// Renderiza todas las series en formato de exposición de Prometheus.
