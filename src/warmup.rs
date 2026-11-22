@@ -85,7 +85,12 @@ async fn warmup_request(
         .map(warmup_timeout)
         .unwrap_or(WARMUP_TIMEOUT);
 
-    let payload = body_for_backend(&warmup_body(&backend_cfg.model), backend_cfg);
+    let Some(model) = backend_cfg.model.as_deref() else {
+        // Un backend sin `model` (dinámico sin expandir) no admite warmup.
+        return false;
+    };
+
+    let payload = body_for_backend(&warmup_body(model), backend_cfg);
     let mut request = state
         .client
         .post(chat_url(&backend_cfg.base_url))
@@ -199,6 +204,12 @@ pub fn spawn_warmup(state: AppState) -> Vec<tokio::task::JoinHandle<()>> {
             let Some(warmup) = backend.warmup.as_ref() else {
                 continue;
             };
+
+            // Un backend sin `model` (dinámico) no tiene un modelo concreto que
+            // mantener caliente: no se lanza tarea de warmup.
+            if backend.model.is_none() {
+                continue;
+            }
 
             let interval = Duration::from_millis(warmup.interval_ms);
             if interval.is_zero() {

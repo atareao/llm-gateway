@@ -11,6 +11,12 @@ pub const GATEWAY_CONFIG_ENV: &str = "GATEWAY_CONFIG";
 /// Ruta por defecto del fichero de configuración.
 pub const DEFAULT_CONFIG_PATH: &str = "gateway.yaml";
 
+/// Intervalo de refresco por defecto del catálogo dinámico (5 min).
+pub const DEFAULT_REFRESH_INTERVAL_MS: u64 = 300_000;
+
+/// Cooldown por defecto de la blacklist dinámica (1 min).
+pub const DEFAULT_BLACKLIST_COOLDOWN_MS: u64 = 60_000;
+
 /// Configuración completa del gateway.
 #[derive(Debug, Deserialize)]
 pub struct GatewayConfig {
@@ -96,22 +102,129 @@ pub struct Route {
 }
 
 /// Backend concreto al que se reenvía la petición.
-#[derive(Debug, Deserialize)]
+///
+/// El campo `kind` distingue un backend **estático** (por defecto) de uno
+/// **dinámico** (`openrouter_free`), que se expande a los modelos concretos del
+/// catálogo free clasificados para su [`Profile`].
+#[derive(Debug, Clone, Deserialize)]
 pub struct Backend {
+    /// Tipo de backend; por defecto [`BackendKind::Static`] (compatibilidad con
+    /// las configuraciones existentes que no declaran `kind`).
+    #[serde(default)]
+    pub kind: BackendKind,
     /// URL base de la API compatible con OpenAI (sin `/chat/completions`).
     pub base_url: String,
-    /// Modelo real que entiende este backend.
-    pub model: String,
+    /// Modelo real que entiende este backend. Requerido para `kind: static`;
+    /// ignorado para `kind: openrouter_free`.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Nombre de la variable de entorno que contiene la API key (opcional).
     pub api_key_env: Option<String>,
     /// Timeout de la petición en milisegundos (opcional).
     pub timeout_ms: Option<u64>,
+    /// Perfil de clasificación para un backend `openrouter_free` (opcional;
+    /// por defecto [`Profile::Code`]). Se ignora en backends estáticos.
+    #[serde(default)]
+    pub profile: Option<Profile>,
+    /// Bloque opcional de descubrimiento para un backend `openrouter_free`.
+    pub discovery: Option<Discovery>,
     /// Bloque opcional de keep-alive (warmup) para este backend.
     pub warmup: Option<Warmup>,
 }
 
+/// Tipo de backend de la ruta.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    /// Backend fijo con `model` explícito (comportamiento histórico).
+    #[default]
+    Static,
+    /// Backend dinámico que se expande al catálogo free de OpenRouter.
+    OpenrouterFree,
+}
+
+/// Perfil de uso que determina la clasificación de modelos dinámicos.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    /// Prioriza familias de razonamiento y, en su defecto, generales grandes.
+    Architect,
+    /// Prioriza familias orientadas a código.
+    #[default]
+    Code,
+    /// Prioriza modelos generales instruct frente a los exclusivamente coder.
+    Writer,
+}
+
+impl Profile {
+    /// Etiqueta estable del perfil, usada en métricas y logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Architect => "architect",
+            Self::Code => "code",
+            Self::Writer => "writer",
+        }
+    }
+}
+
+/// Configuración de descubrimiento de un backend `openrouter_free`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Discovery {
+    /// TTL de la caché del catálogo y periodo de refresco en segundo plano.
+    pub refresh_interval_ms: u64,
+    /// Tiempo que un modelo permanece en la blacklist tras un fallo.
+    pub blacklist_cooldown_ms: u64,
+    /// Contexto mínimo (en tokens) exigido a los modelos elegibles.
+    pub min_context: Option<u32>,
+    /// Reclasificaciones manuales por perfil (opcional).
+    #[serde(default)]
+    pub overrides: Option<ClassifyOverrides>,
+}
+
+/// Reclasificaciones manuales aplicadas a la heurística de clasificación.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClassifyOverrides {
+    /// Identificadores de modelo excluidos de este perfil.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Identificadores de modelo forzados al principio de este perfil.
+    #[serde(default)]
+    pub include: Vec<String>,
+}
+
+impl Discovery {
+    /// Intervalo de refresco efectivo del bloque o el valor por defecto.
+    pub fn refresh_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.refresh_interval_ms)
+    }
+
+    /// Cooldown efectivo de la blacklist del bloque o el valor por defecto.
+    pub fn blacklist_cooldown(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.blacklist_cooldown_ms)
+    }
+}
+
+impl Backend {
+    /// `true` si el backend es dinámico (`openrouter_free`).
+    pub fn is_dynamic(&self) -> bool {
+        self.kind == BackendKind::OpenrouterFree
+    }
+
+    /// Perfil efectivo del backend dinámico (por defecto [`Profile::Code`]).
+    pub fn profile(&self) -> Profile {
+        self.profile.unwrap_or_default()
+    }
+
+    /// Etiqueta legible del backend para mensajes de error, en el formato
+    /// `<base_url>#<model|dynamic>`.
+    pub fn label(&self) -> String {
+        let model = self.model.as_deref().unwrap_or("dynamic");
+        format!("{}#{}", self.base_url, model)
+    }
+}
+
 /// Configuración de keep-alive (warmup) de un backend.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Warmup {
     /// Intervalo entre warmups, en milisegundos (debe ser mayor que 0).
     pub interval_ms: u64,
@@ -171,21 +284,56 @@ fn validate(config: &GatewayConfig) -> Result<()> {
             bail!("config: la ruta '{}' no tiene backends", route.name);
         }
         for backend in &route.backend {
+            match backend.kind {
+                BackendKind::Static => {
+                    if backend.model.as_deref().is_none_or(str::is_empty) {
+                        bail!(
+                            "config: la ruta '{}' backend '{}' es de tipo static y requiere 'model'",
+                            route.name,
+                            backend.label()
+                        );
+                    }
+                }
+                BackendKind::OpenrouterFree => {
+                    if backend.api_key_env.as_deref().is_none_or(str::is_empty) {
+                        bail!(
+                            "config: la ruta '{}' backend '{}' es de tipo openrouter_free y requiere 'api_key_env'",
+                            route.name,
+                            backend.label()
+                        );
+                    }
+                    if let Some(discovery) = &backend.discovery {
+                        if discovery.refresh_interval_ms == 0 {
+                            bail!(
+                                "config: la ruta '{}' backend '{}' tiene discovery.refresh_interval_ms = 0; debe ser mayor que 0",
+                                route.name,
+                                backend.label()
+                            );
+                        }
+                        if discovery.blacklist_cooldown_ms == 0 {
+                            bail!(
+                                "config: la ruta '{}' backend '{}' tiene discovery.blacklist_cooldown_ms = 0; debe ser mayor que 0",
+                                route.name,
+                                backend.label()
+                            );
+                        }
+                    }
+                }
+            }
+
             if let Some(warmup) = &backend.warmup {
                 if warmup.interval_ms == 0 {
                     bail!(
-                        "config: la ruta '{}' backend '{}#{}' tiene warmup.interval_ms = 0; debe ser mayor que 0",
+                        "config: la ruta '{}' backend '{}' tiene warmup.interval_ms = 0; debe ser mayor que 0",
                         route.name,
-                        backend.base_url,
-                        backend.model
+                        backend.label()
                     );
                 }
                 if warmup.timeout_ms == Some(0) {
                     bail!(
-                        "config: la ruta '{}' backend '{}#{}' tiene warmup.timeout_ms = 0; debe ser mayor que 0",
+                        "config: la ruta '{}' backend '{}' tiene warmup.timeout_ms = 0; debe ser mayor que 0",
                         route.name,
-                        backend.base_url,
-                        backend.model
+                        backend.label()
                     );
                 }
             }

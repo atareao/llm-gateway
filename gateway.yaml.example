@@ -31,6 +31,51 @@ route:
         model: "qwen/qwen3-8b"
         api_key_env: "OPENROUTER_API_KEY"
         timeout_ms: 30000
+  # Rutas dinámicas de modelos GRATUITOS de OpenRouter por perfil. El backend
+  # `kind: openrouter_free` descubre el catálogo free (GET /models), clasifica
+  # los modelos con tool-calling para el `profile` y los usa como cadena de
+  # candidatos con failover, rotación y blacklist. El `model` se ignora en los
+  # backends dinámicos. Detrás va un backend de PAGO como respaldo (sustituye
+  # los placeholders por modelos reales). Ver docs/openrouter-free-routing.md.
+  - name: architect
+    backend:
+      - kind: openrouter_free
+        profile: architect
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: 60000
+          min_context: 32768
+      - base_url: "https://openrouter.ai/api/v1"   # fallback de PAGO (razonamiento)
+        model: "<REEMPLAZA-modelo-pago-razonamiento>"
+        api_key_env: "OPENROUTER_API_KEY"
+  - name: code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: 60000
+          min_context: 32768
+      - base_url: "https://openrouter.ai/api/v1"   # fallback de PAGO (coder)
+        model: "<REEMPLAZA-modelo-pago-coder>"
+        api_key_env: "OPENROUTER_API_KEY"
+  - name: writer
+    backend:
+      - kind: openrouter_free
+        profile: writer
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: 60000
+          min_context: 32768
+      - base_url: "https://openrouter.ai/api/v1"   # fallback de PAGO (prosa)
+        model: "<REEMPLAZA-modelo-pago-prosa>"
+        api_key_env: "OPENROUTER_API_KEY"
 
 # Observabilidad (opcional). Ausente → el gateway no exporta nada por OTLP y
 # solo expone /metrics en formato Prometheus, como antes.

@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use llm_gateway_rs::config::{Protocol, load};
+use llm_gateway_rs::config::{BackendKind, Profile, Protocol, load};
 
 const VALID_YAML: &str = r#"
 route:
@@ -37,10 +37,13 @@ fn valid_config_loads_routes_and_backends_in_order() {
     assert_eq!(route.name, "mech-writer");
     assert_eq!(route.backend.len(), 2);
     assert_eq!(route.backend[0].base_url, "http://localhost:11434/v1");
-    assert_eq!(route.backend[0].model, "qwen2.5:7b-instruct");
+    assert_eq!(
+        route.backend[0].model.as_deref(),
+        Some("qwen2.5:7b-instruct")
+    );
     assert_eq!(route.backend[0].api_key_env, None);
     assert_eq!(route.backend[1].base_url, "https://openrouter.ai/api/v1");
-    assert_eq!(route.backend[1].model, "qwen/qwen3-8b");
+    assert_eq!(route.backend[1].model.as_deref(), Some("qwen/qwen3-8b"));
     assert_eq!(
         route.backend[1].api_key_env.as_deref(),
         Some("OPENROUTER_API_KEY")
@@ -580,4 +583,163 @@ fn invalid_yaml_reports_line_information() {
         msg.contains("line"),
         "error must include line information, got: {msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Backends dinámicos `openrouter_free` (change add-openrouter-free-routing)
+// ---------------------------------------------------------------------------
+
+const DYNAMIC_YAML: &str = r#"
+route:
+  - name: code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: 60000
+          min_context: 32768
+      - base_url: "https://openrouter.ai/api/v1"
+        model: "deepseek/deepseek-v4.1-flash"
+        api_key_env: "OPENROUTER_API_KEY"
+"#;
+
+/// Scenario: Backend dinámico válido → se acepta con perfil `code`.
+#[test]
+fn dynamic_backend_is_accepted_with_profile() {
+    let file = write_temp(DYNAMIC_YAML);
+
+    let config = load(file.path()).expect("config dinámica válida debe cargar");
+
+    let dynamic = &config.route[0].backend[0];
+    assert_eq!(dynamic.kind, BackendKind::OpenrouterFree);
+    assert_eq!(dynamic.profile, Some(Profile::Code));
+    assert_eq!(dynamic.base_url, "https://openrouter.ai/api/v1");
+    assert_eq!(dynamic.api_key_env.as_deref(), Some("OPENROUTER_API_KEY"));
+    assert_eq!(dynamic.model, None, "un backend dinámico ignora `model`");
+
+    let discovery = dynamic
+        .discovery
+        .as_ref()
+        .expect("el bloque discovery debe conservarse");
+    assert_eq!(discovery.refresh_interval_ms, 300_000);
+    assert_eq!(discovery.blacklist_cooldown_ms, 60_000);
+    assert_eq!(discovery.min_context, Some(32_768));
+}
+
+/// Scenario: Backend estático sin `kind` → se interpreta como `static`.
+#[test]
+fn backend_without_kind_defaults_to_static() {
+    let file = write_temp(VALID_YAML);
+
+    let config = load(file.path()).expect("config estática válida debe cargar");
+
+    for backend in &config.route[0].backend {
+        assert_eq!(
+            backend.kind,
+            BackendKind::Static,
+            "sin `kind`, el backend debe ser estático"
+        );
+    }
+    assert_eq!(
+        config.route[0].backend[0].model.as_deref(),
+        Some("qwen2.5:7b-instruct")
+    );
+}
+
+/// Scenario: Backend dinámico sin `profile` → perfil por defecto `code`.
+#[test]
+fn dynamic_backend_defaults_profile_to_code() {
+    let yaml = r#"
+route:
+  - name: code
+    backend:
+      - kind: openrouter_free
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+"#;
+    let file = write_temp(yaml);
+
+    let config = load(file.path()).expect("config dinámica sin profile debe cargar");
+
+    let backend = &config.route[0].backend[0];
+    assert_eq!(
+        backend.profile, None,
+        "sin `profile`, el campo queda en None"
+    );
+    assert_eq!(
+        backend.profile(),
+        Profile::Code,
+        "el perfil efectivo por defecto de un backend dinámico es `code`"
+    );
+}
+
+/// Scenario: Backend estático sin `model` → error nombrando ruta y backend.
+#[test]
+fn static_backend_without_model_is_rejected() {
+    let yaml = r#"
+route:
+  - name: mech-writer
+    backend:
+      - kind: static
+        base_url: "http://static-no-model.invalid/v1"
+"#;
+    let file = write_temp(yaml);
+
+    let err = load(file.path()).expect_err("static sin model debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("mech-writer"),
+        "el error debe nombrar la ruta, got: {msg}"
+    );
+    assert!(
+        msg.contains("static-no-model"),
+        "el error debe nombrar el backend, got: {msg}"
+    );
+}
+
+/// Scenario: Backend dinámico sin `api_key_env` → error nombrando el backend.
+#[test]
+fn dynamic_backend_without_api_key_env_is_rejected() {
+    let yaml = r#"
+route:
+  - name: code
+    backend:
+      - kind: openrouter_free
+        base_url: "http://dynamic-no-key.invalid/v1"
+"#;
+    let file = write_temp(yaml);
+
+    let err = load(file.path()).expect_err("dinámico sin api_key_env debe fallar");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("dynamic-no-key"),
+        "el error debe nombrar el backend afectado, got: {msg}"
+    );
+}
+
+/// Scenario: Perfil inválido → error listando los perfiles admitidos.
+#[test]
+fn invalid_profile_is_rejected_listing_admitted_profiles() {
+    let yaml = r#"
+route:
+  - name: code
+    backend:
+      - kind: openrouter_free
+        profile: cualquiera
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+"#;
+    let file = write_temp(yaml);
+
+    let err = load(file.path()).expect_err("perfil inválido debe fallar");
+    let msg = format!("{err:#}");
+    for profile in ["architect", "code", "writer"] {
+        assert!(
+            msg.contains(profile),
+            "el error debe listar el perfil `{profile}`, got: {msg}"
+        );
+    }
 }

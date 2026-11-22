@@ -25,6 +25,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
 thiserror = "2"
+httpdate = "1"
 opentelemetry = "0.33"
 opentelemetry_sdk = "0.33"
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "metrics", "logs", "trace"] }

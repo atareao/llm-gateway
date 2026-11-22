@@ -40,6 +40,7 @@ use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::{Backend, GatewayConfig, Route};
+use crate::discovery::Registry;
 use crate::error::AppError;
 use crate::metrics::{AttemptResult, GlobalOutcome, Metrics, Outcome};
 
@@ -67,6 +68,12 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// backend no define `timeout_ms`. Solo limita el arranque: una vez llega la
 /// primera cabecera, el stream fluye sin deadline.
 const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cota superior del cooldown derivado de `Retry-After`.
+///
+/// Un `Retry-After` en formato fecha puede apuntar a años vista; sin cota, un
+/// único `429`/`5xx` con una fecha lejana blacklistearía el modelo durante años.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// Fallo al contactar con un backend, antes de tener su respuesta.
 enum SendError {
@@ -97,6 +104,8 @@ pub struct AppState {
     pub client: reqwest::Client,
     /// Registro de métricas Prometheus.
     pub metrics: Arc<Metrics>,
+    /// Registro de descubrimiento del catálogo dinámico.
+    pub discovery: Arc<Registry>,
 }
 
 impl AppState {
@@ -114,11 +123,13 @@ impl AppState {
             .build()?;
 
         let metrics = Arc::new(Metrics::new(&config));
+        let discovery = Arc::new(Registry::new(&config, client.clone(), Arc::clone(&metrics)));
 
         Ok(Self {
             config: Arc::new(config),
             client,
             metrics,
+            discovery,
         })
     }
 }
@@ -150,7 +161,8 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// Se expone para que clientes y tests puedan predecirlo; se emite en la
 /// cabecera `x-gateway-backend` en las respuestas con éxito.
 pub fn backend_id(backend: &Backend) -> String {
-    format!("{}#{}", backend.base_url, backend.model)
+    let model = backend.model.as_deref().unwrap_or("dynamic");
+    format!("{}#{}", backend.base_url, model)
 }
 
 /// `POST /v1/chat/completions` (no-stream o streaming SSE).
@@ -258,6 +270,104 @@ async fn handle_chat_completions(
     }
 }
 
+/// Candidato concreto tras expandir un backend de la ruta.
+struct Candidate {
+    /// Índice del backend en la configuración (slot para métricas).
+    slot: usize,
+    /// Backend a contactar, con el `model` ya resuelto si es dinámico.
+    backend: Backend,
+    /// Cooldown de blacklist si el candidato procede de un backend dinámico.
+    dynamic_cooldown: Option<Duration>,
+}
+
+/// Expande cada backend de la ruta en su posición: los estáticos aportan un
+/// único candidato y los dinámicos (`openrouter_free`) se expanden a sus modelos
+/// elegibles, en orden y con rotación round-robin.
+async fn expand_backends(state: &AppState, route_idx: usize, route: &Route) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for (slot, backend) in route.backend.iter().enumerate() {
+        if backend.is_dynamic() {
+            let cooldown = state.discovery.cooldown(route_idx, slot);
+            for model in state.discovery.expand(route_idx, slot).await {
+                let mut expanded = backend.clone();
+                expanded.model = Some(model);
+                candidates.push(Candidate {
+                    slot,
+                    backend: expanded,
+                    dynamic_cooldown: cooldown,
+                });
+            }
+        } else {
+            candidates.push(Candidate {
+                slot,
+                backend: backend.clone(),
+                dynamic_cooldown: None,
+            });
+        }
+    }
+    candidates
+}
+
+/// Marca `backend` (dinámico) en la blacklist global si su respuesta lo exige:
+/// `429`, `5xx` o presencia de un `Retry-After` **positivo**. El cooldown
+/// efectivo es el mayor entre el configurado y el indicado por `Retry-After`,
+/// acotado a [`MAX_RETRY_AFTER`].
+///
+/// Un `Retry-After` que se traduce a duración cero (p. ej. una fecha HTTP ya
+/// pasada) no es informativo: no fuerza por sí solo la blacklist de un status no
+/// reintentable.
+fn blacklist_if_needed(
+    state: &AppState,
+    backend: &Backend,
+    response: &reqwest::Response,
+    cooldown: Duration,
+) {
+    let retry_after = parse_retry_after(response.headers().get(header::RETRY_AFTER))
+        .filter(|delay| !delay.is_zero());
+    if !is_retryable(response.status()) && retry_after.is_none() {
+        return;
+    }
+    let Some(model) = backend.model.as_deref() else {
+        return;
+    };
+    let effective = effective_cooldown(retry_after, cooldown);
+    state.discovery.blacklist().mark(model, effective);
+    tracing::warn!(
+        model = %model,
+        status = %response.status(),
+        cooldown_ms = effective.as_millis() as u64,
+        "modelo dinámico en blacklist"
+    );
+}
+
+/// Cooldown efectivo de blacklist: el mayor entre el configurado y el
+/// `Retry-After`, nunca por encima de [`MAX_RETRY_AFTER`].
+fn effective_cooldown(retry_after: Option<Duration>, cooldown: Duration) -> Duration {
+    cooldown
+        .max(retry_after.unwrap_or(Duration::ZERO))
+        .min(MAX_RETRY_AFTER)
+}
+
+/// Interpreta el encabezado `Retry-After`, en segundos o como fecha HTTP.
+///
+/// Acepta el formato numérico (`Retry-After: 30`) y el de fecha IMF-fixdate
+/// (`Retry-After: Wed, 21 Oct 2099 07:28:00 GMT`), que se traduce al delta hasta
+/// esa fecha. Una fecha ya pasada se interpreta como `0` (nunca un delta
+/// negativo), de modo que el cooldown efectivo cae al configurado. Un valor no
+/// interpretable devuelve `None`.
+fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
+    let text = value?.to_str().ok()?.trim();
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let deadline = httpdate::parse_http_date(text).ok()?;
+    Some(
+        deadline
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
 /// Recorre la cadena de backends de `route` en orden hasta obtener una
 /// respuesta válida (**failover antes del primer byte**): reintenta en error de
 /// conexión, timeout, `429` o `5xx`; un `4xx` distinto de `429` se devuelve tal
@@ -296,8 +406,13 @@ async fn route_with_failover(
     let requires_tool_call = !streaming && request_requires_tool_call(body);
     let mut no_tool_call_seen = false;
 
-    for (backend_idx, backend) in route.backend.iter().enumerate() {
+    // Los backends dinámicos se expanden en su posición a modelos concretos.
+    let candidates = expand_backends(state, route_idx, route).await;
+
+    for candidate in &candidates {
         considered += 1;
+        let backend_idx = candidate.slot;
+        let backend = &candidate.backend;
         let attempt_started = Instant::now();
 
         let Some(api_key) = resolve_api_key(backend) else {
@@ -318,15 +433,21 @@ async fn route_with_failover(
         attempts += 1;
 
         let payload = body_for_backend(body, backend);
-        match send(
+        let send_result = send(
             &state.client,
             backend,
             payload,
             streaming,
             api_key.as_deref(),
         )
-        .await
-        {
+        .await;
+
+        // Blacklist dinámica: un `429`/`5xx`/`Retry-After` marca el modelo.
+        if let (Ok(response), Some(cooldown)) = (&send_result, candidate.dynamic_cooldown) {
+            blacklist_if_needed(state, backend, response, cooldown);
+        }
+
+        match send_result {
             Ok(response) if is_retryable(response.status()) => {
                 state.metrics.record_attempt(
                     route_idx,
@@ -607,7 +728,7 @@ async fn send(
     let span = tracing::info_span!(
         "backend_request",
         backend = %backend_id(backend),
-        model = %backend.model,
+        model = %backend.model.as_deref().unwrap_or(""),
         streaming,
         "otel.kind" = "client",
     );
@@ -720,10 +841,16 @@ fn assemble(
 
 /// Clona `body` y sustituye su `model` por el del backend. El resto de campos
 /// (incluidos los desconocidos) se conservan intactos.
+///
+/// Un backend sin `model` (p. ej. un dinámico sin expandir) devuelve el cuerpo
+/// tal cual.
 pub(crate) fn body_for_backend(body: &Value, backend: &Backend) -> Value {
+    let Some(model) = backend.model.as_deref() else {
+        return body.clone();
+    };
     let mut value = body.clone();
     if let Some(object) = value.as_object_mut() {
-        object.insert("model".to_owned(), Value::String(backend.model.clone()));
+        object.insert("model".to_owned(), Value::String(model.to_owned()));
     }
     value
 }
@@ -793,14 +920,19 @@ fn with_request_id(mut response: Response, request_id: &str) -> Response {
     response
 }
 
-/// `GET /v1/models`: lista los nombres lógicos de ruta como modelos.
+/// `GET /v1/models`: lista los nombres lógicos de ruta y los modelos dinámicos
+/// elegibles del catálogo `openrouter_free`.
 async fn list_models(State(state): State<AppState>) -> Json<Value> {
-    let data: Vec<Value> = state
+    let mut data: Vec<Value> = state
         .config
         .route
         .iter()
         .map(|route| json!({"id": route.name, "object": "model"}))
         .collect();
+
+    for id in state.discovery.eligible_model_ids().await {
+        data.push(json!({"id": id, "object": "model"}));
+    }
 
     Json(json!({"object": "list", "data": data}))
 }
@@ -812,8 +944,80 @@ async fn healthz() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_url, request_requires_tool_call, response_has_tool_call};
+    use super::{
+        MAX_RETRY_AFTER, chat_url, effective_cooldown, parse_retry_after,
+        request_requires_tool_call, response_has_tool_call,
+    };
+    use axum::http::HeaderValue;
     use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn parse_retry_after_reads_seconds() {
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("30"))),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static(" 5 "))),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("0"))),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after(None), None);
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static("no-es-una-fecha"))),
+            None
+        );
+    }
+
+    /// M4: `Retry-After` en formato fecha HTTP futura se interpreta como delta.
+    #[test]
+    fn parse_retry_after_reads_future_http_date() {
+        let parsed = parse_retry_after(Some(&HeaderValue::from_static(
+            "Wed, 21 Oct 2099 07:28:00 GMT",
+        )))
+        .expect("una fecha HTTP futura debe interpretarse");
+        assert!(
+            parsed > Duration::from_secs(3600),
+            "el delta hasta 2099 es grande, got {parsed:?}"
+        );
+    }
+
+    /// M4: una fecha HTTP ya pasada se interpreta como 0 (nunca negativa), para
+    /// que el cooldown efectivo caiga al configurado.
+    #[test]
+    fn parse_retry_after_past_http_date_is_zero() {
+        assert_eq!(
+            parse_retry_after(Some(&HeaderValue::from_static(
+                "Wed, 21 Oct 2015 07:28:00 GMT"
+            ))),
+            Some(Duration::ZERO)
+        );
+    }
+
+    /// A2: un `Retry-After` muy lejano se acota al cap, no blacklistea años.
+    #[test]
+    fn effective_cooldown_caps_a_far_future_retry_after() {
+        // ~10 años: mucho más que el cap, debe recortarse.
+        let far = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+        assert_eq!(
+            effective_cooldown(Some(far), Duration::from_secs(30)),
+            MAX_RETRY_AFTER,
+            "una fecha muy lejana no debe blacklistear el modelo durante años"
+        );
+    }
+
+    /// A2: un `Retry-After` positivo por debajo del cap manda sobre el cooldown.
+    #[test]
+    fn effective_cooldown_uses_retry_after_when_larger() {
+        assert_eq!(
+            effective_cooldown(Some(Duration::from_secs(120)), Duration::from_secs(30)),
+            Duration::from_secs(120)
+        );
+    }
 
     #[test]
     fn chat_url_joins_slashes() {
