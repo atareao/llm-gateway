@@ -103,8 +103,12 @@ fn meter_provider(otlp: Option<&Otlp>) -> Result<(SdkMeterProvider, bool)> {
 
     let (provider, otlp_metrics) = build_meter_provider(otlp)?;
     OTLP_METRICS_INSTALLED.store(otlp_metrics, Ordering::Release);
-    let _ = METER_PROVIDER.set(provider.clone());
+    // Instala el provider global **antes** de publicar `METER_PROVIDER`: quien
+    // observe el `OnceLock` como inicializado y se salte el lock en
+    // `ensure_meter_provider` verá ya el provider global instalado, en vez de
+    // obtener un meter no-op que descartaría sus medidas.
     opentelemetry::global::set_meter_provider(provider.clone());
+    let _ = METER_PROVIDER.set(provider.clone());
     Ok((provider, otlp_metrics))
 }
 
