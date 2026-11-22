@@ -30,8 +30,8 @@
 
 ## 6. Documentación
 
-- [ ] 6.1 Escribir `docs/openrouter-free-routing.md` (qué es, ficheros, funcionamiento, variables/config, despliegue, decisiones, follow-ups) y verificar que los comandos del documento se ejecutan tal cual
-- [ ] 6.2 Añadir a `gateway.yaml.example` las tres rutas de ejemplo y verificar que la config de ejemplo valida
+- [x] 6.1 Escribir `docs/openrouter-free-routing.md` (qué es, ficheros, funcionamiento, variables/config, despliegue, decisiones, follow-ups) y verificar que los comandos del documento se ejecutan tal cual
+- [x] 6.2 Añadir a `gateway.yaml.example` las tres rutas de ejemplo y verificar que la config de ejemplo valida
 
 ## 7. Verificación de integración
 
