@@ -13,9 +13,9 @@
 
 ## 3. Clasificación
 
-- [ ] 3.1 Implementar `src/classify.rs` con los tres perfiles y orden por `context_length` desc y `id` asc, verificado con tests por familia (razonamiento, coder, general)
-- [ ] 3.2 Añadir overrides manuales por configuración y verificar con un test que un modelo excluido no aparece en el perfil
-- [ ] 3.3 Aplicar `discovery.min_context` y verificar con un test que los modelos con contexto insuficiente se descartan
+- [x] 3.1 Implementar `src/classify.rs` con los tres perfiles y orden por `context_length` desc y `id` asc, verificado con tests por familia (razonamiento, coder, general)
+- [x] 3.2 Añadir overrides manuales por configuración y verificar con un test que un modelo excluido no aparece en el perfil
+- [x] 3.3 Aplicar `discovery.min_context` y verificar con un test que los modelos con contexto insuficiente se descartan
 
 ## 4. Integración en el enrutado
 

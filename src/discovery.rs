@@ -100,9 +100,7 @@ pub fn is_free(model: &ModelEntry) -> bool {
         return true;
     }
     match &model.pricing {
-        Some(pricing) => {
-            is_zero(pricing.prompt.as_ref()) && is_zero(pricing.completion.as_ref())
-        }
+        Some(pricing) => is_zero(pricing.prompt.as_ref()) && is_zero(pricing.completion.as_ref()),
         None => false,
     }
 }
@@ -123,7 +121,11 @@ pub fn is_eligible(model: &ModelEntry) -> bool {
 
 /// Filtra un catálogo a los modelos elegibles (free + tool-calling).
 pub fn eligible_models(models: &[ModelEntry]) -> Vec<ModelEntry> {
-    models.iter().filter(|model| is_eligible(model)).cloned().collect()
+    models
+        .iter()
+        .filter(|model| is_eligible(model))
+        .cloned()
+        .collect()
 }
 
 /// Consulta `GET {base_url}/models` y devuelve el catálogo completo.
@@ -261,8 +263,7 @@ impl CatalogCache {
                 Ok(())
             }
             Err(err) => {
-                self.metrics
-                    .record_discovery_refresh(&self.base_url, false);
+                self.metrics.record_discovery_refresh(&self.base_url, false);
                 Err(err)
             }
         }
@@ -310,16 +311,14 @@ impl Registry {
                     .as_ref()
                     .map(|discovery| discovery.refresh_interval())
                     .unwrap_or(Duration::from_millis(DEFAULT_REFRESH_INTERVAL_MS));
-                catalogs
-                    .entry(backend.base_url.clone())
-                    .or_insert_with(|| {
-                        Arc::new(CatalogCache::new(
-                            client.clone(),
-                            backend.base_url.clone(),
-                            ttl,
-                            Arc::clone(&metrics),
-                        ))
-                    });
+                catalogs.entry(backend.base_url.clone()).or_insert_with(|| {
+                    Arc::new(CatalogCache::new(
+                        client.clone(),
+                        backend.base_url.clone(),
+                        ttl,
+                        Arc::clone(&metrics),
+                    ))
+                });
             }
         }
         Self { catalogs }
@@ -398,9 +397,29 @@ mod tests {
 
     #[test]
     fn tool_calling_requires_both_parameters() {
-        assert!(supports_tool_calling(&entry("a", &["tools", "tool_choice"], json!("0"), json!("0"))));
-        assert!(!supports_tool_calling(&entry("b", &["tools"], json!("0"), json!("0"))));
-        assert!(!supports_tool_calling(&entry("c", &["tool_choice"], json!("0"), json!("0"))));
-        assert!(!supports_tool_calling(&entry("d", &[], json!("0"), json!("0"))));
+        assert!(supports_tool_calling(&entry(
+            "a",
+            &["tools", "tool_choice"],
+            json!("0"),
+            json!("0")
+        )));
+        assert!(!supports_tool_calling(&entry(
+            "b",
+            &["tools"],
+            json!("0"),
+            json!("0")
+        )));
+        assert!(!supports_tool_calling(&entry(
+            "c",
+            &["tool_choice"],
+            json!("0"),
+            json!("0")
+        )));
+        assert!(!supports_tool_calling(&entry(
+            "d",
+            &[],
+            json!("0"),
+            json!("0")
+        )));
     }
 }

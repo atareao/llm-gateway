@@ -80,9 +80,7 @@ async fn spawn_models_server(body: Value) -> String {
 /// Servidor que responde la n-ésima entrada de `responses`: `Some` → `200` con
 /// el JSON; `None` → `500`. Al agotarse, repite la última.
 async fn spawn_sequence_server(responses: Vec<Option<Value>>) -> String {
-    async fn handler(
-        State(state): State<Arc<(Vec<Option<Value>>, AtomicUsize)>>,
-    ) -> Response {
+    async fn handler(State(state): State<Arc<(Vec<Option<Value>>, AtomicUsize)>>) -> Response {
         let (responses, counter) = &*state;
         let idx = counter.fetch_add(1, Ordering::SeqCst);
         let entry = &responses[idx.min(responses.len() - 1)];
@@ -138,10 +136,7 @@ async fn paid_models_are_excluded() {
     let cache = cache(&base, Duration::from_secs(300));
 
     let models = cache.ensure().await.expect("la caché debe poblarse");
-    let ids: Vec<String> = eligible_models(&models)
-        .into_iter()
-        .map(|m| m.id)
-        .collect();
+    let ids: Vec<String> = eligible_models(&models).into_iter().map(|m| m.id).collect();
 
     assert!(
         !ids.iter().any(|id| id.contains("llama-3.3-70b")),
@@ -156,10 +151,7 @@ async fn models_without_tool_calling_are_excluded() {
     let cache = cache(&base, Duration::from_secs(300));
 
     let models = cache.ensure().await.expect("la caché debe poblarse");
-    let ids: Vec<String> = eligible_models(&models)
-        .into_iter()
-        .map(|m| m.id)
-        .collect();
+    let ids: Vec<String> = eligible_models(&models).into_iter().map(|m| m.id).collect();
 
     assert!(
         !ids.iter().any(|id| id.contains("free-no-tools")),
@@ -224,7 +216,10 @@ async fn expired_ttl_returns_stale_and_refreshes_in_background() {
             break;
         }
     }
-    assert!(updated, "el refresco en segundo plano debe actualizar la caché");
+    assert!(
+        updated,
+        "el refresco en segundo plano debe actualizar la caché"
+    );
 }
 
 /// `models_url` une bien las barras.

@@ -5,6 +5,7 @@
 //! de integración (`tests/`) puedan ejercitar la API pública (`config::load`)
 //! sin duplicar lógica. `main.rs` queda como capa fina de arranque.
 
+pub mod classify;
 pub mod config;
 pub mod discovery;
 pub mod error;
