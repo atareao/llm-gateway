@@ -150,7 +150,8 @@ async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
 /// Se expone para que clientes y tests puedan predecirlo; se emite en la
 /// cabecera `x-gateway-backend` en las respuestas con éxito.
 pub fn backend_id(backend: &Backend) -> String {
-    format!("{}#{}", backend.base_url, backend.model)
+    let model = backend.model.as_deref().unwrap_or("dynamic");
+    format!("{}#{}", backend.base_url, model)
 }
 
 /// `POST /v1/chat/completions` (no-stream o streaming SSE).
@@ -607,7 +608,7 @@ async fn send(
     let span = tracing::info_span!(
         "backend_request",
         backend = %backend_id(backend),
-        model = %backend.model,
+        model = %backend.model.as_deref().unwrap_or(""),
         streaming,
         "otel.kind" = "client",
     );
@@ -720,10 +721,16 @@ fn assemble(
 
 /// Clona `body` y sustituye su `model` por el del backend. El resto de campos
 /// (incluidos los desconocidos) se conservan intactos.
+///
+/// Un backend sin `model` (p. ej. un dinámico sin expandir) devuelve el cuerpo
+/// tal cual.
 pub(crate) fn body_for_backend(body: &Value, backend: &Backend) -> Value {
+    let Some(model) = backend.model.as_deref() else {
+        return body.clone();
+    };
     let mut value = body.clone();
     if let Some(object) = value.as_object_mut() {
-        object.insert("model".to_owned(), Value::String(backend.model.clone()));
+        object.insert("model".to_owned(), Value::String(model.to_owned()));
     }
     value
 }

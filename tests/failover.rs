@@ -439,10 +439,13 @@ async fn no_stream_explicit_short_timeout_is_respected() {
 #[test]
 fn backend_id_format_is_base_url_hash_model() {
     let backend = llm_gateway_rs::config::Backend {
+        kind: llm_gateway_rs::config::BackendKind::Static,
         base_url: "http://localhost:11434/v1".to_owned(),
-        model: "qwen2.5:7b-instruct".to_owned(),
+        model: Some("qwen2.5:7b-instruct".to_owned()),
         api_key_env: None,
         timeout_ms: None,
+        profile: None,
+        discovery: None,
         warmup: None,
     };
     assert_eq!(

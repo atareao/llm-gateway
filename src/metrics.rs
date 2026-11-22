@@ -420,10 +420,13 @@ mod tests {
             route: vec![Route {
                 name: route_name.to_owned(),
                 backend: vec![Backend {
+                    kind: crate::config::BackendKind::Static,
                     base_url: "http://127.0.0.1:1/v1".to_owned(),
-                    model: "m".to_owned(),
+                    model: Some("m".to_owned()),
                     api_key_env: None,
                     timeout_ms: None,
+                    profile: None,
+                    discovery: None,
                     warmup: warmup.then_some(Warmup {
                         interval_ms: 1_000,
                         timeout_ms: None,
