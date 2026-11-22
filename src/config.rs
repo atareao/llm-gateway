@@ -1,5 +1,6 @@
 //! Carga y validación de la configuración de rutas del gateway (YAML).
 
+use std::collections::{HashMap, hash_map::Entry};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -167,12 +168,24 @@ impl Profile {
     }
 }
 
+/// Valor por defecto de `refresh_interval_ms` ([`DEFAULT_REFRESH_INTERVAL_MS`]).
+fn default_refresh_interval_ms() -> u64 {
+    DEFAULT_REFRESH_INTERVAL_MS
+}
+
+/// Valor por defecto de `blacklist_cooldown_ms` ([`DEFAULT_BLACKLIST_COOLDOWN_MS`]).
+fn default_blacklist_cooldown_ms() -> u64 {
+    DEFAULT_BLACKLIST_COOLDOWN_MS
+}
+
 /// Configuración de descubrimiento de un backend `openrouter_free`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Discovery {
     /// TTL de la caché del catálogo y periodo de refresco en segundo plano.
+    #[serde(default = "default_refresh_interval_ms")]
     pub refresh_interval_ms: u64,
     /// Tiempo que un modelo permanece en la blacklist tras un fallo.
+    #[serde(default = "default_blacklist_cooldown_ms")]
     pub blacklist_cooldown_ms: u64,
     /// Contexto mínimo (en tokens) exigido a los modelos elegibles.
     pub min_context: Option<u32>,
@@ -218,9 +231,16 @@ impl Backend {
     /// Etiqueta legible del backend para mensajes de error, en el formato
     /// `<base_url>#<model|dynamic>`.
     pub fn label(&self) -> String {
-        let model = self.model.as_deref().unwrap_or("dynamic");
-        format!("{}#{}", self.base_url, model)
+        format_id(&self.base_url, self.model.as_deref().unwrap_or("dynamic"))
     }
+}
+
+/// Identificador determinista de un backend, en el formato `<base_url>#<model>`.
+///
+/// Es el único punto que produce la etiqueta que comparten [`Backend::label`],
+/// `proxy::backend_id` y el `Candidate` expandido, para que las tres no diverjan.
+pub(crate) fn format_id(base_url: &str, model: &str) -> String {
+    format!("{base_url}#{model}")
 }
 
 /// Configuración de keep-alive (warmup) de un backend.
@@ -276,9 +296,16 @@ fn yaml_error(err: serde_saphyr::Error, path: &Path) -> anyhow::Error {
 }
 
 /// Valida las invariantes semánticas que el deserializador no puede comprobar
-/// por sí solo: cada ruta debe declarar al menos un backend, y el bloque
-/// opcional `observability.otlp` debe ser coherente.
+/// por sí solo: cada ruta debe declarar al menos un backend, el TTL de
+/// descubrimiento debe ser coherente por `base_url`, y el bloque opcional
+/// `observability.otlp` debe ser coherente.
 fn validate(config: &GatewayConfig) -> Result<()> {
+    // D5: el catálogo de descubrimiento es único por `base_url`, así que todos
+    // los backends dinámicos que la comparten deben refrescarlo con el mismo
+    // TTL efectivo. Se conserva el primero visto para que el error determinista
+    // pueda informar del TTL esperado.
+    let mut dynamic_ttls: HashMap<&str, (u64, Vec<&str>)> = HashMap::new();
+
     for route in &config.route {
         if route.backend.is_empty() {
             bail!("config: la ruta '{}' no tiene backends", route.name);
@@ -318,6 +345,32 @@ fn validate(config: &GatewayConfig) -> Result<()> {
                             );
                         }
                     }
+
+                    let effective_ttl = backend
+                        .discovery
+                        .as_ref()
+                        .map_or(DEFAULT_REFRESH_INTERVAL_MS, |discovery| {
+                            discovery.refresh_interval_ms
+                        });
+                    match dynamic_ttls.entry(backend.base_url.as_str()) {
+                        Entry::Vacant(slot) => {
+                            slot.insert((effective_ttl, vec![route.name.as_str()]));
+                        }
+                        Entry::Occupied(mut slot) => {
+                            let (expected_ttl, routes) = slot.get_mut();
+                            if !routes.contains(&route.name.as_str()) {
+                                routes.push(route.name.as_str());
+                            }
+                            if *expected_ttl != effective_ttl {
+                                return Err(ttl_conflict_error(
+                                    &backend.base_url,
+                                    *expected_ttl,
+                                    effective_ttl,
+                                    routes,
+                                ));
+                            }
+                        }
+                    }
                 }
             }
 
@@ -347,6 +400,28 @@ fn validate(config: &GatewayConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Construye el error de TTL de descubrimiento incoherente para una `base_url`
+/// compartida por varias rutas.
+///
+/// Mismo formato de una línea que el resto de errores de `config:`. Es
+/// determinista: `expected_ms` es el TTL del primer backend visto en orden de
+/// YAML y `routes` conserva ese mismo orden.
+fn ttl_conflict_error(
+    base_url: &str,
+    expected_ms: u64,
+    found_ms: u64,
+    routes: &[&str],
+) -> anyhow::Error {
+    let routes = routes
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::anyhow!(
+        "config: la base_url '{base_url}' se comparte entre las rutas [{routes}] con discovery.refresh_interval_ms distinto: se esperaba {expected_ms} ms y se encontró {found_ms} ms; unifica el TTL en todas las rutas que comparten esa base_url"
+    )
 }
 
 /// Valida el bloque `observability.otlp`: endpoint y organización no vacíos,
@@ -416,5 +491,390 @@ fn config_path() -> PathBuf {
     match std::env::var(GATEWAY_CONFIG_ENV) {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
         _ => PathBuf::from(DEFAULT_CONFIG_PATH),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::{DEFAULT_BLACKLIST_COOLDOWN_MS, DEFAULT_REFRESH_INTERVAL_MS, load};
+
+    fn write_temp(contents: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::Builder::new()
+            .suffix(".yaml")
+            .tempfile()
+            .expect("create temp file");
+        file.write_all(contents.as_bytes())
+            .expect("write temp file");
+        file.flush().expect("flush temp file");
+        file
+    }
+
+    fn dynamic_yaml(discovery: &str) -> String {
+        format!(
+            r#"
+route:
+  - name: mech-writer
+    backend:
+      - kind: openrouter_free
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery: {discovery}
+"#
+        )
+    }
+
+    const SHARED_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+    /// Bloque YAML de un backend dinámico; `ttl` a `None` omite `discovery`.
+    fn dynamic_backend(base_url: &str, ttl: Option<u64>) -> String {
+        let discovery = match ttl {
+            Some(ms) => format!("        discovery: {{ refresh_interval_ms: {ms} }}\n"),
+            None => String::new(),
+        };
+        format!(
+            "      - kind: openrouter_free\n        base_url: \"{base_url}\"\n        api_key_env: \"OPENROUTER_API_KEY\"\n{discovery}"
+        )
+    }
+
+    /// Ruta YAML con nombre y los bloques de backend ya renderizados.
+    fn route_yaml(name: &str, backends: &[String]) -> String {
+        format!("  - name: {name}\n    backend:\n{}", backends.concat())
+    }
+
+    /// Scenario: `discovery` con solo `min_context`
+    #[test]
+    fn discovery_with_only_min_context_uses_default_values() {
+        let file = write_temp(&dynamic_yaml("{ min_context: 32768 }"));
+
+        let config = load(file.path()).expect("discovery with only min_context should load");
+
+        let discovery = config.route[0].backend[0]
+            .discovery
+            .as_ref()
+            .expect("discovery block should be present");
+        assert_eq!(discovery.refresh_interval_ms, DEFAULT_REFRESH_INTERVAL_MS);
+        assert_eq!(
+            discovery.blacklist_cooldown_ms,
+            DEFAULT_BLACKLIST_COOLDOWN_MS
+        );
+        assert_eq!(discovery.min_context, Some(32_768));
+    }
+
+    /// Scenario: `discovery` vacío
+    #[test]
+    fn empty_discovery_uses_default_values() {
+        let file = write_temp(&dynamic_yaml("{}"));
+
+        let config = load(file.path()).expect("empty discovery should load");
+
+        let discovery = config.route[0].backend[0]
+            .discovery
+            .as_ref()
+            .expect("discovery block should be present");
+        assert_eq!(discovery.refresh_interval_ms, DEFAULT_REFRESH_INTERVAL_MS);
+        assert_eq!(
+            discovery.blacklist_cooldown_ms,
+            DEFAULT_BLACKLIST_COOLDOWN_MS
+        );
+        assert_eq!(discovery.min_context, None);
+    }
+
+    /// Scenario: TTL explícito mantiene el default del cooldown
+    #[test]
+    fn explicit_refresh_interval_keeps_default_blacklist_cooldown() {
+        let file = write_temp(&dynamic_yaml("{ refresh_interval_ms: 1500 }"));
+
+        let config = load(file.path()).expect("explicit refresh interval should load");
+
+        let discovery = config.route[0].backend[0]
+            .discovery
+            .as_ref()
+            .expect("discovery block should be present");
+        assert_eq!(discovery.refresh_interval_ms, 1_500);
+        assert_eq!(
+            discovery.blacklist_cooldown_ms,
+            DEFAULT_BLACKLIST_COOLDOWN_MS
+        );
+    }
+
+    /// Scenario: cooldown explícito mantiene el default del refresh interval
+    #[test]
+    fn explicit_blacklist_cooldown_keeps_default_refresh_interval() {
+        let file = write_temp(&dynamic_yaml("{ blacklist_cooldown_ms: 5000 }"));
+
+        let config = load(file.path()).expect("explicit blacklist cooldown should load");
+
+        let discovery = config.route[0].backend[0]
+            .discovery
+            .as_ref()
+            .expect("discovery block should be present");
+        assert_eq!(
+            discovery.blacklist_cooldown_ms, 5_000,
+            "el cooldown explícito debe respetarse"
+        );
+        assert_eq!(
+            discovery.refresh_interval_ms, DEFAULT_REFRESH_INTERVAL_MS,
+            "el refresh interval debe tomar el default"
+        );
+    }
+
+    /// Scenario: cooldown cero explícito
+    #[test]
+    fn explicit_zero_blacklist_cooldown_is_rejected() {
+        let file = write_temp(&dynamic_yaml("{ blacklist_cooldown_ms: 0 }"));
+
+        let err = load(file.path()).expect_err("zero blacklist cooldown should be rejected");
+        let message = err.to_string();
+
+        assert!(message.contains("mech-writer"), "message: {message}");
+        assert!(
+            message.contains("https://openrouter.ai/api/v1#dynamic"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("blacklist_cooldown_ms"),
+            "message: {message}"
+        );
+    }
+
+    /// Scenario: TTL cero explícito
+    #[test]
+    fn explicit_zero_refresh_interval_is_rejected() {
+        let file = write_temp(&dynamic_yaml("{ refresh_interval_ms: 0 }"));
+
+        let err = load(file.path()).expect_err("zero refresh interval should be rejected");
+        let message = err.to_string();
+
+        assert!(message.contains("mech-writer"), "message: {message}");
+        assert!(
+            message.contains("https://openrouter.ai/api/v1#dynamic"),
+            "message: {message}"
+        );
+        assert!(
+            message.contains("refresh_interval_ms"),
+            "message: {message}"
+        );
+    }
+
+    /// Scenario: TTL incoherente por `base_url` en una misma ruta.
+    #[test]
+    fn ttl_conflict_in_same_route_is_rejected() {
+        let yaml = format!(
+            "route:\n{}",
+            route_yaml(
+                "mech-writer",
+                &[
+                    dynamic_backend(SHARED_BASE_URL, Some(1_500)),
+                    dynamic_backend(SHARED_BASE_URL, Some(3_000)),
+                ],
+            )
+        );
+        let file = write_temp(&yaml);
+
+        let err = load(file.path()).expect_err("distinct TTLs for one base_url should be rejected");
+        let message = err.to_string();
+
+        assert!(message.contains(SHARED_BASE_URL), "message: {message}");
+        assert!(message.contains("mech-writer"), "message: {message}");
+        assert!(
+            message.contains("discovery.refresh_interval_ms"),
+            "el mensaje debe nombrar el campo: {message}"
+        );
+        assert!(
+            message.contains("se esperaba 1500 ms"),
+            "el mensaje debe indicar el TTL esperado: {message}"
+        );
+        assert!(
+            message.contains("se encontró 3000 ms"),
+            "el mensaje debe indicar el TTL encontrado: {message}"
+        );
+    }
+
+    /// Misma ruta, dos dinámicos con la misma `base_url` y el mismo TTL.
+    #[test]
+    fn same_route_equal_ttls_are_accepted() {
+        let yaml = format!(
+            "route:\n{}",
+            route_yaml(
+                "mech-writer",
+                &[
+                    dynamic_backend(SHARED_BASE_URL, Some(1_500)),
+                    dynamic_backend(SHARED_BASE_URL, Some(1_500)),
+                ],
+            )
+        );
+        let file = write_temp(&yaml);
+
+        load(file.path()).expect("equal TTLs within one route should load");
+    }
+
+    /// El nombre de una ruta con dos backends en conflicto aparece una sola vez.
+    #[test]
+    fn same_route_conflict_names_route_once() {
+        let yaml = format!(
+            "route:\n{}",
+            route_yaml(
+                "mech-writer",
+                &[
+                    dynamic_backend(SHARED_BASE_URL, Some(1_500)),
+                    dynamic_backend(SHARED_BASE_URL, Some(3_000)),
+                ],
+            )
+        );
+        let file = write_temp(&yaml);
+
+        let err = load(file.path()).expect_err("distinct TTLs for one base_url should be rejected");
+        let message = err.to_string();
+
+        assert_eq!(
+            message.matches("mech-writer").count(),
+            1,
+            "la ruta debe nombrarse una sola vez: {message}"
+        );
+    }
+
+    /// Un backend estático con la misma `base_url` no entra en la validación de TTL.
+    #[test]
+    fn static_backend_sharing_base_url_is_not_ttl_validated() {
+        let static_backend = format!(
+            "      - kind: static\n        base_url: \"{SHARED_BASE_URL}\"\n        model: \"some/model\"\n"
+        );
+        let yaml = format!(
+            "route:\n{}",
+            route_yaml(
+                "mech-writer",
+                &[
+                    dynamic_backend(SHARED_BASE_URL, Some(1_500)),
+                    static_backend
+                ],
+            )
+        );
+        let file = write_temp(&yaml);
+
+        let config =
+            load(file.path()).expect("a static backend must not take part in the TTL check");
+        let dynamic = &config.route[0].backend[0];
+        assert_eq!(
+            dynamic
+                .discovery
+                .as_ref()
+                .map(|discovery| discovery.refresh_interval_ms),
+            Some(1_500)
+        );
+    }
+
+    /// Scenario: TTL incoherente por `base_url` entre rutas distintas.
+    #[test]
+    fn ttl_conflict_across_routes_names_all_routes() {
+        let yaml = format!(
+            "route:\n{}{}",
+            route_yaml(
+                "mech-writer",
+                &[dynamic_backend(SHARED_BASE_URL, Some(1_500))],
+            ),
+            route_yaml(
+                "mech-code",
+                &[dynamic_backend(SHARED_BASE_URL, Some(3_000))],
+            ),
+        );
+        let file = write_temp(&yaml);
+
+        let err = load(file.path()).expect_err("distinct TTLs across routes should be rejected");
+        let message = err.to_string();
+
+        assert!(message.contains(SHARED_BASE_URL), "message: {message}");
+        assert!(message.contains("mech-writer"), "message: {message}");
+        assert!(message.contains("mech-code"), "message: {message}");
+        assert!(message.contains("1500"), "message: {message}");
+        assert!(message.contains("3000"), "message: {message}");
+    }
+
+    /// Scenario: TTL coherente por `base_url`.
+    #[test]
+    fn equal_ttls_for_same_base_url_are_accepted() {
+        let yaml = format!(
+            "route:\n{}{}",
+            route_yaml(
+                "mech-writer",
+                &[dynamic_backend(SHARED_BASE_URL, Some(1_500))],
+            ),
+            route_yaml(
+                "mech-code",
+                &[dynamic_backend(SHARED_BASE_URL, Some(1_500))],
+            ),
+        );
+        let file = write_temp(&yaml);
+
+        load(file.path()).expect("equal TTLs for one base_url should load");
+    }
+
+    /// Scenario: backend sin `discovery` y otro con el TTL por defecto.
+    #[test]
+    fn missing_discovery_matches_explicit_default_ttl() {
+        let yaml = format!(
+            "route:\n{}{}",
+            route_yaml("mech-writer", &[dynamic_backend(SHARED_BASE_URL, None)]),
+            route_yaml(
+                "mech-code",
+                &[dynamic_backend(
+                    SHARED_BASE_URL,
+                    Some(DEFAULT_REFRESH_INTERVAL_MS),
+                )],
+            ),
+        );
+        let file = write_temp(&yaml);
+
+        load(file.path()).expect("explicit default TTL should match the implicit default");
+    }
+
+    /// Scenario: backend sin `discovery` frente a un TTL explícito distinto.
+    #[test]
+    fn missing_discovery_conflicts_with_non_default_ttl() {
+        let yaml = format!(
+            "route:\n{}{}",
+            route_yaml("mech-writer", &[dynamic_backend(SHARED_BASE_URL, None)]),
+            route_yaml(
+                "mech-code",
+                &[dynamic_backend(SHARED_BASE_URL, Some(1_500))],
+            ),
+        );
+        let file = write_temp(&yaml);
+
+        let err = load(file.path())
+            .expect_err("implicit default TTL should conflict with an explicit non-default TTL");
+        let message = err.to_string();
+
+        assert!(message.contains(SHARED_BASE_URL), "message: {message}");
+        assert!(message.contains("mech-writer"), "message: {message}");
+        assert!(message.contains("mech-code"), "message: {message}");
+        assert!(
+            message.contains(&DEFAULT_REFRESH_INTERVAL_MS.to_string()),
+            "message: {message}"
+        );
+        assert!(message.contains("1500"), "message: {message}");
+    }
+
+    /// Ambos `base_url` conservan TTLs independientes.
+    #[test]
+    fn distinct_base_urls_keep_independent_ttls() {
+        let yaml = format!(
+            "route:\n{}{}",
+            route_yaml(
+                "mech-writer",
+                &[dynamic_backend("https://openrouter.ai/api/v1", Some(1_500),)],
+            ),
+            route_yaml(
+                "mech-code",
+                &[dynamic_backend(
+                    "https://mirror.example.com/api/v1",
+                    Some(3_000),
+                )],
+            ),
+        );
+        let file = write_temp(&yaml);
+
+        load(file.path()).expect("distinct base_urls should keep independent TTLs");
     }
 }

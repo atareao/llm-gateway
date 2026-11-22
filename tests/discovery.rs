@@ -36,6 +36,42 @@ fn metrics() -> Arc<Metrics> {
     Arc::new(Metrics::new(&config()))
 }
 
+/// Config con un backend dinámico sobre `base_url`, para construir `Metrics` y
+/// un `Registry` que ejecute el descubrimiento real contra el mock.
+fn config_for(base_url: &str) -> GatewayConfig {
+    let yaml = format!(
+        r#"
+route:
+  - name: code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base_url}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: 60000
+"#
+    );
+    serde_saphyr::from_str(&yaml).expect("config de test válida")
+}
+
+/// Valor de la serie `name` para `base_url` (y `profile`/`result` opcional) en
+/// el render de Prometheus.
+fn series_value(
+    text: &str,
+    name: &str,
+    base_url: &str,
+    extra: Option<(&str, &str)>,
+) -> Option<u64> {
+    let line = text.lines().find(|line| {
+        line.starts_with(name)
+            && line.contains(&format!(r#"base_url="{base_url}""#))
+            && extra.is_none_or(|(key, value)| line.contains(&format!(r#"{key}="{value}""#)))
+    })?;
+    line.rsplit_once(' ')?.1.parse().ok()
+}
+
 /// Catálogo con un modelo free con tool-calling, uno de pago y uno free sin
 /// tool-calling.
 fn catalog() -> Value {
@@ -385,5 +421,87 @@ async fn concurrent_cold_start_ensure_fetches_once() {
     assert!(
         a.is_some() && b.is_some(),
         "ambas peticiones deben recibir el catálogo"
+    );
+}
+
+/// Scenario: Métricas tras descubrimiento → el descubrimiento real contra
+/// `/models` publica el total del catálogo, los elegibles por perfil y el
+/// refresco con éxito.
+#[tokio::test]
+async fn real_discovery_records_catalog_and_profile_metrics() {
+    let base = spawn_models_server(catalog()).await;
+    let config = config_for(&base);
+    let metrics = Arc::new(Metrics::new(&config));
+    let registry = Registry::new(&config, reqwest::Client::new(), Arc::clone(&metrics));
+
+    // Descubrimiento real contra el mock: `refresh` puebla la caché y publica el
+    // total del catálogo; `expand` clasifica el perfil `code` y publica sus
+    // elegibles. El catálogo tiene 3 modelos y solo uno es free con tools.
+    let cache = registry.catalog(&base).expect("caché del mock");
+    cache
+        .refresh()
+        .await
+        .expect("el refresco contra el mock debe funcionar");
+    let candidates = registry.expand(0, 0).await;
+    assert_eq!(
+        candidates,
+        vec!["deepseek/deepseek-r1:free".to_owned()],
+        "el perfil code debe resolver el modelo free con tool-calling"
+    );
+
+    let text = metrics.render();
+    assert_eq!(
+        series_value(&text, "llm_gateway_discovery_models", &base, None),
+        Some(3),
+        "el total del catálogo debe reflejarse en el gauge:\n{text}"
+    );
+    assert_eq!(
+        series_value(
+            &text,
+            "llm_gateway_discovery_profile_models",
+            &base,
+            Some(("profile", "code"))
+        ),
+        Some(1),
+        "los elegibles por perfil deben reflejarse en el gauge:\n{text}"
+    );
+    assert_eq!(
+        series_value(
+            &text,
+            "llm_gateway_discovery_refresh_total",
+            &base,
+            Some(("result", "success"))
+        ),
+        Some(1),
+        "el refresco real debe contarse con result=\"success\":\n{text}"
+    );
+}
+
+/// Scenario: Fallo de refresco → un `/models` que responde 500 incrementa el
+/// contador de refrescos con `result="failure"`.
+#[tokio::test]
+async fn failed_refresh_increments_failure_counter() {
+    let base = spawn_sequence_server(vec![None]).await;
+    let metrics = metrics();
+    let cache = CatalogCache::new(
+        reqwest::Client::new(),
+        base.clone(),
+        Duration::from_secs(300),
+        Arc::clone(&metrics),
+    );
+
+    let result = cache.refresh().await;
+    assert!(result.is_err(), "el refresco contra un 500 debe fallar");
+
+    let text = metrics.render();
+    assert_eq!(
+        series_value(
+            &text,
+            "llm_gateway_discovery_refresh_total",
+            &base,
+            Some(("result", "failure"))
+        ),
+        Some(1),
+        "el fallo real debe contarse con result=\"failure\":\n{text}"
     );
 }

@@ -4,8 +4,9 @@
 //! y `POST /v1/chat/completions` (comportamiento por modelo), y el gateway real
 //! sobre un puerto efímero.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -41,6 +42,12 @@ impl Behaviour {
 /// Estado del mock de OpenRouter: catálogo + comportamiento y contadores por modelo.
 struct OpenRouterMock {
     catalog: Value,
+    /// Si está activo, `GET /models` responde 500.
+    models_failing: AtomicBool,
+    /// Peticiones recibidas en `GET /v1/models`.
+    models_requests: AtomicUsize,
+    /// Peticiones a `GET /v1/models` que respondieron error.
+    models_failures: AtomicUsize,
     behaviours: Mutex<HashMap<String, Behaviour>>,
     counts: Mutex<HashMap<String, usize>>,
     default: Behaviour,
@@ -50,10 +57,32 @@ impl OpenRouterMock {
     fn new(catalog: Value) -> Self {
         Self {
             catalog,
+            models_failing: AtomicBool::new(false),
+            models_requests: AtomicUsize::new(0),
+            models_failures: AtomicUsize::new(0),
             behaviours: Mutex::new(HashMap::new()),
             counts: Mutex::new(HashMap::new()),
             default: Behaviour::status(StatusCode::OK),
         }
+    }
+
+    /// Simula un fallo de `GET /models` mientras `failing` sea `true`.
+    fn set_models_failure(&self, failing: bool) {
+        self.models_failing.store(failing, Ordering::SeqCst);
+    }
+
+    fn models_failing(&self) -> bool {
+        self.models_failing.load(Ordering::SeqCst)
+    }
+
+    /// Peticiones totales recibidas en `GET /v1/models`.
+    fn models_requests(&self) -> usize {
+        self.models_requests.load(Ordering::SeqCst)
+    }
+
+    /// Peticiones a `GET /v1/models` que terminaron en error.
+    fn models_failures(&self) -> usize {
+        self.models_failures.load(Ordering::SeqCst)
     }
 
     fn set(&self, model: &str, status: StatusCode) {
@@ -109,8 +138,17 @@ impl OpenRouterMock {
     }
 }
 
-async fn models_handler(State(mock): State<Arc<OpenRouterMock>>) -> axum::Json<Value> {
-    axum::Json(mock.catalog.clone())
+async fn models_handler(State(mock): State<Arc<OpenRouterMock>>) -> Response {
+    mock.models_requests.fetch_add(1, Ordering::SeqCst);
+    if mock.models_failing() {
+        mock.models_failures.fetch_add(1, Ordering::SeqCst);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": "modelos no disponibles"})),
+        )
+            .into_response();
+    }
+    axum::Json(mock.catalog.clone()).into_response()
 }
 
 async fn chat_handler(State(mock): State<Arc<OpenRouterMock>>, body: Bytes) -> Response {
@@ -158,6 +196,24 @@ async fn spawn_openrouter(catalog: Value) -> (String, Arc<OpenRouterMock>) {
     (format!("http://{addr}/v1"), mock)
 }
 
+/// Espera hasta que el mock registre al menos `at_least` fallos de
+/// `GET /v1/models` (los refrescos en segundo plano no han terminado cuando
+/// responde la petición que los dispara).
+async fn wait_for_models_failures(mock: &OpenRouterMock, at_least: usize) {
+    for _ in 0..100 {
+        if mock.models_failures() >= at_least {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        mock.models_failures() >= at_least,
+        "el mock no registró {at_least} fallo(s) de /v1/models: {} peticiones, {} fallos",
+        mock.models_requests(),
+        mock.models_failures()
+    );
+}
+
 /// Catálogo con dos modelos free elegibles (mismo tier y contexto → orden por id).
 fn two_model_catalog() -> Value {
     json!({"data": [
@@ -184,10 +240,26 @@ fn no_eligible_catalog() -> Value {
     ]})
 }
 
+/// Fija la API key de prueba una sola vez por proceso.
+///
+/// `std::env::set_var` no es seguro frente a lecturas concurrentes de entorno y
+/// el resto de tests del binario corre en paralelo, así que la escritura se hace
+/// aquí una única vez, antes de construir el primer `AppState`.
+fn ensure_test_api_key() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        // SAFETY: la escritura es única por proceso y precede a cualquier
+        // lector del binario: todo test pasa antes por `ensure_test_api_key()`,
+        // así que ningún `getenv` concurrente (`resolve_api_key`) puede
+        // solaparse con este `set_var`. La unicidad del `OnceLock` es
+        // necesaria, pero la soundness la da ese orden de acceso.
+        unsafe { std::env::set_var(KEY_ENV, "test-key") };
+    });
+}
+
 /// Levanta el gateway con la `yaml` dada (con `{base}` y `{key_env}` sustituidos).
 async fn spawn_gateway(yaml: &str, base: &str, cooldown_ms: u64) -> String {
-    // SAFETY: nombre de variable de test; el valor no es sensible.
-    unsafe { std::env::set_var(KEY_ENV, "test-key") };
+    ensure_test_api_key();
     let yaml = yaml
         .replace("{base}", base)
         .replace("{key_env}", KEY_ENV)
@@ -286,8 +358,9 @@ route:
     let first = backend_header(&chat(&gateway, "free-code").await);
     let second = backend_header(&chat(&gateway, "free-code").await);
 
-    assert!(first.contains("dyn/aa:free"), "1ª petición: {first}");
-    assert!(second.contains("dyn/bb:free"), "2ª petición: {second}");
+    // El identificador emitido lleva el modelo expandido, nunca `dynamic`.
+    assert_eq!(first, format!("{base}#dyn/aa:free"), "1ª petición");
+    assert_eq!(second, format!("{base}#dyn/bb:free"), "2ª petición");
 }
 
 /// Scenario: 429 marca el modelo en blacklist → no se reintenta en la siguiente.
@@ -621,13 +694,421 @@ route:
         .await
         .expect("json");
 
-    let ids: Vec<&str> = body["data"]
+    let mut ids: Vec<&str> = body["data"]
         .as_array()
         .expect("data")
         .iter()
         .filter_map(|m| m["id"].as_str())
         .collect();
-    assert!(ids.contains(&"free-code"), "ids: {ids:?}");
-    assert!(ids.contains(&"dyn/aa:free"), "ids: {ids:?}");
-    assert!(ids.contains(&"dyn/bb:free"), "ids: {ids:?}");
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec!["dyn/aa:free", "dyn/bb:free", "free-code"],
+        "solo deben listarse la ruta y los modelos dinámicos elegibles"
+    );
+}
+
+/// Scenario: catálogo dinámico vacío → el backend estático de respaldo sirve y
+/// `/v1/models` no lista modelos dinámicos.
+#[tokio::test]
+async fn empty_catalog_serves_static_fallback() {
+    let (base, mock) = spawn_openrouter(json!({"data": []})).await;
+    mock.set("static/fallback", StatusCode::OK);
+
+    let yaml = r#"
+route:
+  - name: free-code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+      - base_url: "{base}"
+        model: "static/fallback"
+        api_key_env: "{key_env}"
+"#;
+    let gateway = spawn_gateway(yaml, &base, 60_000).await;
+
+    let response = chat(&gateway, "free-code").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        backend_header(&response).contains("static/fallback"),
+        "un catálogo vacío debe dejar el respaldo estático, got: {}",
+        backend_header(&response)
+    );
+
+    let body: Value = reqwest::Client::new()
+        .get(format!("{gateway}/v1/models"))
+        .send()
+        .await
+        .expect("request a /v1/models")
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect();
+    assert!(
+        !ids.iter().any(|id| id.starts_with("dyn/")),
+        "sin catálogo no debe listarse ningún modelo dinámico: {ids:?}"
+    );
+}
+
+/// Scenario: TTL vencido + fallo de `/models` → se sirve la caché previa sin
+/// error mientras el refresco de fondo falla.
+#[tokio::test]
+async fn expired_ttl_with_models_failure_reuses_previous_cache() {
+    let (base, mock) = spawn_openrouter(one_model_catalog()).await;
+
+    let yaml = r#"
+route:
+  - name: free-code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 50
+          blacklist_cooldown_ms: {cooldown}
+"#;
+    let gateway = spawn_gateway(yaml, &base, 60_000).await;
+
+    let first = chat(&gateway, "free-code").await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert!(
+        backend_header(&first).contains("dyn/aa:free"),
+        "la primera petición puebla la caché: {}",
+        backend_header(&first)
+    );
+
+    mock.set_models_failure(true);
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let second = chat(&gateway, "free-code").await;
+    assert_eq!(
+        second.status(),
+        reqwest::StatusCode::OK,
+        "un refresco fallido no debe romper la petición"
+    );
+    assert!(
+        backend_header(&second).contains("dyn/aa:free"),
+        "debe reutilizarse el catálogo previo: {}",
+        backend_header(&second)
+    );
+    assert_eq!(
+        mock.count("dyn/aa:free"),
+        2,
+        "el modelo cacheado se sirve también con /models caído"
+    );
+    wait_for_models_failures(&mock, 1).await;
+    assert!(
+        mock.models_requests() >= 2,
+        "un TTL vencido debe volver a pedir /v1/models: {} peticiones",
+        mock.models_requests()
+    );
+    assert!(
+        mock.models_failures() >= 1,
+        "el refresco del TTL vencido debe fallar y conservar la caché: {} fallos",
+        mock.models_failures()
+    );
+}
+
+/// Scenario complementario: sin caché previa y `/models` fallando → la ruta
+/// dinámica no aporta candidatos y responde el backend estático, sin pánico.
+#[tokio::test]
+async fn models_failure_without_cache_uses_static_fallback() {
+    let (base, mock) = spawn_openrouter(one_model_catalog()).await;
+    mock.set_models_failure(true);
+    mock.set("static/fallback", StatusCode::OK);
+
+    let yaml = r#"
+route:
+  - name: free-code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+      - base_url: "{base}"
+        model: "static/fallback"
+        api_key_env: "{key_env}"
+"#;
+    let gateway = spawn_gateway(yaml, &base, 60_000).await;
+
+    let response = chat(&gateway, "free-code").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert!(
+        backend_header(&response).contains("static/fallback"),
+        "sin catálogo disponible debe servir el respaldo: {}",
+        backend_header(&response)
+    );
+    assert_eq!(
+        mock.count("dyn/aa:free"),
+        0,
+        "la caché en frío falló y no debe proponerse ningún modelo dinámico"
+    );
+    assert!(
+        mock.models_requests() >= 1,
+        "la caché en frío debe intentar /v1/models al menos una vez"
+    );
+    assert!(
+        mock.models_failures() >= 1,
+        "el intento de /v1/models en frío debe contabilizarse como fallo"
+    );
+}
+
+/// Scenario: blacklist compartida por `base_url` → un 429 desde una ruta
+/// excluye el modelo en la otra ruta mientras dure el cooldown.
+#[tokio::test]
+async fn blacklist_is_shared_between_routes_with_same_base_url() {
+    let (base, mock) = spawn_openrouter(two_model_catalog()).await;
+    mock.set("dyn/aa:free", StatusCode::TOO_MANY_REQUESTS);
+    mock.set("dyn/bb:free", StatusCode::OK);
+
+    // Dos perfiles distintos con el mismo modelo compartido al frente: la
+    // blacklist es global, así que el 429 de la ruta A también afecta a la B.
+    let yaml = r#"
+route:
+  - name: route-a
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+          overrides:
+            include: ["dyn/aa:free"]
+  - name: route-b
+    backend:
+      - kind: openrouter_free
+        profile: writer
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+          overrides:
+            include: ["dyn/aa:free"]
+"#;
+    let gateway = spawn_gateway(yaml, &base, 60_000).await;
+
+    // Ruta A: el modelo compartido responde 429 y se marca; el failover sirve
+    // el siguiente modelo dinámico.
+    let first = chat(&gateway, "route-a").await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert!(
+        backend_header(&first).contains("dyn/bb:free"),
+        "la ruta A debe caer al siguiente modelo: {}",
+        backend_header(&first)
+    );
+
+    // Ruta B: el modelo compartido sigue en blacklist y no recibe una segunda
+    // petición; se sirve el otro modelo.
+    let second = chat(&gateway, "route-b").await;
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    assert!(
+        backend_header(&second).contains("dyn/bb:free"),
+        "la ruta B no debe proponer el modelo en blacklist: {}",
+        backend_header(&second)
+    );
+
+    assert_eq!(
+        mock.count("dyn/aa:free"),
+        1,
+        "el modelo compartido solo debe contactarse una vez"
+    );
+    assert_eq!(
+        mock.count("dyn/bb:free"),
+        2,
+        "cada ruta usa el siguiente modelo"
+    );
+}
+
+/// Scenario: Perfil sin modelos elegibles → el dinámico se queda sin candidatos
+/// por filtrado (`min_context`), no por catálogo vacío, y la ruta continúa con
+/// el siguiente backend estático.
+#[tokio::test]
+async fn min_context_leaves_dynamic_without_candidates_and_uses_static() {
+    let (base, mock) = spawn_openrouter(two_model_catalog()).await;
+    mock.set("static/fallback", StatusCode::OK);
+
+    // El catálogo tiene modelos (context_length 1000), pero todos quedan por
+    // debajo de `min_context`, así que el dinámico no aporta candidatos.
+    let yaml = r#"
+route:
+  - name: free-code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+          min_context: 100000
+      - base_url: "{base}"
+        model: "static/fallback"
+        api_key_env: "{key_env}"
+"#;
+    let gateway = spawn_gateway(yaml, &base, 60_000).await;
+
+    let response = chat(&gateway, "free-code").await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let served = backend_header(&response);
+    assert!(
+        served.contains("static/fallback"),
+        "sin modelos que superen min_context debe servir el estático, got: {served}"
+    );
+    assert!(
+        !served.contains("dyn/"),
+        "el filtrado no debe dejar ningún candidato dinámico, got: {served}"
+    );
+    assert_eq!(
+        mock.count("dyn/aa:free"),
+        0,
+        "el modelo filtrado no debe contactarse"
+    );
+    assert_eq!(
+        mock.count("dyn/bb:free"),
+        0,
+        "el modelo filtrado no debe contactarse"
+    );
+    assert!(
+        mock.models_requests() >= 1,
+        "el catálogo se consultó; el dinámico se queda sin candidatos por filtrado, no por catálogo vacío"
+    );
+}
+
+/// Scenario: un único catálogo compartido por `base_url` → dos rutas con la
+/// misma `base_url` y el mismo TTL comparten un solo `GET /models`.
+#[tokio::test]
+async fn same_base_url_shares_one_catalog_fetch_between_routes() {
+    let (base, mock) = spawn_openrouter(two_model_catalog()).await;
+
+    let yaml = r#"
+route:
+  - name: route-code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+  - name: route-writer
+    backend:
+      - kind: openrouter_free
+        profile: writer
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+"#;
+    let gateway = spawn_gateway(yaml, &base, 60_000).await;
+
+    let first = chat(&gateway, "route-code").await;
+    assert_eq!(first.status(), reqwest::StatusCode::OK);
+    assert!(
+        backend_header(&first).contains("dyn/"),
+        "la primera ruta debe resolver un modelo dinámico: {}",
+        backend_header(&first)
+    );
+
+    let second = chat(&gateway, "route-writer").await;
+    assert_eq!(second.status(), reqwest::StatusCode::OK);
+    assert!(
+        backend_header(&second).contains("dyn/"),
+        "la segunda ruta debe resolver un modelo dinámico: {}",
+        backend_header(&second)
+    );
+
+    assert_eq!(
+        mock.models_requests(),
+        1,
+        "las dos rutas con la misma base_url deben compartir un único GET /models"
+    );
+}
+
+/// Scenario: `/v1/models` deduplica sin duplicados → dos backends dinámicos con
+/// perfiles distintos y modelos solapados producen identificadores únicos.
+#[tokio::test]
+async fn list_models_deduplicates_overlapping_dynamic_models() {
+    let (base, _mock) = spawn_openrouter(two_model_catalog()).await;
+
+    let yaml = r#"
+route:
+  - name: route-code
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+  - name: route-writer
+    backend:
+      - kind: openrouter_free
+        profile: writer
+        base_url: "{base}"
+        api_key_env: "{key_env}"
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: {cooldown}
+"#;
+    let gateway = spawn_gateway(yaml, &base, 60_000).await;
+
+    let body: Value = reqwest::Client::new()
+        .get(format!("{gateway}/v1/models"))
+        .send()
+        .await
+        .expect("request a /v1/models")
+        .json()
+        .await
+        .expect("json");
+
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect();
+
+    assert_eq!(
+        ids.len(),
+        ids.iter().collect::<HashSet<_>>().len(),
+        "ningún identificador debe repetirse: {ids:?}"
+    );
+
+    let dynamic: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| id.starts_with("dyn/"))
+        .collect();
+    let mut expected = dynamic.clone();
+    expected.sort_unstable();
+    expected.dedup();
+    assert_eq!(
+        dynamic, expected,
+        "los modelos dinámicos solapados deben deduplicarse y quedar ordenados: {dynamic:?}"
+    );
+    assert_eq!(
+        dynamic,
+        vec!["dyn/aa:free", "dyn/bb:free"],
+        "cada modelo solapado debe aparecer una sola vez"
+    );
 }

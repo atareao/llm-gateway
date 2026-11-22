@@ -14,6 +14,7 @@
 //! se nombran **sin** el sufijo `_total` porque el `PrometheusExporter` lo
 //! añade al renderizar.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use opentelemetry::KeyValue;
@@ -177,6 +178,20 @@ pub struct Metrics {
     discovery_refresh: Counter<u64>,
     /// Tamaño actual de la blacklist global.
     discovery_blacklist: Gauge<u64>,
+    /// Último tamaño de blacklist publicado en el gauge. Arranca en 0, que es
+    /// lo que deja el pre-registro de [`Metrics::new`]; así una blacklist vacía
+    /// no reescribe el gauge en cada acceso.
+    ///
+    /// La caché es **por instancia de `Metrics`** y asume una única instancia
+    /// por proceso: la serie OTel del gauge es global, de modo que dos
+    /// instancias compartirían la serie pero no este atómico.
+    blacklist_size: AtomicUsize,
+    /// Actualizaciones del tamaño de blacklist que reescribieron el gauge.
+    ///
+    /// No cuenta el `record(0)` del pre-registro de [`Metrics::new`], solo las
+    /// escrituras que cambian el tamaño publicado. Solo para tests.
+    #[cfg(test)]
+    blacklist_size_updates: AtomicUsize,
 }
 
 /// Atributos `route`, `streaming`, `outcome`.
@@ -396,9 +411,27 @@ impl Metrics {
                 discovery_refresh.add(0, &discovery_refresh_attrs(base, ok));
             }
         }
-        if !bases.is_empty() {
-            discovery_blacklist.record(0, &[]);
+        // La blacklist es global (sin `base_url`), así que su serie se
+        // pre-registra aunque la config no declare backends dinámicos.
+        //
+        // En tests conviven varias instancias de `Metrics` en el mismo proceso
+        // (la producción asume una sola). Si el test ya mantiene el lock del
+        // gauge, se pre-registra directamente; si no, se toma solo cuando está
+        // libre para no pisar una lectura concurrente. Si `try_lock` falla,
+        // otro test está leyendo o escribiendo el gauge y este pre-registro se
+        // omite a propósito: bloquear aquí podría interbloquear el test que
+        // tiene el lock si a su vez construye un `Metrics`.
+        #[cfg(test)]
+        {
+            let already_locked = HOLDS_BLACKLIST_GAUGE_LOCK.with(std::cell::Cell::get);
+            if already_locked {
+                discovery_blacklist.record(0, &[]);
+            } else if let Ok(_guard) = BLACKLIST_GAUGE_LOCK.try_lock() {
+                discovery_blacklist.record(0, &[]);
+            }
         }
+        #[cfg(not(test))]
+        discovery_blacklist.record(0, &[]);
 
         Self {
             requests,
@@ -416,6 +449,9 @@ impl Metrics {
             discovery_profile,
             discovery_refresh,
             discovery_blacklist,
+            blacklist_size: AtomicUsize::new(0),
+            #[cfg(test)]
+            blacklist_size_updates: AtomicUsize::new(0),
         }
     }
 
@@ -497,8 +533,32 @@ impl Metrics {
     }
 
     /// Fija el tamaño actual de la blacklist dinámica.
-    pub fn set_blacklist_size(&self, size: usize) {
+    ///
+    /// Solo escribe el gauge si el tamaño difiere del último publicado; los
+    /// accesos sin cambio de tamaño (la mayoría de purgas) no lo reescriben.
+    ///
+    /// La secuencia `swap` + `record` **requiere serialización externa**: dos
+    /// llamadas concurrentes podrían publicar un valor distinto del último
+    /// `swap` o dejar la caché desfasada respecto al gauge. Las llamadas desde
+    /// [`crate::discovery::Blacklist`] quedan serializadas por su lock de
+    /// escritura, donde no se produce un valor incorrecto; sin esa
+    /// serialización, esta función no es segura por sí sola.
+    pub(crate) fn set_blacklist_size(&self, size: usize) {
+        let previous = self.blacklist_size.swap(size, Ordering::Relaxed);
+        if previous == size {
+            return;
+        }
         self.discovery_blacklist.record(size as u64, &[]);
+        #[cfg(test)]
+        self.blacklist_size_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Actualizaciones de tamaño que reescribieron el gauge (solo para tests).
+    ///
+    /// Excluye el `record(0)` del pre-registro de [`Metrics::new`].
+    #[cfg(test)]
+    pub(crate) fn blacklist_size_updates(&self) -> usize {
+        self.blacklist_size_updates.load(Ordering::Relaxed)
     }
 
     /// Renderiza todas las series en formato de exposición de Prometheus.
@@ -519,8 +579,59 @@ impl Metrics {
 /// Serializa, solo en tests, los que tocan el gauge global de blacklist: al no
 /// tener etiquetas es compartido por todo el proceso, así que cualquier test que
 /// lo lea o escriba debe tomar este lock para no interferir con otro.
+///
+/// No se usa directamente: los tests toman [`BlacklistGaugeGuard`].
 #[cfg(test)]
-pub(crate) static BLACKLIST_GAUGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static BLACKLIST_GAUGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    /// `true` mientras el hilo actual mantiene [`BLACKLIST_GAUGE_LOCK`].
+    static HOLDS_BLACKLIST_GAUGE_LOCK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Guardián de test del gauge global de blacklist.
+///
+/// Equivale a [`BLACKLIST_GAUGE_LOCK`], pero marca el lock como tomado por el
+/// hilo actual para que un [`Metrics::new`] dentro de la sección crítica pueda
+/// pre-registrar el gauge sin bloquearse consigo mismo.
+#[cfg(test)]
+pub(crate) struct BlacklistGaugeGuard {
+    /// `Some` mientras el guardián vive; se toma explícitamente al soltarlo.
+    guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl BlacklistGaugeGuard {
+    /// Toma el lock tolerando un posible envenenamiento.
+    ///
+    /// No es reentrante: si el hilo ya lo mantiene, el `debug_assert` de abajo
+    /// lo detecta antes de bloquearse para siempre.
+    pub(crate) fn lock() -> Self {
+        debug_assert!(
+            !HOLDS_BLACKLIST_GAUGE_LOCK.with(std::cell::Cell::get),
+            "BlacklistGaugeGuard no es reentrante"
+        );
+        let guard = BLACKLIST_GAUGE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HOLDS_BLACKLIST_GAUGE_LOCK.with(|held| held.set(true));
+        Self { guard: Some(guard) }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BlacklistGaugeGuard {
+    fn drop(&mut self) {
+        // Suelta el lock antes de limpiar el indicador del hilo: así el hilo
+        // nunca observa «lock libre» mientras `HOLDS_BLACKLIST_GAUGE_LOCK`
+        // sigue en `true`. El orden inverso también sería correcto, pero este
+        // es el que refleja el estado real en cada instante.
+        drop(self.guard.take());
+        HOLDS_BLACKLIST_GAUGE_LOCK.with(|held| held.set(false));
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -866,9 +977,7 @@ mod tests {
 
     #[test]
     fn discovery_metrics_are_preregistered_at_zero() {
-        let _guard = BLACKLIST_GAUGE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = BlacklistGaugeGuard::lock();
         let base = "http://discovery-preregistro.invalid/v1";
         let metrics = Metrics::new(&dynamic_config(base));
         let text = metrics.render();
@@ -888,9 +997,15 @@ mod tests {
                 "llm_gateway_discovery_refresh_total",
                 Some(("result", "failure")),
             ),
+            ("llm_gateway_discovery_blacklist", None),
         ] {
-            let line = discovery_line(&text, name, base, extra)
-                .unwrap_or_else(|| panic!("falta la serie {name} para {base}:\n{text}"));
+            // La blacklist es global y no lleva `base_url` en sus atributos.
+            let line = if name == "llm_gateway_discovery_blacklist" {
+                text.lines().find(|line| line.starts_with(name))
+            } else {
+                discovery_line(&text, name, base, extra)
+            };
+            let line = line.unwrap_or_else(|| panic!("falta la serie {name} para {base}:\n{text}"));
             assert_eq!(
                 value(line),
                 "0",
@@ -901,9 +1016,7 @@ mod tests {
 
     #[test]
     fn discovery_metrics_are_recorded_and_increment() {
-        let _guard = BLACKLIST_GAUGE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = BlacklistGaugeGuard::lock();
         let base = "http://discovery-registro.invalid/v1";
         let metrics = Metrics::new(&dynamic_config(base));
 
