@@ -632,10 +632,17 @@ fn diff_prices(
     let mut events = Vec::new();
     let mut next: HashMap<String, TrackedPrice> = HashMap::with_capacity(catalog.len());
     for model in catalog {
+        let id = model.id.as_str();
         let Some((pin, pout)) = price_per_token(model) else {
+            // Presente sin precio parseable: «desconocido» no es «gratis». Se
+            // retiene el último precio conocido sin emitir, para que un precio
+            // ilegible no produzca una baja falsa ni una oscilación
+            // `removed`→`new` al reaparecer el precio.
+            if let Some(prev) = last.get(id) {
+                next.insert(id.to_owned(), *prev);
+            }
             continue;
         };
-        let id = model.id.as_str();
         let context_length = model.context_length;
         let (change_kind, prev_pin, prev_pout) = match last.get(id) {
             None => (CatalogChangeKind::New, None, None),
@@ -673,6 +680,9 @@ fn diff_prices(
             prev_pin.zip(prev_pout),
         ));
     }
+    // Con la retención anterior, `next` contiene exactamente los ids presentes
+    // en el catálogo (con precio parseable o retenidos): `removed` solo
+    // alcanza a los ids realmente ausentes del catálogo.
     let mut removed: Vec<(&String, &TrackedPrice)> = last
         .iter()
         .filter(|(id, _)| !next.contains_key(id.as_str()))
@@ -743,8 +753,8 @@ fn blend_parts(pin: f64, pout: f64) -> f64 {
 }
 
 /// Precios por token (`prompt`, `completion`) de un modelo, o `None` si falta
-/// alguno o no es numérico. A diferencia de `classify::price_value`, un valor
-/// ausente no cuenta como `0`.
+/// alguno, no es numérico o no es finito. A diferencia de
+/// `classify::price_value`, un valor ausente no cuenta como `0`.
 fn price_per_token(model: &ModelEntry) -> Option<(f64, f64)> {
     let pricing = model.pricing.as_ref()?;
     Some((
@@ -753,11 +763,13 @@ fn price_per_token(model: &ModelEntry) -> Option<(f64, f64)> {
     ))
 }
 
-/// Parsea un campo de precio (cadena o número) a `f64`.
+/// Parsea un campo de precio (cadena o número) a `f64`. Los valores no finitos
+/// (`NaN`, `inf`) se tratan como no parseables: contaminarían el `blend` (y un
+/// `blend` `NaN` no empata consigo mismo, rompiendo la deduplicación de D2).
 fn price_field(value: Option<&Value>) -> Option<f64> {
     match value {
-        Some(Value::Number(number)) => number.as_f64(),
-        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        Some(Value::Number(number)) => number.as_f64().filter(|v| v.is_finite()),
+        Some(Value::String(text)) => text.trim().parse::<f64>().ok().filter(|v| v.is_finite()),
         _ => None,
     }
 }
@@ -2525,6 +2537,33 @@ route:
         paid_entry(id, pin, pout, 8_000)
     }
 
+    /// Modelo con precios crudos como `Value` (número o cadena, válido o no).
+    fn raw_priced(id: &str, prompt: Value, completion: Value) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(8_000),
+            pricing: Some(Pricing {
+                prompt: Some(prompt),
+                completion: Some(completion),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Modelo presente en el catálogo sin campo `pricing`.
+    fn unpriced_entry(id: &str) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(8_000),
+            pricing: None,
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
     /// Transición `new`: la primera observación da de alta el modelo con sus
     /// precios normalizados a USD/Mtok y sin precios previos.
     #[test]
@@ -2717,6 +2756,131 @@ route:
         assert!(json["blend"].is_null());
         assert!(json["prev_pin"].is_number());
         assert!(json["prev_pout"].is_number());
+    }
+
+    /// Un modelo presente cuyo precio deja de ser parseable (`pricing`
+    /// ausente, campo no numérico o cadena no numérica) NO emite `removed`:
+    /// «desconocido» no es «gratis» (D2). El último snapshot conocido se
+    /// retiene hasta que vuelva un precio legible.
+    #[test]
+    fn catalog_tracker_retains_snapshot_when_price_becomes_unparseable() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[unpriced_entry("acme/flash-a")]);
+
+        assert!(
+            events.is_empty(),
+            "un precio ilegible no es una baja ni un alta: {events:?}"
+        );
+
+        // El snapshot se retiene: al volver el precio idéntico no reemite.
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        assert!(
+            events.is_empty(),
+            "el precio reaparecido idéntico no reemite: {events:?}"
+        );
+    }
+
+    /// Al reaparecer un precio parseable tras uno ilegible se emite el cambio
+    /// real (`price_up`/`price_down`) con los precios previos retenidos, no un
+    /// `new` sin historial.
+    #[test]
+    fn catalog_tracker_emits_price_change_when_unparseable_price_reappears() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        tracker.observe(&[unpriced_entry("acme/flash-a")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.0000025")]);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "reaparece con cambio de precio: {events:?}"
+        );
+        assert_eq!(
+            events[0].change_kind,
+            CatalogChangeKind::PriceUp,
+            "no es un alta: el modelo seguía en el snapshot: {events:?}"
+        );
+        assert_price_close(events[0].pout.expect("pout nuevo"), 2.5);
+        assert_price_close(events[0].prev_pout.expect("pout previo"), 2.0);
+        assert_price_close(events[0].prev_pin.expect("pin previo"), 1.5);
+    }
+
+    /// Un precio como cadena no numérica se trata igual que uno ausente: sin
+    /// emisión y con el snapshot retenido.
+    #[test]
+    fn catalog_tracker_treats_non_numeric_string_price_as_unparseable() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[raw_priced(
+            "acme/flash-a",
+            json!("0.0000015"),
+            json!("gratis"),
+        )]);
+
+        assert!(
+            events.is_empty(),
+            "una cadena no numérica no emite ni borra: {events:?}"
+        );
+    }
+
+    /// `NaN` e `inf` no son precios válidos: se tratan como no parseables para
+    /// no propagar un `blend` no finito que rompería la deduplicación (un
+    /// `blend` `NaN` no empata consigo mismo y emitiría en cada refresco).
+    #[test]
+    fn catalog_tracker_treats_nan_and_inf_price_as_unparseable() {
+        let tracker = PriceTracker::new();
+
+        let events =
+            tracker.observe(&[raw_priced("acme/flash-a", json!("NaN"), json!("0.000002"))]);
+        assert!(events.is_empty(), "NaN no es un precio: {events:?}");
+
+        let events =
+            tracker.observe(&[raw_priced("acme/flash-a", json!("inf"), json!("0.000002"))]);
+        assert!(events.is_empty(), "inf no es un precio: {events:?}");
+
+        // «Desconocido» no es «gratis»: sin precio finito conocido, la primera
+        // observación válida da de alta el modelo como `new`.
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        assert_eq!(
+            events.len(),
+            1,
+            "el primer precio finito da de alta: {events:?}"
+        );
+        assert_eq!(events[0].change_kind, CatalogChangeKind::New);
+    }
+
+    /// Desempate en `change_kind_of`: con `blend` idéntico (sube una pata y
+    /// baja la otra en la misma proporción) decide el lado del `pin`, en ambos
+    /// sentidos.
+    #[test]
+    fn change_kind_of_tie_breaks_equal_blend_by_pin() {
+        // 0.75·1.0 + 0.25·4.0 = 1.75 = 0.75·2.0 + 0.25·1.0 (blend empata).
+        let prev = TrackedPrice {
+            pin: 1.0,
+            pout: 4.0,
+            context_length: None,
+        };
+        assert_eq!(
+            change_kind_of(&prev, 2.0, 1.0),
+            CatalogChangeKind::PriceUp,
+            "empate de blend con pin al alza: price_up"
+        );
+
+        // Simetría: 0.75·2.0 + 0.25·1.0 = 1.75 = 0.75·1.0 + 0.25·4.0.
+        let prev = TrackedPrice {
+            pin: 2.0,
+            pout: 1.0,
+            context_length: None,
+        };
+        assert_eq!(
+            change_kind_of(&prev, 1.0, 4.0),
+            CatalogChangeKind::PriceDown,
+            "empate de blend con pin a la baja: price_down"
+        );
     }
 
     /// Capa que captura los campos de los logs `INFO` del hilo actual.
