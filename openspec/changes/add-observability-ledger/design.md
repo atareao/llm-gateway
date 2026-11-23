@@ -67,6 +67,7 @@ Bloque `observability` con `events: bool` (default `true`). Desactivarlo detiene
 - [Cardinalidad] → `model` como label acota a las ~500 series del catálogo; se prohíbe `request_id` en métricas.
 - [Coste de parseo/emisión en el hot path] → el parseo de `usage` es O(1) sobre un body ya leído; la emisión es un log (no bloqueante). En streaming el `include_usage` añade un chunk final mínimo.
 - [`usage` ausente (streaming sin soporte)] → tokens y coste desconocidos; el evento se emite igual con nulos, sin romper la respuesta al cliente.
+- [Emisión incompleta en streaming] → un aborto del cliente a mitad de stream descarta el body antes del fin real y **no emite** `gateway_requests`; un corte del upstream a mitad tampoco emite (el stream termina en error), o emite con datos parciales si el upstream cierra limpio pero incompleto. Mitigación: pérdida aceptada (uso personal); el evento nunca inventa ceros.
 - [Volumen de `requests`] → proporcional al tráfico; se mitiga con retención corta y con la denormalización (un evento por petición, sin eventos adicionales por intento).
 
 ## Migration Plan
