@@ -1050,9 +1050,12 @@ fn stream_response(response: reqwest::Response, backend_label: &str) -> Response
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let mut usage = StreamUsage::default();
     // Centinela de fin de stream (un `Bytes` vacío tras el último chunk) para
-    // procesar la línea parcial pendiente (EOF sin `\n` final). `hyper` no
-    // emite data frames vacíos en `bytes_stream`, así que no colisiona con
-    // chunks reales del upstream; y `finish` es idempotente por si acaso.
+    // procesar la línea parcial pendiente (EOF sin `\n` final). En HTTP/2 un
+    // DATA(0, END_STREAM) sí llega como chunk vacío en `bytes_stream` (igual
+    // que los frames vacíos intermedios); no colisiona con datos reales
+    // porque un chunk vacío no aporta bytes, `finish` es idempotente (sin
+    // línea pendiente no hace nada) y el `usage` solo se retiene con JSON
+    // válido.
     let body = Body::from_stream(
         response
             .bytes_stream()
