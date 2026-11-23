@@ -30,7 +30,7 @@
 
 ## 6. Configuración, documentación y verificación
 
-- [ ] 6.1 Añadir el bloque `observability` con `events: bool` (default `true`) en `src/config.rs`, con tests de parseo y de default
-- [ ] 6.2 Verificar con un test de integración que `observability.events: false` no emite ninguno de los tres eventos
-- [ ] 6.3 Crear `docs/observability-ledger.md` con los tres eventos, sus campos, la retención recomendada por evento (configurada en OpenObserve), el requisito de `usage` y consultas SQL de ejemplo (coste por modelo y día; evolución de precio de una familia)
-- [ ] 6.4 Verificación manual E2E: `curl -s http://127.0.0.1:4010/metrics | rg 'tokens_total|cost_usd'` y una consulta de coste por modelo y día en OpenObserve
+- [x] 6.1 Añadir el bloque `observability` con `events: bool` (default `true`) en `src/config.rs`, con tests de parseo y de default
+- [x] 6.2 Verificar con un test de integración que `observability.events: false` no emite ninguno de los tres eventos
+- [x] 6.3 Crear `docs/observability-ledger.md` con los tres eventos, sus campos, la retención recomendada por evento (configurada en OpenObserve), el requisito de `usage` y consultas SQL de ejemplo (coste por modelo y día; evolución de precio de una familia)
+- [x] 6.4 Verificación manual E2E: `curl -s http://127.0.0.1:4010/metrics | rg 'tokens_total|cost_usd'` y una consulta de coste por modelo y día en OpenObserve
