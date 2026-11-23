@@ -2,9 +2,9 @@
 
 ## 1. Parseo de `usage`
 
-- [ ] 1.1 Extraer `usage.prompt_tokens`/`usage.completion_tokens` del body en las respuestas no-stream de `src/proxy.rs`, con tests unitarios de respuesta con y sin `usage`
-- [ ] 1.2 Inyectar `stream_options.include_usage: true` en las peticiones con `stream: true` y leer el `usage` del chunk final, con un test que verifica la inyección y otro que lee el último chunk
-- [ ] 1.3 Definir la representación de tokens desconocidos (nulos) y verificar con un test que no se registra `0` cuando falta `usage`
+- [x] 1.1 Extraer `usage.prompt_tokens`/`usage.completion_tokens` del body en las respuestas no-stream de `src/proxy.rs`, con tests unitarios de respuesta con y sin `usage`
+- [x] 1.2 Inyectar `stream_options.include_usage: true` en las peticiones con `stream: true` y leer el `usage` del chunk final, con un test que verifica la inyección y otro que lee el último chunk
+- [x] 1.3 Definir la representación de tokens desconocidos (nulos) y verificar con un test que no se registra `0` cuando falta `usage`
 
 ## 2. Evento de catálogo (`gateway_catalog`)
 
