@@ -24,17 +24,17 @@
 
 ## 5. Respaldo de pago dinámico
 
-- [ ] 5.1 Añadir la variante `BackendKind::OpenrouterPaid` (serde `openrouter_paid`) en `src/config.rs`, reutilizando `base_url`, `api_key`, `profile` y `min_context`, con validación (base_url y api_key presentes, profile válido) y tests de parseo y de campo ausente
-- [ ] 5.2 Añadir en `Discovery` los campos `allow` (Vec<String>), `reselect_interval_ms` (default 14400000) y `min_price_delta` (default 0.20), con defaults, validación (`min_price_delta >= 0`, ningún patrón vacío) y tests de parseo, defaults y validación
-- [ ] 5.3 Implementar la elegibilidad de pago (allow + tool-calling + `pricing > 0` + `min_context` + excluir `:batch`) y el orden por `blend` ascendente en `src/classify.rs` (modo `Price` en `ClassifyContext` o `classify_paid` + helper `matches_allow`), con tests unitarios de filtrado, exclusión del free, orden y desempates (contexto desc, id asc)
-- [ ] 5.4 Hacer que la expansión resuelva un backend `openrouter_paid` reutilizando el catálogo cacheado y **sin rotación**, con failover en orden de precio, verificado con un test de que dos expansiones consecutivas devuelven el mismo primer candidato
-- [ ] 5.5 Implementar la selección pegajosa con histéresis en el `Registry` (estado por `(route, backend)`: modelo, instante de elección y precio), con tests de: mantener dentro de `reselect_interval_ms`, cambiar tras el intervalo con mejora ≥ `min_price_delta`, no cambiar con mejora marginal, cambio inmediato por fallo o baja del catálogo, y elección inicial tras reinicio
-- [ ] 5.6 Emitir un aviso (log) cuando un patrón de `allow` no tiene coincidencias en el catálogo, con un test que lo verifica sin elevar el nivel a error
-- [ ] 5.7 Verificar con un test que `allow` ausente o vacío hace que el backend de pago aporte cero candidatos y la ruta continúe con el siguiente backend
+- [x] 5.1 Añadir la variante `BackendKind::OpenrouterPaid` (serde `openrouter_paid`) en `src/config.rs`, reutilizando `base_url`, `api_key`, `profile` y `min_context`, con validación (base_url y api_key presentes, profile válido) y tests de parseo y de campo ausente
+- [x] 5.2 Añadir en `Discovery` los campos `allow` (Vec<String>), `reselect_interval_ms` (default 14400000) y `min_price_delta` (default 0.20), con defaults, validación (`min_price_delta >= 0`, ningún patrón vacío) y tests de parseo, defaults y validación
+- [x] 5.3 Implementar la elegibilidad de pago (allow + tool-calling + `pricing > 0` + `min_context` + excluir `:batch`) y el orden por `blend` ascendente en `src/classify.rs` (modo `Price` en `ClassifyContext` o `classify_paid` + helper `matches_allow`), con tests unitarios de filtrado, exclusión del free, orden y desempates (contexto desc, id asc)
+- [x] 5.4 Hacer que la expansión resuelva un backend `openrouter_paid` reutilizando el catálogo cacheado y **sin rotación**, con failover en orden de precio, verificado con un test de que dos expansiones consecutivas devuelven el mismo primer candidato
+- [x] 5.5 Implementar la selección pegajosa con histéresis en el `Registry` (estado por `(route, backend)`: modelo, instante de elección y precio), con tests de: mantener dentro de `reselect_interval_ms`, cambiar tras el intervalo con mejora ≥ `min_price_delta`, no cambiar con mejora marginal, cambio inmediato por fallo o baja del catálogo, y elección inicial tras reinicio
+- [x] 5.6 Emitir un aviso (log) cuando un patrón de `allow` no tiene coincidencias en el catálogo, con un test que lo verifica sin elevar el nivel a error
+- [x] 5.7 Verificar con un test que `allow` ausente o vacío hace que el backend de pago aporte cero candidatos y la ruta continúe con el siguiente backend
 
 ## 6. Ejemplo, documentación y verificación de integración
 
-- [ ] 6.1 Actualizar `gateway.yaml.example`: respaldo `kind: openrouter_paid` con `profile` en `architect`/`code`/`writer`, `discovery.allow` con la lista por defecto y un `kind: static` final; verificar con los tests de configuración que el ejemplo sigue cargando (`cargo test`)
-- [ ] 6.2 Documentar el gate, el sondeo, las métricas, `openrouter_paid`, la lista curada, la cadencia de selección y la histéresis en `docs/openrouter-free-routing.md`, y anotar los follow-ups en `docs/openrouter-free-followups.md`
-- [ ] 6.3 Test de integración: con cuota agotada simulada, la ruta `code` responde desde el backend de pago sin ningún intento free, el contador de saltos incrementa y el modelo servido es el más barato de la lista curada
+- [x] 6.1 Actualizar `gateway.yaml.example`: respaldo `kind: openrouter_paid` con `profile` en `architect`/`code`/`writer`, `discovery.allow` con la lista por defecto y un `kind: static` final; verificar con los tests de configuración que el ejemplo sigue cargando (`cargo test`)
+- [x] 6.2 Documentar el gate, el sondeo, las métricas, `openrouter_paid`, la lista curada, la cadencia de selección y la histéresis en `docs/openrouter-free-routing.md`, y anotar los follow-ups en `docs/openrouter-free-followups.md`
+- [x] 6.3 Test de integración: con cuota agotada simulada, la ruta `code` responde desde el backend de pago sin ningún intento free, el contador de saltos incrementa y el modelo servido es el más barato de la lista curada
 - [ ] 6.4 Verificación manual E2E: `curl -s http://127.0.0.1:4010/metrics | rg free_quota` y una inferencia real con `finish_reason: stop`

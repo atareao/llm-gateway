@@ -1,4 +1,4 @@
-//! Descubrimiento del catálogo free de OpenRouter.
+//! Descubrimiento del catálogo de OpenRouter (tier free y tier de pago).
 //!
 //! Un [`CatalogCache`] consulta `GET {base_url}/models` (endpoint público, sin
 //! autenticación), filtra los modelos **gratuitos** que además exponen
@@ -7,21 +7,28 @@
 //! si el TTL ha vencido se devuelve la copia existente y se dispara un refresco
 //! en segundo plano. Un fallo de red conserva la última caché válida.
 //!
+//! El mismo catálogo (una caché por `base_url`) sirve al tier de pago
+//! (`openrouter_paid`), que filtra por la lista curada `discovery.allow`, ordena
+//! por precio y mantiene el modelo elegido con histéresis (ver
+//! [`Registry::expand`]).
+//!
 //! El filtrado de elegibilidad se expone en [`eligible_models`] para que la
 //! clasificación por perfil ([`crate::classify`]) trabaje sobre modelos ya
 //! depurados.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::classify::{ClassifyContext, classify};
+use crate::classify::{
+    ClassifyContext, PaidContext, blend_price, classify, classify_paid, matches_allow,
+};
 use crate::config::{ClassifyOverrides, DEFAULT_REFRESH_INTERVAL_MS, GatewayConfig, Profile};
 use crate::metrics::Metrics;
 
@@ -31,6 +38,18 @@ use crate::metrics::Metrics;
 /// un upstream que acepta la conexión y no responde dejaría colgada la rama
 /// síncrona de [`CatalogCache::ensure`] (y el ticker de refresco).
 pub const CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout total de la consulta de cuota (`GET {base_url}/key`).
+pub const QUOTA_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cota máxima del gate global de cuota free (24 h).
+///
+/// Evita que un `X-RateLimit-Reset` absurdo deje el tier free bloqueado más de
+/// lo razonable; el daño máximo es servir pago durante el resto del día.
+pub const MAX_QUOTA_GATE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Milisegundos de un día (resolución del reset diario de OpenRouter).
+const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// Entrada del catálogo `GET /models` de OpenRouter.
 #[derive(Debug, Clone, Deserialize)]
@@ -166,6 +185,97 @@ pub async fn fetch_catalog(
         .await
         .map_err(DiscoveryError::Decode)?;
     Ok(body.data)
+}
+
+/// URL del endpoint de clave a partir de la `base_url` (que incluye `/v1`).
+pub fn key_url(base_url: &str) -> String {
+    format!("{}/key", base_url.trim_end_matches('/'))
+}
+
+/// Extrae `free_model_daily_requests.remaining` del cuerpo de `GET /key`.
+///
+/// Acepta el bloque en la raíz o anidado bajo `data`, y el valor como número o
+/// cadena. Un `remaining` negativo se normaliza a `0`.
+pub fn free_quota_remaining(body: &Value) -> Option<u64> {
+    let data = body.get("data").unwrap_or(body);
+    let remaining = data.get("free_model_daily_requests")?.get("remaining")?;
+    let value = match remaining {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }?;
+    Some(value.max(0) as u64)
+}
+
+/// Consulta `GET {base_url}/key` y devuelve la cuota free restante observada.
+///
+/// Si el cuerpo no expone `free_model_daily_requests.remaining`, devuelve
+/// `Ok(None)`. No consume cuota de modelos free.
+///
+/// # Errors
+/// Devuelve [`DiscoveryError`] si falla el transporte (incluido el timeout), el
+/// status no es exitoso o el cuerpo no decodifica.
+pub async fn fetch_free_quota(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<Option<u64>, DiscoveryError> {
+    let mut request = client.get(key_url(base_url)).timeout(timeout);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+
+    let response = request.send().await.map_err(DiscoveryError::Transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(DiscoveryError::Status(status.as_u16()));
+    }
+
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(DiscoveryError::Decode)?;
+    Ok(free_quota_remaining(&body))
+}
+
+/// Convierte un epoch UTC en milisegundos a un [`Instant`] futuro.
+///
+/// Devuelve `None` si el instante ya pasó: un reset en el pasado no debe abrir
+/// el gate.
+pub fn epoch_ms_to_instant(epoch_ms: u64) -> Option<Instant> {
+    let target = UNIX_EPOCH + Duration::from_millis(epoch_ms);
+    let delta = target.duration_since(SystemTime::now()).ok()?;
+    if delta.is_zero() {
+        return None;
+    }
+    Some(Instant::now() + delta)
+}
+
+/// Próximo `00:00 UTC` como [`Instant`].
+pub fn next_utc_midnight() -> Instant {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let delta = SECS_PER_DAY - (secs % SECS_PER_DAY);
+    Instant::now() + Duration::from_secs(delta)
+}
+
+/// Deadline T del gate de cuota free.
+///
+/// Usa `reset_epoch_ms` (epoch en ms) si es futuro; si falta, el siguiente
+/// `00:00 UTC`. Un reset en el pasado devuelve `None` (no abre el gate). El
+/// resultado se acota a [`MAX_QUOTA_GATE`].
+pub fn quota_deadline(reset_epoch_ms: Option<u64>) -> Option<Instant> {
+    let now = Instant::now();
+    let deadline = match reset_epoch_ms {
+        Some(ms) => epoch_ms_to_instant(ms)?,
+        None => next_utc_midnight(),
+    };
+    if deadline <= now {
+        return None;
+    }
+    Some(deadline.min(now + MAX_QUOTA_GATE))
 }
 
 /// Instantánea de la caché: catálogo y momento de captura.
@@ -448,6 +558,44 @@ fn purge_expired(entries: &mut HashMap<String, Instant>) {
     entries.retain(|_, until| *until > now);
 }
 
+/// `blend` de un modelo del catálogo por identificador (`0` si no está).
+///
+/// La clasificación de pago devuelve identificadores; el precio observado se
+/// recupera del catálogo cacheado en el momento de la elección.
+fn blend_of(catalog: &[ModelEntry], id: &str) -> f64 {
+    catalog
+        .iter()
+        .find(|model| model.id == id)
+        .and_then(|model| model.pricing.as_ref())
+        .map_or(0.0, blend_price)
+}
+
+/// Mejora relativa de `cheaper` frente al precio observado `current`.
+///
+/// Es la magnitud que se compara con `min_price_delta`: `0.20` exige que el
+/// candidato sea al menos un 20 % más barato. Sin precio de referencia positivo
+/// (un modelo sin precios no es elegible, pero la observación puede ser antigua),
+/// cualquier candidato más barato cuenta como mejora total.
+fn relative_price_improvement(current: f64, cheaper: f64) -> f64 {
+    if current > 0.0 {
+        (current - cheaper) / current
+    } else if cheaper < current {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Tier de un backend dinámico.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// Tier free (`openrouter_free`): sujeto al gate global de cuota diaria.
+    Free,
+    /// Tier de pago (`openrouter_paid`): lista curada, orden por precio y
+    /// selección pegajosa con histéresis.
+    Paid,
+}
+
 /// Backend dinámico registrado, con su estado de rotación.
 struct DynamicBackend {
     profile: Profile,
@@ -455,6 +603,16 @@ struct DynamicBackend {
     min_context: Option<u32>,
     cooldown: Duration,
     overrides: Option<ClassifyOverrides>,
+    /// Tier dinámico del backend.
+    tier: Tier,
+    /// `true` si respeta el gate global de cuota diaria.
+    respect_daily_quota: bool,
+    /// Lista curada de patrones glob (solo backends de pago).
+    allow: Vec<String>,
+    /// Cadencia mínima de reselección del modelo de pago.
+    reselect_interval: Duration,
+    /// Mejora relativa mínima de precio exigida para cambiar de modelo de pago.
+    min_price_delta: f64,
     rotation: AtomicUsize,
 }
 
@@ -470,18 +628,54 @@ impl DynamicBackend {
     }
 }
 
+/// Objetivo del sondeo de cuota: una `base_url` dinámica y su API key.
+struct QuotaTarget {
+    base_url: String,
+    api_key_env: Option<String>,
+    interval: Duration,
+}
+
+/// Selección pegajosa de un backend de pago.
+///
+/// Guarda el modelo elegido, el `blend` con el que se eligió y cuándo se eligió;
+/// el estado no persiste entre reinicios (arranca vacío).
+#[derive(Debug, Clone)]
+struct PaidSelection {
+    /// Identificador del modelo elegido.
+    model: String,
+    /// `blend` observado en el momento de la elección.
+    blend: f64,
+    /// Instante de la elección.
+    chosen_at: Instant,
+}
+
 /// Registro de cachés de catálogo, una por `base_url` dinámica.
 ///
 /// Agrupa el descubrimiento de todos los backends `openrouter_free` de la
 /// configuración en un único `/models` por `base_url` (los perfiles comparten
-/// catálogo) y mantiene la blacklist global y el estado de rotación.
+/// catálogo) y mantiene la blacklist global, el estado de rotación y el gate
+/// global de cuota diaria free.
 pub struct Registry {
+    client: reqwest::Client,
     catalogs: HashMap<String, Arc<CatalogCache>>,
     dynamic: Vec<DynamicBackend>,
     /// Posición en `dynamic` del backend dinámico `(route, backend)`.
     index: HashMap<(usize, usize), usize>,
     blacklist: Arc<Blacklist>,
     metrics: Arc<Metrics>,
+    /// Deadline del gate global de cuota free agotada; `None` si está cerrado.
+    free_quota_exhausted_until: RwLock<Option<Instant>>,
+    /// `true` si algún backend dinámico respeta la cuota diaria.
+    respect_daily_quota: bool,
+    /// Objetivos del sondeo proactivo, uno por `base_url` que respeta la cuota.
+    quota_targets: Vec<QuotaTarget>,
+    /// Selección pegajosa por `(route, backend)` de los backends de pago.
+    paid_selections: RwLock<HashMap<(usize, usize), PaidSelection>>,
+    /// Patrones de `allow` ya avisados como huérfanos, por `(base_url, patrón)`.
+    ///
+    /// Evita emitir el mismo aviso en cada expansión (hot path): un patrón solo
+    /// se avisa una vez hasta el siguiente reinicio.
+    warned_allow_patterns: Mutex<HashSet<(String, String)>>,
 }
 
 impl Registry {
@@ -490,6 +684,8 @@ impl Registry {
         let mut catalogs: HashMap<String, Arc<CatalogCache>> = HashMap::new();
         let mut dynamic = Vec::new();
         let mut index = HashMap::new();
+        let mut quota_targets: Vec<QuotaTarget> = Vec::new();
+        let mut respect_daily_quota = false;
 
         for (route_idx, route) in config.route.iter().enumerate() {
             for (backend_idx, backend) in route.backend.iter().enumerate() {
@@ -508,6 +704,36 @@ impl Registry {
                         Arc::clone(&metrics),
                     ))
                 });
+                let respect = backend.is_free_tier()
+                    && discovery.is_none_or(|discovery| discovery.respect_daily_quota);
+                if respect {
+                    respect_daily_quota = true;
+                    let interval = discovery.map_or(
+                        Duration::from_millis(crate::config::DEFAULT_QUOTA_POLL_INTERVAL_MS),
+                        |discovery| discovery.quota_poll_interval(),
+                    );
+                    match quota_targets
+                        .iter_mut()
+                        .find(|target| target.base_url == backend.base_url)
+                    {
+                        Some(existing) if existing.interval != interval => {
+                            // El sondeo es único por `base_url`: si dos backends
+                            // declaran intervalos distintos se toma el menor (el
+                            // más conservador) y se avisa. No es un error.
+                            existing.interval = existing.interval.min(interval);
+                            tracing::warn!(
+                                base_url = %backend.base_url,
+                                "quota_poll_interval_ms incoherente por base_url; se toma el menor"
+                            );
+                        }
+                        Some(_) => {}
+                        None => quota_targets.push(QuotaTarget {
+                            base_url: backend.base_url.clone(),
+                            api_key_env: backend.api_key_env.clone(),
+                            interval,
+                        }),
+                    }
+                }
                 index.insert((route_idx, backend_idx), dynamic.len());
                 dynamic.push(DynamicBackend {
                     profile: backend.profile(),
@@ -519,17 +745,40 @@ impl Registry {
                             crate::config::DEFAULT_BLACKLIST_COOLDOWN_MS,
                         )),
                     overrides: discovery.and_then(|discovery| discovery.overrides.clone()),
+                    tier: if backend.is_free_tier() {
+                        Tier::Free
+                    } else {
+                        Tier::Paid
+                    },
+                    respect_daily_quota: respect,
+                    allow: discovery
+                        .map(|discovery| discovery.allow.clone())
+                        .unwrap_or_default(),
+                    reselect_interval: discovery.map_or(
+                        Duration::from_millis(crate::config::DEFAULT_RESELECT_INTERVAL_MS),
+                        |discovery| discovery.reselect_interval(),
+                    ),
+                    min_price_delta: discovery
+                        .map_or(crate::config::DEFAULT_MIN_PRICE_DELTA, |discovery| {
+                            discovery.min_price_delta
+                        }),
                     rotation: AtomicUsize::new(0),
                 });
             }
         }
 
         Self {
+            client,
             catalogs,
             dynamic,
             index,
             blacklist: Arc::new(Blacklist::new(Arc::clone(&metrics))),
             metrics,
+            free_quota_exhausted_until: RwLock::new(None),
+            respect_daily_quota,
+            quota_targets,
+            paid_selections: RwLock::new(HashMap::new()),
+            warned_allow_patterns: Mutex::new(HashSet::new()),
         }
     }
 
@@ -541,6 +790,112 @@ impl Registry {
     /// Blacklist global compartida.
     pub fn blacklist(&self) -> &Arc<Blacklist> {
         &self.blacklist
+    }
+
+    /// `true` si algún backend dinámico respeta la cuota diaria free.
+    pub fn respect_daily_quota(&self) -> bool {
+        self.respect_daily_quota
+    }
+
+    /// Intervalo del objetivo de sondeo de `base_url` (solo tests).
+    #[cfg(test)]
+    fn quota_interval(&self, base_url: &str) -> Option<Duration> {
+        self.quota_targets
+            .iter()
+            .find(|target| target.base_url == base_url)
+            .map(|target| target.interval)
+    }
+
+    /// `true` si el backend free `(route, backend)` se saltará por el gate abierto.
+    ///
+    /// Exige que el backend respete la cuota, que exista catálogo para su
+    /// `base_url` (si no, no habría aportado candidatos de todos modos) y que el
+    /// gate esté abierto. Lo usa `expand_backends` para contar **un** salto por
+    /// petición y ruta, no uno por backend free.
+    pub fn free_quota_skip(&self, route: usize, backend: usize) -> bool {
+        let Some(entry) = self.dynamic(route, backend) else {
+            return false;
+        };
+        entry.tier == Tier::Free
+            && entry.respect_daily_quota
+            && self.catalogs.contains_key(&entry.base_url)
+            && self.quota_gate_open()
+    }
+
+    /// Abre el gate global de cuota free hasta `deadline`.
+    ///
+    /// No hace nada si ningún backend respeta la cuota o si `deadline` ya venció.
+    /// El deadline se acota a [`MAX_QUOTA_GATE`].
+    ///
+    /// Política deliberada de «conservar el deadline más lejano»: si el gate ya
+    /// está abierto, un `429` con un deadline anterior **no** lo acorta. Un mismo
+    /// agotamiento puede llegar por varias rutas y `base_url` con resets
+    /// ligeramente distintos; acortar por el primero en llegar cerraría el gate
+    /// antes de que la cuota se recupere de verdad, así que se conserva el
+    /// vencimiento más lejano. El sondeo es quien puede cerrarlo antes (ver
+    /// [`Registry::close_quota_gate`]).
+    pub fn open_quota_gate(&self, deadline: Instant) {
+        if !self.respect_daily_quota {
+            return;
+        }
+        let now = Instant::now();
+        if deadline <= now {
+            return;
+        }
+        let deadline = deadline.min(now + MAX_QUOTA_GATE);
+        let mut guard = self
+            .free_quota_exhausted_until
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none_or(|existing| existing < deadline) {
+            *guard = Some(deadline);
+        }
+    }
+
+    /// `true` si el gate de cuota free está abierto.
+    ///
+    /// El camino rápido (gate cerrado o deadline vigente) solo toma el lock de
+    /// **lectura**; únicamente cuando el deadline ha vencido se promueve a
+    /// escritura para purgarlo (doble comprobación).
+    pub fn quota_gate_open(&self) -> bool {
+        let now = Instant::now();
+        {
+            let guard = self
+                .free_quota_exhausted_until
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match *guard {
+                Some(deadline) if deadline > now => return true,
+                None => return false,
+                Some(_) => {}
+            }
+        }
+
+        let mut guard = self
+            .free_quota_exhausted_until
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *guard {
+            Some(deadline) if deadline > Instant::now() => true,
+            Some(_) => {
+                *guard = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Cierra el gate de cuota free si estaba abierto.
+    ///
+    /// Lo usa el sondeo: si vuelve a observar cuota disponible (`remaining > 0`)
+    /// —por ejemplo justo tras el reset a las 00:00 UTC— el gate debe cerrarse de
+    /// inmediato en lugar de bloquear el tier free hasta el deadline.
+    pub fn close_quota_gate(&self) {
+        let mut guard = self
+            .free_quota_exhausted_until
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = None;
     }
 
     /// Backend dinámico registrado en `(route, backend)`, si lo hay.
@@ -556,8 +911,13 @@ impl Registry {
     }
 
     /// Expande el backend dinámico `(route, backend)` a los modelos concretos
-    /// elegibles de su perfil, en orden de preferencia, excluyendo los modelos en
-    /// blacklist y aplicando rotación round-robin entre peticiones sucesivas.
+    /// elegibles, en orden de preferencia.
+    ///
+    /// En un backend `openrouter_free` son los modelos free clasificados para su
+    /// perfil, excluyendo los que están en blacklist y aplicando rotación
+    /// round-robin entre peticiones sucesivas. En un backend `openrouter_paid`
+    /// son los modelos de la lista curada ordenados por precio, con selección
+    /// pegajosa y sin rotación.
     ///
     /// Devuelve una lista vacía si el backend no es dinámico, no hay catálogo o
     /// el perfil no aporta candidatos.
@@ -565,6 +925,11 @@ impl Registry {
         let Some(entry) = self.dynamic(route, backend) else {
             return Vec::new();
         };
+        if entry.tier == Tier::Free && entry.respect_daily_quota && self.quota_gate_open() {
+            // El conteo del salto lo hace `expand_backends` una vez por petición y
+            // ruta; aquí `expand` se ejecuta una vez por backend.
+            return Vec::new();
+        }
         let Some(cache) = self.catalogs.get(&entry.base_url) else {
             return Vec::new();
         };
@@ -572,7 +937,15 @@ impl Registry {
             return Vec::new();
         };
 
-        let eligible = eligible_models(&catalog);
+        match entry.tier {
+            Tier::Free => self.expand_free(entry, &catalog),
+            Tier::Paid => self.expand_paid(route, backend, entry, &catalog),
+        }
+    }
+
+    /// Expansión del tier free: clasificación por perfil más rotación round-robin.
+    fn expand_free(&self, entry: &DynamicBackend, catalog: &[ModelEntry]) -> Vec<String> {
+        let eligible = eligible_models(catalog);
         let ordered = classify(&eligible, entry.classify_context());
         self.metrics
             .record_discovery_profile(&entry.base_url, entry.profile, ordered.len());
@@ -586,8 +959,118 @@ impl Registry {
         candidates
     }
 
+    /// Expansión del tier de pago: lista curada, orden por precio y selección
+    /// pegajosa con histéresis, sin rotación.
+    ///
+    /// Devuelve el modelo elegido al frente y el resto en orden de precio como
+    /// failover. Un modelo en blacklist o ausente del catálogo deja de ser
+    /// elegible y se cambia de inmediato al más barato disponible.
+    fn expand_paid(
+        &self,
+        route: usize,
+        backend: usize,
+        entry: &DynamicBackend,
+        catalog: &[ModelEntry],
+    ) -> Vec<String> {
+        self.warn_unmatched_allow(entry, catalog);
+
+        let context = PaidContext::new(entry.min_context, &entry.allow);
+        let candidates = self
+            .blacklist
+            .retain_eligible(&classify_paid(catalog, context));
+
+        let Some(cheapest) = candidates.first().cloned() else {
+            // Sin candidatos elegibles (lista curada vacía, sin coincidencias o
+            // todo en blacklist) no hay elección que conservar.
+            self.write_selections().remove(&(route, backend));
+            return Vec::new();
+        };
+
+        let mut selections = self.write_selections();
+        let sticky = selections.get(&(route, backend)).cloned();
+        let cheapest_blend = blend_of(catalog, &cheapest);
+
+        let chosen = match &sticky {
+            Some(selection) if selection.model != cheapest => {
+                let still_eligible = candidates.iter().any(|id| id == &selection.model);
+                let due = selection.chosen_at.elapsed() >= entry.reselect_interval;
+                let enough = relative_price_improvement(selection.blend, cheapest_blend)
+                    >= entry.min_price_delta;
+                if still_eligible && !(due && enough) {
+                    selection.model.clone()
+                } else {
+                    cheapest.clone()
+                }
+            }
+            _ => cheapest.clone(),
+        };
+
+        // El instante de elección solo se reinicia cuando cambia el modelo: el
+        // refresco de precios no debe reiniciar la histéresis.
+        let chosen_at = match &sticky {
+            Some(selection) if selection.model == chosen => selection.chosen_at,
+            _ => Instant::now(),
+        };
+        let observed = blend_of(catalog, &chosen);
+        selections.insert(
+            (route, backend),
+            PaidSelection {
+                model: chosen.clone(),
+                blend: observed,
+                chosen_at,
+            },
+        );
+        drop(selections);
+
+        // El elegido al frente; el resto, en orden de precio, es el failover.
+        let mut ordered: Vec<String> = candidates.into_iter().filter(|id| id != &chosen).collect();
+        ordered.insert(0, chosen);
+        ordered
+    }
+
+    /// Avisa de los patrones de `allow` sin ninguna coincidencia en el catálogo.
+    ///
+    /// Emite **un único** `tracing::warn!` por `(base_url, patrón)`: el par queda
+    /// registrado en `warned_allow_patterns` y no se vuelve a avisar en las
+    /// expansiones siguientes. Así la lista curada a medio migrar no inunda el log
+    /// en el hot path ni es un error de arranque.
+    fn warn_unmatched_allow(&self, entry: &DynamicBackend, catalog: &[ModelEntry]) {
+        if entry.allow.is_empty() {
+            return;
+        }
+        let mut warned = self
+            .warned_allow_patterns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for pattern in &entry.allow {
+            let matched = catalog
+                .iter()
+                .any(|model| matches_allow(&model.id, std::slice::from_ref(pattern)));
+            if !matched && warned.insert((entry.base_url.clone(), pattern.clone())) {
+                tracing::warn!(
+                    pattern = %pattern,
+                    base_url = %entry.base_url,
+                    "discovery.allow: patrón sin coincidencias en el catálogo"
+                );
+            }
+        }
+    }
+
+    /// Toma el lock de escritura de las selecciones de pago, ignorando un posible
+    /// envenenamiento.
+    fn write_selections(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<(usize, usize), PaidSelection>> {
+        self.paid_selections
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Identificadores de modelos dinámicos elegibles (para `/v1/models`),
     /// deduplicados, sin rotación ni filtrado por blacklist.
+    ///
+    /// Solo se anuncian los modelos del tier free: los ids de la lista curada de
+    /// pago no son enrutables como `model` de una petición.
     ///
     /// La deduplicación conserva el orden de primera aparición entre backends y
     /// entre llamadas con el mismo catálogo.
@@ -595,6 +1078,9 @@ impl Registry {
         let mut ids: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for entry in &self.dynamic {
+            if entry.tier != Tier::Free {
+                continue;
+            }
             let Some(cache) = self.catalogs.get(&entry.base_url) else {
                 continue;
             };
@@ -640,12 +1126,123 @@ impl Registry {
         }
         handles
     }
+
+    /// Lanza una tarea de sondeo de cuota free por `base_url` que respeta la
+    /// cuota, siguiendo el patrón de [`Registry::spawn_refresh`]: primer tick
+    /// inmediato y después cada `quota_poll_interval_ms`, con
+    /// [`MissedTickBehavior::Delay`].
+    ///
+    /// No lanza ninguna tarea si el gate está deshabilitado o no hay objetivos.
+    /// Un fallo del sondeo nunca altera el gate (stale-while-error).
+    pub fn spawn_quota_poll(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
+        let mut handles = Vec::new();
+        for target in &self.quota_targets {
+            if target.interval.is_zero() {
+                continue;
+            }
+            let this = Arc::clone(self);
+            let target = QuotaTarget {
+                base_url: target.base_url.clone(),
+                api_key_env: target.api_key_env.clone(),
+                interval: target.interval,
+            };
+            handles.push(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(target.interval);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    this.poll_quota_once(&target).await;
+                }
+            }));
+        }
+        handles
+    }
+
+    /// Ejecuta un ciclo de sondeo de cuota para `target`.
+    ///
+    /// Registra el gauge con el último `remaining` observado y abre el gate si
+    /// llega a `0` (deadline: siguiente `00:00 UTC`). Un fallo se registra pero
+    /// conserva el estado del gate.
+    async fn poll_quota_once(&self, target: &QuotaTarget) {
+        let Some(api_key) = resolve_poll_key(target.api_key_env.as_deref()) else {
+            return;
+        };
+        match fetch_free_quota(
+            &self.client,
+            &target.base_url,
+            api_key.as_deref(),
+            QUOTA_TIMEOUT,
+        )
+        .await
+        {
+            Ok(Some(remaining)) => {
+                self.metrics
+                    .record_free_quota_remaining(&target.base_url, remaining);
+                if remaining == 0 {
+                    if let Some(deadline) = quota_deadline(None) {
+                        self.open_quota_gate(deadline);
+                        tracing::warn!(
+                            base_url = %target.base_url,
+                            "cuota diaria free agotada (sondeo); gate abierto"
+                        );
+                    }
+                } else if self.quota_gate_open() {
+                    // La cuota volvió (p. ej. justo tras el reset a las 00:00 UTC):
+                    // se cierra el gate de inmediato en vez de esperar al deadline.
+                    self.close_quota_gate();
+                    tracing::info!(
+                        base_url = %target.base_url,
+                        remaining,
+                        "cuota diaria free recuperada (sondeo); gate cerrado"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    base_url = %target.base_url,
+                    "GET /key sin free_model_daily_requests; se conserva el estado"
+                );
+            }
+            Err(err) => {
+                // Stale-while-error: el fallo no altera el gate.
+                tracing::warn!(
+                    base_url = %target.base_url,
+                    error = %err,
+                    "sondeo de cuota free fallido; se conserva el estado"
+                );
+            }
+        }
+    }
+}
+
+/// Resuelve la API key del sondeo de cuota a partir de su variable de entorno.
+///
+/// - `None` → `Some(None)`: endpoint sin autenticación.
+/// - `Some(var)` definida y no vacía → `Some(Some(key))`.
+/// - `Some(var)` ausente o vacía → `None`: se omite el sondeo (el backend
+///   tampoco podría usarla).
+fn resolve_poll_key(api_key_env: Option<&str>) -> Option<Option<String>> {
+    match api_key_env {
+        None => Some(None),
+        Some(var) => match std::env::var(var) {
+            Ok(value) if !value.is_empty() => Some(Some(value)),
+            _ => {
+                tracing::debug!(env_var = %var, "api_key_env sin resolver; se omite el sondeo");
+                None
+            }
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry;
 
     fn entry(id: &str, params: &[&str], prompt: Value, completion: Value) -> ModelEntry {
         ModelEntry {
@@ -1013,6 +1610,599 @@ route:
             registry.cooldown(1, 1),
             None,
             "un slot estático no está registrado"
+        );
+    }
+
+    /// Milisegundos epoch UTC dentro de `delta` a partir de ahora.
+    fn epoch_ms_in(delta: Duration) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("reloj posterior a 1970");
+        u64::try_from((now + delta).as_millis()).expect("epoch en ms cabe en u64")
+    }
+
+    /// Config mínima con un backend dinámico sobre `base_url`, para el gate.
+    fn quota_config(base_url: &str) -> GatewayConfig {
+        let yaml = format!(
+            r#"
+route:
+  - name: quota-unit
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base_url}"
+        api_key_env: "OPENROUTER_API_KEY"
+"#
+        );
+        serde_saphyr::from_str(&yaml).expect("config de test válida")
+    }
+
+    #[test]
+    fn key_url_joins_slashes() {
+        assert_eq!(
+            key_url("https://openrouter.ai/api/v1"),
+            "https://openrouter.ai/api/v1/key"
+        );
+        assert_eq!(
+            key_url("https://openrouter.ai/api/v1/"),
+            "https://openrouter.ai/api/v1/key"
+        );
+    }
+
+    #[test]
+    fn free_quota_remaining_parses_nested_payload() {
+        let nested = json!({
+            "data": {"free_model_daily_requests": {"used": 1003, "limit": 1000, "remaining": 0}}
+        });
+        assert_eq!(free_quota_remaining(&nested), Some(0));
+
+        let top = json!({"free_model_daily_requests": {"remaining": "250"}});
+        assert_eq!(free_quota_remaining(&top), Some(250));
+
+        let missing = json!({"data": {"label": "sin cuota"}});
+        assert_eq!(free_quota_remaining(&missing), None);
+    }
+
+    #[test]
+    fn quota_deadline_falls_back_to_next_utc_midnight() {
+        let deadline = quota_deadline(None).expect("sin cabecera hay deadline");
+        let delta = deadline.saturating_duration_since(Instant::now()).as_secs();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("reloj posterior a 1970")
+            .as_secs();
+        let expected = 86_400 - (now_unix % 86_400);
+        assert!(
+            delta.abs_diff(expected) <= 1,
+            "el deadline debe ser el siguiente 00:00 UTC: delta={delta}s expected={expected}s"
+        );
+    }
+
+    #[test]
+    fn quota_deadline_uses_reset_epoch_ms() {
+        let deadline = quota_deadline(Some(epoch_ms_in(Duration::from_secs(6 * 3600))))
+            .expect("un reset futuro abre el gate");
+        let delta = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            delta > Duration::from_secs(6 * 3600 - 5) && delta < Duration::from_secs(6 * 3600 + 5),
+            "el deadline debe seguir el reset, got {delta:?}"
+        );
+    }
+
+    #[test]
+    fn quota_deadline_caps_at_24h() {
+        let deadline = quota_deadline(Some(epoch_ms_in(Duration::from_secs(10 * 24 * 3600))))
+            .expect("un reset futuro abre el gate");
+        let delta = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            delta <= MAX_QUOTA_GATE && delta > MAX_QUOTA_GATE - Duration::from_secs(5),
+            "el deadline debe acotarse a 24 h, got {delta:?}"
+        );
+    }
+
+    #[test]
+    fn quota_deadline_past_reset_is_none() {
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("reloj posterior a 1970")
+            .as_millis()
+            .saturating_sub(60_000);
+        let past = u64::try_from(past).expect("epoch en ms cabe en u64");
+        assert_eq!(
+            quota_deadline(Some(past)),
+            None,
+            "un reset en el pasado no abre el gate"
+        );
+    }
+
+    #[test]
+    fn quota_gate_opens_and_expires() {
+        let _guard = blacklist_gauge_guard();
+        let registry = Registry::new(
+            &quota_config("http://quota-gate.test/v1"),
+            reqwest::Client::new(),
+            metrics(),
+        );
+        assert!(!registry.quota_gate_open(), "el gate arranca cerrado");
+
+        registry.open_quota_gate(Instant::now() + Duration::from_millis(50));
+        assert!(registry.quota_gate_open(), "el gate debe abrirse");
+
+        std::thread::sleep(Duration::from_millis(90));
+        assert!(!registry.quota_gate_open(), "el gate debe expirar");
+    }
+
+    #[test]
+    fn quota_gate_stays_closed_when_respect_is_false() {
+        let _guard = blacklist_gauge_guard();
+        let base = "http://quota-disabled.test/v1";
+        let yaml = format!(
+            r#"
+route:
+  - name: quota-disabled-unit
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          respect_daily_quota: false
+"#
+        );
+        let config: GatewayConfig = serde_saphyr::from_str(&yaml).expect("config de test válida");
+        let registry = Registry::new(&config, reqwest::Client::new(), metrics());
+        assert!(!registry.respect_daily_quota());
+
+        registry.open_quota_gate(Instant::now() + Duration::from_secs(60));
+        assert!(!registry.quota_gate_open(), "el gate no debe abrirse");
+    }
+
+    #[tokio::test]
+    async fn expand_returns_zero_candidates_with_gate_open() {
+        let _guard = blacklist_gauge_guard();
+        let base = "http://quota-expand.test/v1";
+        let registry = Registry::new(&quota_config(base), reqwest::Client::new(), metrics());
+        registry
+            .catalog(base)
+            .expect("caché registrada")
+            .seed(vec![entry(
+                "dyn/aa:free",
+                &["tools", "tool_choice"],
+                json!("0"),
+                json!("0"),
+            )]);
+
+        assert_eq!(
+            registry.expand(0, 0).await.len(),
+            1,
+            "sin gate debe haber candidato"
+        );
+
+        registry.open_quota_gate(Instant::now() + Duration::from_millis(50));
+        assert!(
+            registry.expand(0, 0).await.is_empty(),
+            "con el gate abierto no debe haber candidatos free"
+        );
+
+        std::thread::sleep(Duration::from_millis(90));
+        assert_eq!(
+            registry.expand(0, 0).await.len(),
+            1,
+            "al expirar el gate el free vuelve a proponerse"
+        );
+    }
+
+    /// `base_url` del backend de pago de los tests.
+    const PAID_BASE: &str = "http://paid.test/v1";
+
+    /// Config mínima con un backend de pago sobre `base_url`.
+    fn paid_config(base_url: &str, discovery: &str) -> GatewayConfig {
+        let yaml = format!(
+            r#"
+route:
+  - name: paid-unit
+    backend:
+      - kind: openrouter_paid
+        profile: code
+        base_url: "{base_url}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+{discovery}
+"#
+        );
+        serde_saphyr::from_str(&yaml).expect("config de test válida")
+    }
+
+    /// Modelo de pago con precios, contexto y tool-calling explícitos.
+    fn paid_entry(id: &str, prompt: &str, completion: &str, context_length: u32) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(context_length),
+            pricing: Some(Pricing {
+                prompt: Some(json!(prompt)),
+                completion: Some(json!(completion)),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Bloque `discovery` (indentado) con la lista curada de los tests.
+    fn paid_discovery(extra: &str) -> String {
+        format!("          allow: [\"acme/flash-*\"]\n{extra}")
+    }
+
+    /// Registry con un backend de pago sobre `base_url` y su catálogo precargado.
+    fn paid_registry(base_url: &str, discovery: &str, models: Vec<ModelEntry>) -> Registry {
+        let registry = Registry::new(
+            &paid_config(base_url, discovery),
+            reqwest::Client::new(),
+            metrics(),
+        );
+        registry
+            .catalog(base_url)
+            .expect("caché del backend de pago")
+            .seed(models);
+        registry
+    }
+
+    /// Modelo de pago barato (`blend` 0.04).
+    fn paid_cheap() -> ModelEntry {
+        paid_entry("acme/flash-a", "0.04", "0.04", 8_000)
+    }
+
+    /// Modelo de pago caro (`blend` 0.1).
+    fn paid_expensive() -> ModelEntry {
+        paid_entry("acme/flash-b", "0.1", "0.1", 128_000)
+    }
+
+    /// Scenario 5.4: sin rotación, dos expansiones devuelven el mismo orden.
+    #[tokio::test]
+    async fn paid_expand_returns_the_same_order_on_consecutive_expansions() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+
+        let first = registry.expand(0, 0).await;
+        let second = registry.expand(0, 0).await;
+
+        assert_eq!(
+            first,
+            vec!["acme/flash-a".to_owned(), "acme/flash-b".to_owned()],
+            "orden por precio ascendente"
+        );
+        assert_eq!(
+            first, second,
+            "sin round-robin el primer candidato no cambia entre expansiones"
+        );
+    }
+
+    /// Scenario: Sin coincidencias con la lista curada el backend aporta cero
+    /// candidatos.
+    #[tokio::test]
+    async fn paid_expand_with_unmatched_pattern_returns_no_candidates() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            "          allow: [\"lab-inexistente/modelo-x\"]\n",
+            vec![paid_cheap()],
+        );
+
+        assert!(
+            registry.expand(0, 0).await.is_empty(),
+            "un patrón huérfano no aporta candidatos"
+        );
+    }
+
+    /// Scenario 5.7: sin `allow` el backend de pago aporta cero candidatos.
+    #[tokio::test]
+    async fn paid_expand_without_allow_returns_no_candidates() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            "          min_context: 1000\n",
+            vec![paid_cheap()],
+        );
+
+        assert!(
+            registry.expand(0, 0).await.is_empty(),
+            "sin lista curada no hay candidatos de pago"
+        );
+    }
+
+    /// Scenario: Tras reinicio elige el más barato (sin estado previo).
+    #[tokio::test]
+    async fn paid_selection_first_expansion_picks_cheapest() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order[0], "acme/flash-a",
+            "la primera expansión elige el modelo más barato de la lista curada"
+        );
+    }
+
+    /// Scenario: Mantiene el modelo dentro de `reselect_interval_ms` aunque el
+    /// catálogo refrescado traiga uno más barato.
+    #[tokio::test]
+    async fn paid_selection_keeps_sticky_model_within_interval() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        // Refresco del catálogo: `B` pasa a ser un 30 % más barato que `A`.
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_cheap(),
+                paid_entry("acme/flash-b", "0.028", "0.028", 128_000),
+            ]);
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order[0], "acme/flash-a",
+            "dentro del intervalo el modelo pegajoso se mantiene"
+        );
+        assert_eq!(
+            order[1], "acme/flash-b",
+            "el más barato queda como failover en orden de precio"
+        );
+    }
+
+    /// Scenario: cambia tras `reselect_interval_ms` si la mejora es suficiente.
+    #[tokio::test]
+    async fn paid_selection_switches_after_interval_with_enough_improvement() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 50\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_cheap(),
+                paid_entry("acme/flash-b", "0.028", "0.028", 128_000),
+            ]);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order[0], "acme/flash-b",
+            "pasado el intervalo, un 30 % más barato releva al pegajoso"
+        );
+        assert_eq!(order[1], "acme/flash-a");
+    }
+
+    /// Scenario: no cambia si la mejora es marginal (5 %).
+    #[tokio::test]
+    async fn paid_selection_keeps_sticky_on_marginal_improvement() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 50\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_cheap(),
+                paid_entry("acme/flash-b", "0.038", "0.038", 128_000),
+            ]);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order[0], "acme/flash-a",
+            "una mejora por debajo de min_price_delta no justifica cambiar"
+        );
+    }
+
+    /// Scenario: cambio inmediato si el pegajoso cae en blacklist.
+    #[tokio::test]
+    async fn paid_selection_switches_immediately_when_sticky_is_blacklisted() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .blacklist()
+            .mark("acme/flash-a", Duration::from_secs(60));
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order,
+            vec!["acme/flash-b".to_owned()],
+            "el pegajoso blacklisteado deja de ser elegible"
+        );
+    }
+
+    /// Scenario: cambio inmediato si el pegajoso desaparece del catálogo.
+    #[tokio::test]
+    async fn paid_selection_switches_immediately_when_sticky_disappears() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![paid_expensive()]);
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order,
+            vec!["acme/flash-b".to_owned()],
+            "si el pegajoso sale del catálogo se pasa de inmediato al más barato"
+        );
+    }
+
+    /// Capa mínima de `tracing` que acumula los eventos `WARN` como texto.
+    #[derive(Clone)]
+    struct WarnLayer {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for WarnLayer {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().level() != &Level::WARN {
+                return;
+            }
+            let mut visitor = WarnVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("lock captured warnings")
+                .push(visitor.fields.join(" "));
+        }
+    }
+
+    /// Visitante que serializa los campos del evento como `campo=valor`.
+    #[derive(Default)]
+    struct WarnVisitor {
+        fields: Vec<String>,
+    }
+
+    impl Visit for WarnVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+
+    /// Captura los avisos `WARN` solo para el hilo actual.
+    fn capture_warnings() -> (Arc<Mutex<Vec<String>>>, tracing::subscriber::DefaultGuard) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = registry().with(WarnLayer {
+            events: Arc::clone(&events),
+        });
+        (events, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Scenario 2: el aviso de un patrón huérfano se emite una sola vez por
+    /// `(base_url, patrón)`, no en cada expansión.
+    #[tokio::test]
+    async fn paid_expand_warns_once_per_unmatched_pattern() {
+        let _guard = blacklist_gauge_guard();
+        let (events, _capture) = capture_warnings();
+        let registry = paid_registry(
+            PAID_BASE,
+            "          allow: [\"lab-inexistente/modelo-x\", \"acme/flash-*\"]\n",
+            vec![paid_cheap()],
+        );
+
+        assert_eq!(
+            registry.expand(0, 0).await,
+            vec!["acme/flash-a".to_owned()],
+            "el patrón con coincidencias aporta su candidato"
+        );
+        let _ = registry.expand(0, 0).await;
+
+        let warnings = events.lock().expect("lock captured warnings").clone();
+        let unmatched: Vec<&String> = warnings
+            .iter()
+            .filter(|warning| warning.contains("lab-inexistente/modelo-x"))
+            .collect();
+        assert_eq!(
+            unmatched.len(),
+            1,
+            "un único aviso por patrón huérfano: {warnings:?}"
+        );
+        assert!(
+            unmatched[0].contains(PAID_BASE),
+            "el aviso debe incluir la base_url: {}",
+            unmatched[0]
+        );
+    }
+
+    /// Con todas las coincidencias no se emite ningún aviso.
+    #[tokio::test]
+    async fn paid_expand_does_not_warn_when_all_patterns_match() {
+        let _guard = blacklist_gauge_guard();
+        let (events, _capture) = capture_warnings();
+        let registry = paid_registry(PAID_BASE, &paid_discovery(""), vec![paid_cheap()]);
+
+        let order = registry.expand(0, 0).await;
+        let _ = registry.expand(0, 0).await;
+
+        assert_eq!(order, vec!["acme/flash-a".to_owned()]);
+        assert!(
+            events.lock().expect("lock captured warnings").is_empty(),
+            "sin patrones huérfanos no hay avisos"
+        );
+    }
+
+    /// Scenario 7: dos backends free con la misma `base_url` y distinto
+    /// `quota_poll_interval_ms` comparten un objetivo con el menor intervalo.
+    #[test]
+    fn quota_targets_dedupe_by_base_url_taking_min_interval() {
+        let _guard = blacklist_gauge_guard();
+        let base = "http://quota-dedupe.test/v1";
+        let yaml = format!(
+            r#"
+route:
+  - name: quota-dedupe-a
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          quota_poll_interval_ms: 5000
+  - name: quota-dedupe-b
+    backend:
+      - kind: openrouter_free
+        profile: writer
+        base_url: "{base}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          quota_poll_interval_ms: 1000
+"#
+        );
+        let config: GatewayConfig = serde_saphyr::from_str(&yaml).expect("config de test válida");
+        let registry = Registry::new(&config, reqwest::Client::new(), metrics());
+
+        assert_eq!(
+            registry.quota_interval(base),
+            Some(Duration::from_millis(1000)),
+            "la deduplicación por base_url debe conservar el menor intervalo"
         );
     }
 }

@@ -152,6 +152,8 @@ struct RouteMetrics {
     failover: Vec<KeyValue>,
     /// `[streaming]` → atributos `route`, `streaming`.
     duration: [Vec<KeyValue>; 2],
+    /// Atributos `route` del contador de saltos del tier free.
+    free_quota_skips: Vec<KeyValue>,
     backends: Vec<BackendMetrics>,
 }
 
@@ -178,6 +180,14 @@ pub struct Metrics {
     discovery_refresh: Counter<u64>,
     /// Tamaño actual de la blacklist global.
     discovery_blacklist: Gauge<u64>,
+    /// Cuota diaria free restante observada (por `base_url`).
+    ///
+    /// **No** se pre-registra: solo aparece cuando el sondeo ha observado un
+    /// valor, de modo que sin observación no se emite ninguna serie.
+    free_quota_remaining: Gauge<u64>,
+    /// Peticiones que saltaron el tier free por el gate de cuota abierto (por
+    /// `route`).
+    free_quota_skips: Counter<u64>,
     /// Último tamaño de blacklist publicado en el gauge. Arranca en 0, que es
     /// lo que deja el pre-registro de [`Metrics::new`]; así una blacklist vacía
     /// no reescribe el gauge en cada acceso.
@@ -316,6 +326,14 @@ impl Metrics {
             .u64_gauge("llm_gateway_discovery_blacklist")
             .with_description("Número de modelos en blacklist dinámica.")
             .build();
+        let free_quota_remaining = meter
+            .u64_gauge("llm_gateway_free_quota_remaining")
+            .with_description("Cuota diaria free restante observada por base_url.")
+            .build();
+        let free_quota_skips = meter
+            .u64_counter("llm_gateway_free_quota_skips")
+            .with_description("Peticiones que saltaron el tier free por el gate de cuota abierto.")
+            .build();
 
         let error_kinds = std::array::from_fn(|index| {
             vec![KeyValue::new("kind", GLOBAL_OUTCOMES[index].label())]
@@ -336,6 +354,7 @@ impl Metrics {
                 let failover = vec![KeyValue::new("route", route.name.clone())];
                 let duration =
                     std::array::from_fn(|streaming| duration_attrs(&route.name, streaming == 1));
+                let free_quota_skips = vec![KeyValue::new("route", route.name.clone())];
                 let backends = route
                     .backend
                     .iter()
@@ -374,6 +393,7 @@ impl Metrics {
                     requests,
                     failover,
                     duration,
+                    free_quota_skips,
                     backends,
                 }
             })
@@ -385,6 +405,7 @@ impl Metrics {
                 requests.add(0, attrs);
             }
             failover.add(0, &route.failover);
+            free_quota_skips.add(0, &route.free_quota_skips);
             for backend in &route.backends {
                 for attrs in &backend.attempts {
                     backend_attempts.add(0, attrs);
@@ -449,6 +470,8 @@ impl Metrics {
             discovery_profile,
             discovery_refresh,
             discovery_blacklist,
+            free_quota_remaining,
+            free_quota_skips,
             blacklist_size: AtomicUsize::new(0),
             #[cfg(test)]
             blacklist_size_updates: AtomicUsize::new(0),
@@ -530,6 +553,23 @@ impl Metrics {
     pub fn record_discovery_refresh(&self, base_url: &str, ok: bool) {
         self.discovery_refresh
             .add(1, &discovery_refresh_attrs(base_url, ok));
+    }
+
+    /// Fija la cuota diaria free restante observada para `base_url`.
+    ///
+    /// Es el único punto que emite la serie `llm_gateway_free_quota_remaining`:
+    /// sin observación (sondeo deshabilitado o sin `free_model_daily_requests`)
+    /// no se publica ninguna serie.
+    pub fn record_free_quota_remaining(&self, base_url: &str, remaining: u64) {
+        self.free_quota_remaining
+            .record(remaining, &discovery_attrs(base_url));
+    }
+
+    /// Registra que la ruta `route` saltó el tier free por el gate abierto.
+    pub fn record_free_quota_skip(&self, route: usize) {
+        if let Some(route) = self.routes.get(route) {
+            self.free_quota_skips.add(1, &route.free_quota_skips);
+        }
     }
 
     /// Fija el tamaño actual de la blacklist dinámica.
@@ -952,12 +992,25 @@ mod tests {
                         blacklist_cooldown_ms: 60_000,
                         min_context: None,
                         overrides: None,
+                        respect_daily_quota: true,
+                        quota_poll_interval_ms: 60_000,
+                        allow: Vec::new(),
+                        reselect_interval_ms: 14_400_000,
+                        min_price_delta: 0.20,
                     }),
                     warmup: None,
                 }],
             }],
             observability: None,
         }
+    }
+
+    /// Config con un backend dinámico y una ruta propia, para aislar las series
+    /// de cuota del resto de tests (el registro Prometheus es global).
+    fn quota_metrics_config(base_url: &str) -> GatewayConfig {
+        let mut config = dynamic_config(base_url);
+        config.route[0].name = "free-quota-metrics".to_owned();
+        config
     }
 
     /// Línea de la serie `name` cuyo `base_url` es `base_url` (y opcionalmente
@@ -1068,5 +1121,30 @@ mod tests {
             .find(|line| line.starts_with("llm_gateway_discovery_blacklist"))
             .expect("serie de blacklist");
         assert_eq!(value(blacklist), "4", "tamaño de blacklist:\n{text}");
+    }
+
+    /// Scenario: el gauge de cuota y el contador de saltos se emiten.
+    #[test]
+    fn free_quota_gauge_and_skips_counter_are_recorded() {
+        let _guard = BlacklistGaugeGuard::lock();
+        let base = "http://free-quota-metrics.invalid/v1";
+        let metrics = Metrics::new(&quota_metrics_config(base));
+
+        metrics.record_free_quota_remaining(base, 250);
+        metrics.record_free_quota_skip(0);
+
+        let text = metrics.render();
+
+        let gauge = discovery_line(&text, "llm_gateway_free_quota_remaining", base, None)
+            .expect("serie del gauge de cuota");
+        assert_eq!(value(gauge), "250", "gauge de cuota:\n{text}");
+
+        let skips = line_for(
+            &text,
+            "llm_gateway_free_quota_skips_total",
+            "free-quota-metrics",
+        )
+        .expect("serie del contador de saltos");
+        assert_eq!(value(skips), "1", "contador de saltos:\n{text}");
     }
 }

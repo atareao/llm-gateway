@@ -7,8 +7,10 @@
 
 use std::collections::HashSet;
 
+use serde_json::Value;
+
 use crate::config::{ClassifyOverrides, Profile};
-use crate::discovery::ModelEntry;
+use crate::discovery::{ModelEntry, Pricing, supports_tool_calling};
 
 /// Contexto de clasificación: perfil, filtros y procedencia del catálogo.
 ///
@@ -96,6 +98,138 @@ pub fn classify(models: &[ModelEntry], context: ClassifyContext<'_>) -> Vec<Stri
     }
 
     ordered
+}
+
+/// Contexto de clasificación de un backend de pago (`openrouter_paid`).
+///
+/// A diferencia de [`ClassifyContext`], no hay perfil ni `overrides`: la
+/// curación la decide la lista `allow` y el orden lo decide el precio.
+#[derive(Debug, Clone, Copy)]
+pub struct PaidContext<'a> {
+    /// Contexto mínimo (en tokens) exigido a los modelos elegibles.
+    pub min_context: Option<u32>,
+    /// Patrones glob (`*` = cero o más caracteres) sobre el `model_id`.
+    pub allow: &'a [String],
+}
+
+impl<'a> PaidContext<'a> {
+    /// Construye el contexto de clasificación de pago.
+    pub const fn new(min_context: Option<u32>, allow: &'a [String]) -> Self {
+        Self { min_context, allow }
+    }
+}
+
+/// `true` si `model_id` coincide con alguno de los patrones de `allow`.
+///
+/// El comodín `*` coincide con cero o más caracteres; el resto de caracteres se
+/// comparan literalmente. Una lista vacía no coincide con nada.
+pub fn matches_allow(model_id: &str, allow: &[String]) -> bool {
+    allow.iter().any(|pattern| glob_matches(pattern, model_id))
+}
+
+/// Coincidencia glob con `*` (cero o más caracteres) sobre el identificador.
+///
+/// Dos punteros con retroceso al último `*` visto: sin asignaciones por carácter
+/// y sin expresiones regulares.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut p, mut t) = (0, 0);
+    let mut last_star: Option<usize> = None;
+    let mut resume = 0;
+
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            last_star = Some(p);
+            resume = t;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == text[t] {
+            p += 1;
+            t += 1;
+        } else if let Some(star) = last_star {
+            p = star + 1;
+            resume += 1;
+            t = resume;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
+/// Precio de referencia de un modelo: `blend = 0.75 · prompt + 0.25 · completion`.
+///
+/// Un precio ausente o no numérico cuenta como `0`, igual que en el catálogo: un
+/// modelo sin precios obtiene `blend = 0` y queda fuera de la elegibilidad por la
+/// regla de precio estrictamente positivo.
+pub fn blend_price(pricing: &Pricing) -> f64 {
+    /// Peso del precio de prompt en el `blend`.
+    const PROMPT_WEIGHT: f64 = 0.75;
+    /// Peso del precio de completion en el `blend`.
+    const COMPLETION_WEIGHT: f64 = 0.25;
+
+    PROMPT_WEIGHT * price_value(pricing.prompt.as_ref())
+        + COMPLETION_WEIGHT * price_value(pricing.completion.as_ref())
+}
+
+/// Parsea el precio de un campo del catálogo (`0` si falta o no es numérico).
+fn price_value(value: Option<&Value>) -> f64 {
+    match value {
+        Some(Value::Number(number)) => number.as_f64().unwrap_or(0.0),
+        Some(Value::String(text)) => text.trim().parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Clasifica `models` como candidatos de pago según el `context`.
+///
+/// Un modelo es elegible si coincide con algún patrón de `allow`, soporta
+/// tool-calling, tiene precio estrictamente positivo (lo que excluye el tier
+/// free), supera `min_context` y no es un modelo `:batch`. El orden es por
+/// [`blend_price`] ascendente, con desempate por `context_length` descendente y
+/// `id` ascendente.
+///
+/// El aviso por patrones de `allow` sin coincidencias no vive aquí: lo emite
+/// [`crate::discovery::Registry`] una sola vez por `(base_url, patrón)`, fuera
+/// del camino por petición.
+pub fn classify_paid(models: &[ModelEntry], context: PaidContext<'_>) -> Vec<String> {
+    let mut scored: Vec<(f64, u32, &str)> = models
+        .iter()
+        .filter(|model| is_paid_eligible(model, context.min_context, context.allow))
+        .map(|model| {
+            (
+                model.pricing.as_ref().map_or(0.0, blend_price),
+                model.context_length.unwrap_or(0),
+                model.id.as_str(),
+            )
+        })
+        .collect();
+
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(b.2)));
+
+    scored.into_iter().map(|(_, _, id)| id.to_owned()).collect()
+}
+
+/// `true` si `model` es elegible en un backend de pago.
+fn is_paid_eligible(model: &ModelEntry, min_context: Option<u32>, allow: &[String]) -> bool {
+    matches_allow(&model.id, allow)
+        && supports_tool_calling(model)
+        && has_paid_pricing(model)
+        && min_context.is_none_or(|min| model.context_length.unwrap_or(0) >= min)
+        && !model.id.ends_with(":batch")
+}
+
+/// `true` si el modelo declara algún precio estrictamente positivo.
+///
+/// Es la regla que excluye el tier free: `prompt > 0` o `completion > 0`.
+fn has_paid_pricing(model: &ModelEntry) -> bool {
+    model.pricing.as_ref().is_some_and(|pricing| {
+        price_value(pricing.prompt.as_ref()) > 0.0 || price_value(pricing.completion.as_ref()) > 0.0
+    })
 }
 
 /// Identificadores excluidos por `overrides`.
@@ -208,7 +342,10 @@ fn is_coder(haystack: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClassifyContext, classify, ignored_includes};
+    use super::{
+        ClassifyContext, PaidContext, blend_price, classify, classify_paid, ignored_includes,
+        matches_allow,
+    };
     use crate::config::{ClassifyOverrides, Profile};
     use crate::discovery::{ModelEntry, Pricing};
     use serde_json::json;
@@ -466,23 +603,20 @@ mod tests {
         assert!(ignored_includes(&models, None, None).is_empty());
     }
 
-    /// Capa mínima de `tracing` que acumula los eventos `WARN` en texto plano.
+    /// Capa mínima de `tracing` que acumula los eventos con su nivel y sus campos.
     #[derive(Clone)]
     struct CaptureLayer {
-        events: Arc<Mutex<Vec<String>>>,
+        events: Arc<Mutex<Vec<(Level, String)>>>,
     }
 
     impl<S: Subscriber> Layer<S> for CaptureLayer {
         fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
-            if event.metadata().level() != &Level::WARN {
-                return;
-            }
             let mut visitor = TextVisitor::default();
             event.record(&mut visitor);
             self.events
                 .lock()
                 .expect("lock captured events")
-                .push(visitor.fields.join(" "));
+                .push((*event.metadata().level(), visitor.fields.join(" ")));
         }
     }
 
@@ -504,13 +638,30 @@ mod tests {
 
     /// Subscriber *scoped* (no global) y los eventos que capture.
     struct Capture {
-        events: Arc<Mutex<Vec<String>>>,
+        events: Arc<Mutex<Vec<(Level, String)>>>,
         _guard: tracing::subscriber::DefaultGuard,
     }
 
     impl Capture {
+        /// Campos de los eventos capturados en nivel `WARN`.
         fn warnings(&self) -> Vec<String> {
-            self.events.lock().expect("lock captured events").clone()
+            self.fields_at(Level::WARN)
+        }
+
+        /// Campos de los eventos capturados en nivel `ERROR`.
+        fn errors(&self) -> Vec<String> {
+            self.fields_at(Level::ERROR)
+        }
+
+        /// Campos de los eventos capturados en el nivel indicado.
+        fn fields_at(&self, level: Level) -> Vec<String> {
+            self.events
+                .lock()
+                .expect("lock captured events")
+                .iter()
+                .filter(|(event_level, _)| *event_level == level)
+                .map(|(_, fields)| fields.clone())
+                .collect()
         }
     }
 
@@ -617,6 +768,240 @@ mod tests {
             warnings.len(),
             1,
             "un aviso por identificador ignorado: {warnings:?}"
+        );
+    }
+
+    /// Lista curada de los tests (subconjunto de la lista por defecto).
+    fn curated() -> Vec<String> {
+        vec![
+            "z-ai/glm-5.*-flash".to_owned(),
+            "qwen/qwen3.7-flash".to_owned(),
+        ]
+    }
+
+    /// Modelo de pago con precios, contexto y tool-calling explícitos.
+    fn paid_model(id: &str, prompt: &str, completion: &str, context_length: u32) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(context_length),
+            pricing: Some(Pricing {
+                prompt: Some(json!(prompt)),
+                completion: Some(json!(completion)),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Clasifica modelos de pago con la lista curada y sin `min_context`.
+    fn classify_curated(models: &[ModelEntry]) -> Vec<String> {
+        let allow = curated();
+        classify_paid(models, PaidContext::new(None, &allow))
+    }
+
+    /// Scenario: El comodín absorbe versiones menores (y admite cero caracteres).
+    #[test]
+    fn matches_allow_handles_wildcards() {
+        let allow = curated();
+
+        assert!(
+            matches_allow("z-ai/glm-5.3-flash", &allow),
+            "el comodín debe cubrir la versión menor"
+        );
+        assert!(
+            matches_allow("qwen/qwen3.7-flash", &allow),
+            "un patrón sin comodines es un match literal"
+        );
+        assert!(
+            !matches_allow("z-ai/glm-5-flash", &allow),
+            "sin el punto que ancla el comodín no hay coincidencia"
+        );
+        assert!(
+            !matches_allow("qwen/qwen3.7-flash-pro", &allow),
+            "el patrón debe cubrir el identificador completo"
+        );
+
+        let trailing = vec!["deepseek/deepseek-v4.1-flash*".to_owned()];
+        assert!(
+            matches_allow("deepseek/deepseek-v4.1-flash", &trailing),
+            "el comodín final admite cero caracteres"
+        );
+        assert!(matches_allow(
+            "deepseek/deepseek-v4.1-flash-2026",
+            &trailing
+        ));
+
+        assert!(matches_allow("cualquiera/cosa", &["*".to_owned()]));
+        assert!(
+            !matches_allow("cualquiera/cosa", &[]),
+            "sin patrones no hay coincidencia posible"
+        );
+    }
+
+    /// El blend pondera 0.75 el prompt y 0.25 la completion.
+    #[test]
+    fn blend_price_weights_prompt_and_completion() {
+        let pricing = Pricing {
+            prompt: Some(json!("0.5")),
+            completion: Some(json!("0.25")),
+        };
+        assert_eq!(blend_price(&pricing), 0.4375);
+
+        let free = Pricing {
+            prompt: Some(json!("0")),
+            completion: Some(json!("0")),
+        };
+        assert_eq!(blend_price(&free), 0.0, "un modelo free tiene blend 0");
+
+        assert_eq!(
+            blend_price(&Pricing::default()),
+            0.0,
+            "un modelo sin precios tiene blend 0"
+        );
+    }
+
+    /// Scenario: Orden por precio ascendente.
+    #[test]
+    fn classify_paid_orders_by_blend_ascending() {
+        let models = vec![
+            paid_model("qwen/qwen3.7-flash", "0.25", "0.125", 1_000_000),
+            paid_model("z-ai/glm-5.3-flash", "0.0625", "0.03125", 131_072),
+        ];
+
+        let order = classify_curated(&models);
+
+        assert_eq!(
+            order,
+            vec!["z-ai/glm-5.3-flash", "qwen/qwen3.7-flash"],
+            "el modelo más barato va primero aunque tenga menos contexto"
+        );
+    }
+
+    /// Scenario: Excluye el tier free.
+    #[test]
+    fn classify_paid_excludes_free_models() {
+        let free_suffix = paid_model("qwen/qwen3.7-flash:free", "0", "0", 131_072);
+        let models = vec![
+            paid_model("z-ai/glm-5.3-flash", "0", "0", 131_072),
+            free_suffix,
+            paid_model("z-ai/glm-5.1-flash", "0.0625", "0", 131_072),
+        ];
+
+        let order = classify_curated(&models);
+
+        assert_eq!(
+            order,
+            vec!["z-ai/glm-5.1-flash"],
+            "solo entra el modelo con precio estrictamente positivo: {order:?}"
+        );
+    }
+
+    /// Scenario: Exige tool-calling y contexto mínimo.
+    #[test]
+    fn classify_paid_requires_tool_calling_and_min_context() {
+        let mut only_tools = paid_model("z-ai/glm-5.3-flash", "0.0625", "0.03125", 131_072);
+        only_tools.supported_parameters = Some(vec!["tools".to_owned()]);
+        let mut without_tools = paid_model("z-ai/glm-5.3-flash", "0.0625", "0.03125", 131_072);
+        without_tools.supported_parameters = Some(vec!["temperature".to_owned()]);
+        let too_small = paid_model("z-ai/glm-5.4-flash", "0.0625", "0.03125", 1_000);
+
+        let allow = curated();
+        let order = classify_paid(
+            &[only_tools, without_tools, too_small],
+            PaidContext::new(Some(32_768), &allow),
+        );
+        assert!(
+            order.is_empty(),
+            "sin tools+tool_choice o bajo min_context quedan fuera: {order:?}"
+        );
+
+        let boundary = paid_model("z-ai/glm-5.5-flash", "0.0625", "0.03125", 32_768);
+        let order = classify_paid(&[boundary], PaidContext::new(Some(32_768), &allow));
+        assert_eq!(
+            order,
+            vec!["z-ai/glm-5.5-flash"],
+            "justo en el umbral el modelo sigue siendo elegible"
+        );
+    }
+
+    /// Un modelo `:batch` queda excluido aunque algún patrón lo cubra.
+    #[test]
+    fn classify_paid_excludes_batch_models() {
+        let allow = vec!["z-ai/*".to_owned()];
+        let models = vec![
+            paid_model("z-ai/glm-5.3-flash", "0.0625", "0.03125", 131_072),
+            paid_model("z-ai/glm-5.3-flash:batch", "0.0625", "0.03125", 131_072),
+        ];
+
+        let order = classify_paid(&models, PaidContext::new(None, &allow));
+
+        assert_eq!(order, vec!["z-ai/glm-5.3-flash"]);
+    }
+
+    /// A igualdad de blend: mayor contexto primero y, a igualdad, `id` ascendente.
+    #[test]
+    fn classify_paid_ties_break_by_context_desc_then_id_asc() {
+        let allow = vec!["lab/*".to_owned()];
+        let models = vec![
+            paid_model("lab/small", "0.0625", "0.03125", 1_000),
+            paid_model("lab/big-b", "0.0625", "0.03125", 200_000),
+            paid_model("lab/big-a", "0.0625", "0.03125", 200_000),
+        ];
+
+        let order = classify_paid(&models, PaidContext::new(None, &allow));
+
+        assert_eq!(order, vec!["lab/big-a", "lab/big-b", "lab/small"]);
+    }
+
+    /// Sin lista curada el backend de pago no aporta candidatos.
+    #[test]
+    fn classify_paid_without_allow_yields_no_candidates() {
+        let models = vec![paid_model(
+            "z-ai/glm-5.3-flash",
+            "0.0625",
+            "0.03125",
+            131_072,
+        )];
+
+        assert!(
+            classify_paid(&models, PaidContext::new(None, &[])).is_empty(),
+            "sin `allow` no hay ningún modelo elegible"
+        );
+    }
+
+    /// `classify_paid` no emite avisos: el aviso por patrón huérfano vive en el
+    /// `Registry`, una vez por `(base_url, patrón)` y fuera del hot path.
+    #[test]
+    fn classify_paid_does_not_warn_on_unmatched_patterns() {
+        let models = vec![paid_model(
+            "z-ai/glm-5.3-flash",
+            "0.0625",
+            "0.03125",
+            131_072,
+        )];
+        let allow = vec![
+            "lab-inexistente/modelo-x".to_owned(),
+            "z-ai/glm-5.*-flash".to_owned(),
+        ];
+        let capture = capture_warnings();
+
+        let order = classify_paid(&models, PaidContext::new(None, &allow));
+
+        assert_eq!(
+            order,
+            vec!["z-ai/glm-5.3-flash"],
+            "el patrón con coincidencias sigue aportando candidatos"
+        );
+        assert!(
+            capture.warnings().is_empty(),
+            "la clasificación no avisa; eso es responsabilidad del Registry: {:?}",
+            capture.warnings()
+        );
+        assert!(
+            capture.errors().is_empty(),
+            "un patrón sin coincidencias no es un error: {:?}",
+            capture.errors()
         );
     }
 }

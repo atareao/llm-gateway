@@ -31,12 +31,16 @@ route:
         model: "qwen/qwen3-8b"
         api_key_env: "OPENROUTER_API_KEY"
         timeout_ms: 30000
-  # Rutas dinámicas de modelos GRATUITOS de OpenRouter por perfil. El backend
-  # `kind: openrouter_free` descubre el catálogo free (GET /models), clasifica
-  # los modelos con tool-calling para el `profile` y los usa como cadena de
-  # candidatos con failover, rotación y blacklist. El `model` se ignora en los
-  # backends dinámicos. Detrás va un backend de PAGO como respaldo (sustituye
-  # los placeholders por modelos reales). Ver docs/openrouter-free-routing.md.
+  # Rutas dinámicas de modelos por perfil. El backend `kind: openrouter_free`
+  # descubre el catálogo free (GET /models), clasifica los modelos con
+  # tool-calling para el `profile` y los usa como cadena de candidatos con
+  # failover, rotación y blacklist. El `model` se ignora en los backends
+  # dinámicos. Cuando la cuota diaria free se agota (gate global), la ruta salta
+  # el tier free y sirve desde el backend `kind: openrouter_paid`, que comparte
+  # el catálogo y elige el modelo **más barato** de la lista curada
+  # `discovery.allow` (sin rotación y con selección pegajosa: el modelo no
+  # cambia a cada refresco del catálogo). El `static` final es el último recurso.
+  # Ver docs/openrouter-free-routing.md.
   - name: architect
     backend:
       - kind: openrouter_free
@@ -47,8 +51,30 @@ route:
           refresh_interval_ms: 300000
           blacklist_cooldown_ms: 60000
           min_context: 32768
-      - base_url: "https://openrouter.ai/api/v1"   # fallback de PAGO (razonamiento)
-        model: "<REEMPLAZA-modelo-pago-razonamiento>"
+      # Respaldo de PAGO dinámico: el más barato de la lista curada.
+      - kind: openrouter_paid
+        profile: architect
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          # Debe coincidir con el TTL del backend free que comparte `base_url`.
+          refresh_interval_ms: 300000
+          min_context: 32768
+          # Lista curada: patrones glob sobre el id (`*` = cero o más caracteres).
+          # Editable sin recompilar ni tocar el binario.
+          allow:
+            - "deepseek/deepseek-v4.1-flash*"
+            - "z-ai/glm-5.*-flash"
+            - "qwen/qwen3.7-flash"
+            - "tencent/hy4-flash"
+            - "inclusionai/ling-3.1-flash"
+            - "nvidia/nemotron-3.5-lightning"
+            - "minimax/minimax-m3.*-flash"
+          # Cadencia mínima de reselección (4 h) e histéresis de precio (20 %).
+          reselect_interval_ms: 14400000
+          min_price_delta: 0.20
+      - base_url: "https://openrouter.ai/api/v1"   # último recurso estático
+        model: "<REEMPLAZA-modelo-final>"
         api_key_env: "OPENROUTER_API_KEY"
   - name: code
     backend:
@@ -60,8 +86,26 @@ route:
           refresh_interval_ms: 300000
           blacklist_cooldown_ms: 60000
           min_context: 32768
-      - base_url: "https://openrouter.ai/api/v1"   # fallback de PAGO (coder)
-        model: "<REEMPLAZA-modelo-pago-coder>"
+      # Respaldo de PAGO dinámico: el más barato de la lista curada.
+      - kind: openrouter_paid
+        profile: code
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          refresh_interval_ms: 300000
+          min_context: 32768
+          allow:
+            - "deepseek/deepseek-v4.1-flash*"
+            - "z-ai/glm-5.*-flash"
+            - "qwen/qwen3.7-flash"
+            - "tencent/hy4-flash"
+            - "inclusionai/ling-3.1-flash"
+            - "nvidia/nemotron-3.5-lightning"
+            - "minimax/minimax-m3.*-flash"
+          reselect_interval_ms: 14400000
+          min_price_delta: 0.20
+      - base_url: "https://openrouter.ai/api/v1"   # último recurso estático
+        model: "<REEMPLAZA-modelo-final>"
         api_key_env: "OPENROUTER_API_KEY"
   - name: writer
     backend:
@@ -73,8 +117,26 @@ route:
           refresh_interval_ms: 300000
           blacklist_cooldown_ms: 60000
           min_context: 32768
-      - base_url: "https://openrouter.ai/api/v1"   # fallback de PAGO (prosa)
-        model: "<REEMPLAZA-modelo-pago-prosa>"
+      # Respaldo de PAGO dinámico: el más barato de la lista curada.
+      - kind: openrouter_paid
+        profile: writer
+        base_url: "https://openrouter.ai/api/v1"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          refresh_interval_ms: 300000
+          min_context: 32768
+          allow:
+            - "deepseek/deepseek-v4.1-flash*"
+            - "z-ai/glm-5.*-flash"
+            - "qwen/qwen3.7-flash"
+            - "tencent/hy4-flash"
+            - "inclusionai/ling-3.1-flash"
+            - "nvidia/nemotron-3.5-lightning"
+            - "minimax/minimax-m3.*-flash"
+          reselect_interval_ms: 14400000
+          min_price_delta: 0.20
+      - base_url: "https://openrouter.ai/api/v1"   # último recurso estático
+        model: "<REEMPLAZA-modelo-final>"
         api_key_env: "OPENROUTER_API_KEY"
 
 # Observabilidad (opcional). Ausente → el gateway no exporta nada por OTLP y

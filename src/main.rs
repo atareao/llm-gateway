@@ -34,6 +34,8 @@ async fn main() -> Result<()> {
     let warmup_handles = llm_gateway_rs::warmup::spawn_warmup(state.clone());
     // Refresco en segundo plano del catálogo dinámico (patrón de `warmup`).
     let discovery_handles = state.discovery.spawn_refresh();
+    // Sondeo proactivo de la cuota diaria free (patrón de `spawn_refresh`).
+    let quota_handles = state.discovery.spawn_quota_poll();
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -55,9 +57,12 @@ async fn main() -> Result<()> {
     for handle in &discovery_handles {
         handle.abort();
     }
+    for handle in &quota_handles {
+        handle.abort();
+    }
     telemetry.flush();
     tracing::info!(
-        tasks = warmup_handles.len() + discovery_handles.len(),
+        tasks = warmup_handles.len() + discovery_handles.len() + quota_handles.len(),
         "cierre ordenado completado"
     );
 

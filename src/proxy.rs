@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-use crate::config::{Backend, GatewayConfig, Route};
+use crate::config::{Backend, BackendKind, GatewayConfig, Route};
 use crate::discovery::Registry;
 use crate::error::AppError;
 use crate::metrics::{AttemptResult, GlobalOutcome, Metrics, Outcome};
@@ -74,6 +74,29 @@ const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Un `Retry-After` en formato fecha puede apuntar a años vista; sin cota, un
 /// único `429`/`5xx` con una fecha lejana blacklistearía el modelo durante años.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Horizonte de reset que convierte un `429` en agotamiento **diario**.
+///
+/// La heurística de cabeceras (`X-RateLimit-Remaining: 0`) solo abre el gate si
+/// el reset está a más de cinco minutos vista: un `429` de minuto trae un reset
+/// cercano y no debe bloquear el free todo el día.
+const QUOTA_RESET_HORIZON: Duration = Duration::from_secs(5 * 60);
+
+/// Nombre de `error.metadata.limit_source` que identifica la cuota diaria free.
+const DAILY_LIMIT_SOURCE: &str = "openrouter_free_tier_daily";
+
+/// Tope del cuerpo de un `429` inspeccionado buscando `limit_source`.
+const QUOTA_BODY_LIMIT: usize = 64 * 1024;
+
+/// Señal de cuota deducida del cuerpo de una respuesta `429`.
+enum QuotaSignal {
+    /// Cuota diaria free agotada (`limit_source` = diaria).
+    Daily,
+    /// Otro límite (`per_minute`, proveedor…) que no abre el gate.
+    Other,
+    /// Cuerpo ausente o sin metadatos: se decide por las cabeceras.
+    Unknown,
+}
 
 /// Fallo al contactar con un backend, antes de tener su respuesta.
 enum SendError {
@@ -287,6 +310,13 @@ struct Candidate {
     api_key_env: Option<String>,
     /// Cooldown de blacklist si el candidato procede de un backend dinámico.
     dynamic_cooldown: Option<Duration>,
+    /// `true` si el candidato procede de un backend del tier free
+    /// (`openrouter_free`); solo esos pueden abrir el gate de cuota diaria.
+    free_tier: bool,
+    /// `true` si el candidato respeta el gate global de cuota diaria
+    /// (`openrouter_free` con `discovery.respect_daily_quota`, por defecto `true`).
+    /// Un `429` diario solo abre el gate si el candidato lo respeta.
+    respect_daily_quota: bool,
 }
 
 impl Candidate {
@@ -309,6 +339,12 @@ impl Candidate {
             timeout_ms: backend.timeout_ms,
             api_key_env: backend.api_key_env.clone(),
             dynamic_cooldown: None,
+            free_tier: backend.kind == BackendKind::OpenrouterFree,
+            respect_daily_quota: backend.is_free_tier()
+                && backend
+                    .discovery
+                    .as_ref()
+                    .is_none_or(|discovery| discovery.respect_daily_quota),
         }
     }
 
@@ -340,8 +376,14 @@ impl Candidate {
 /// con [`Candidate::from_backend`].
 async fn expand_backends(state: &AppState, route_idx: usize, route: &Route) -> Vec<Candidate> {
     let mut candidates = Vec::new();
+    // El salto del tier free por el gate se cuenta una sola vez por petición y
+    // ruta, aunque haya varios backends free.
+    let mut free_skipped = false;
     for (slot, backend) in route.backend.iter().enumerate() {
         if backend.is_dynamic() {
+            if state.discovery.free_quota_skip(route_idx, slot) {
+                free_skipped = true;
+            }
             let cooldown = state.discovery.cooldown(route_idx, slot);
             // Un candidato ligero por modelo elegible.
             for model in state.discovery.expand(route_idx, slot).await {
@@ -354,6 +396,9 @@ async fn expand_backends(state: &AppState, route_idx: usize, route: &Route) -> V
         } else {
             candidates.push(Candidate::from_backend(slot, backend));
         }
+    }
+    if free_skipped {
+        state.metrics.record_free_quota_skip(route_idx);
     }
     candidates
 }
@@ -413,6 +458,114 @@ fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
             .duration_since(std::time::SystemTime::now())
             .unwrap_or(Duration::ZERO),
     )
+}
+
+/// Reset del límite de la respuesta (`X-RateLimit-Reset`, epoch en ms).
+fn quota_reset_epoch_ms(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("x-ratelimit-reset")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `true` si las cabeceras indican agotamiento **diario**: `X-RateLimit-Remaining`
+/// a cero **y** un reset a más de [`QUOTA_RESET_HORIZON`] vista.
+fn headers_show_daily_exhaustion(headers: &HeaderMap, reset_ms: Option<u64>) -> bool {
+    let remaining_zero = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        == Some(0.0);
+    if !remaining_zero {
+        return false;
+    }
+    reset_ms
+        .and_then(crate::discovery::epoch_ms_to_instant)
+        .is_some_and(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) > QUOTA_RESET_HORIZON
+        })
+}
+
+/// Señal de cuota deducida del cuerpo de la respuesta.
+///
+/// `limit_source` es autoritativo: `openrouter_free_tier_daily` abre el gate y
+/// cualquier otro valor (minuto, proveedor) lo deja cerrado, ignorando la
+/// heurística de cabeceras. Un `provider_code` presente también se considera
+/// «otro» límite. Sin metadatos, la señal es desconocida.
+fn quota_signal(body: Option<&Value>) -> QuotaSignal {
+    let Some(metadata) = body.and_then(|body| body.pointer("/error/metadata")) else {
+        return QuotaSignal::Unknown;
+    };
+    if let Some(source) = metadata.get("limit_source") {
+        let daily = source.as_str() == Some(DAILY_LIMIT_SOURCE);
+        return if daily {
+            QuotaSignal::Daily
+        } else {
+            QuotaSignal::Other
+        };
+    }
+    if metadata.get("provider_code").is_some() {
+        return QuotaSignal::Other;
+    }
+    QuotaSignal::Unknown
+}
+
+/// Lee el cuerpo de un `429` de forma acotada para buscar `limit_source`.
+///
+/// El cuerpo se descarta por encima de [`QUOTA_BODY_LIMIT`]. Se lee **fragmento
+/// a fragmento** (`chunk`) en vez de `bytes()` para no acumular entero un cuerpo
+/// sin `Content-Length` (chunked) antes de decidir: en cuanto la suma supera el
+/// límite se descarta, sin esperar al resto del cuerpo.
+async fn read_quota_body(mut response: reqwest::Response) -> Option<Value> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > QUOTA_BODY_LIMIT as u64)
+    {
+        return None;
+    }
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > QUOTA_BODY_LIMIT {
+                    return None;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+/// Detecta un `429` de cuota diaria free y abre el gate global.
+///
+/// Solo se invoca para respuestas `429` de un backend del tier free que ya se
+/// van a descartar (son reintentables), así que consumir su cuerpo es seguro.
+async fn detect_daily_quota(state: &AppState, response: reqwest::Response) {
+    let headers = response.headers().clone();
+    let reset_ms = quota_reset_epoch_ms(&headers);
+    let header_daily = headers_show_daily_exhaustion(&headers, reset_ms);
+    let body = read_quota_body(response).await;
+
+    let daily = match quota_signal(body.as_ref()) {
+        QuotaSignal::Daily => true,
+        QuotaSignal::Other => false,
+        QuotaSignal::Unknown => header_daily,
+    };
+    if !daily {
+        return;
+    }
+
+    let Some(deadline) = crate::discovery::quota_deadline(reset_ms) else {
+        return;
+    };
+    state.discovery.open_quota_gate(deadline);
+    tracing::warn!("429 de cuota diaria free; gate abierto hasta el reset");
 }
 
 /// Recorre la cadena de backends de `route` en orden hasta obtener una
@@ -500,6 +653,17 @@ async fn route_with_failover(
 
         match send_result {
             Ok(response) if is_retryable(response.status()) => {
+                let status = response.status();
+                // Un `429` del tier free puede indicar agotamiento diario: se
+                // inspecciona (cuerpo incluido) antes de descartar la respuesta.
+                // Solo si el backend respeta el gate de cuota diaria: un `429` de
+                // un backend con `respect_daily_quota: false` no debe abrirlo.
+                if candidate.free_tier
+                    && candidate.respect_daily_quota
+                    && status == StatusCode::TOO_MANY_REQUESTS
+                {
+                    detect_daily_quota(state, response).await;
+                }
                 state.metrics.record_attempt(
                     route_idx,
                     backend_idx,
@@ -508,7 +672,7 @@ async fn route_with_failover(
                 );
                 tracing::warn!(
                     backend = %candidate_id,
-                    status = %response.status(),
+                    status = %status,
                     result = AttemptResult::RetryableStatus.label(),
                     latency_ms = attempt_started.elapsed().as_millis() as u64,
                     "backend retornó un status reintentable; probando el siguiente"
@@ -1013,14 +1177,16 @@ async fn healthz() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Candidate, MAX_RETRY_AFTER, backend_id, chat_url, effective_cooldown,
-        expand_backends, parse_retry_after, request_requires_tool_call, response_has_tool_call,
+        AppState, Candidate, MAX_RETRY_AFTER, QUOTA_BODY_LIMIT, QuotaSignal, backend_id, chat_url,
+        effective_cooldown, expand_backends, headers_show_daily_exhaustion, parse_retry_after,
+        quota_reset_epoch_ms, quota_signal, read_quota_body, request_requires_tool_call,
+        response_has_tool_call,
     };
     use crate::config::{Backend, BackendKind, GatewayConfig};
     use crate::discovery::{ModelEntry, Pricing};
-    use axum::http::HeaderValue;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
     use serde_json::json;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     /// Modelo elegible (free + tool-calling) para precargar un catálogo.
     fn eligible_model(id: &str, context_length: u32) -> ModelEntry {
@@ -1350,5 +1516,263 @@ route:
         assert!(!response_has_tool_call(
             br#"{"choices":[{"message":{"content":"hola"}}]}"#
         ));
+    }
+
+    /// Milisegundos epoch UTC dentro de `delta` a partir de ahora.
+    fn epoch_ms_in(delta: Duration) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("reloj posterior a 1970");
+        u64::try_from((now + delta).as_millis()).expect("epoch en ms cabe en u64")
+    }
+
+    /// Scenario: `limit_source` distingue la cuota diaria del resto.
+    #[test]
+    fn quota_signal_reads_limit_source() {
+        let daily = json!({"error": {"metadata": {"limit_source": "openrouter_free_tier_daily"}}});
+        assert!(matches!(quota_signal(Some(&daily)), QuotaSignal::Daily));
+
+        let minute =
+            json!({"error": {"metadata": {"limit_source": "openrouter_free_tier_per_minute"}}});
+        assert!(matches!(quota_signal(Some(&minute)), QuotaSignal::Other));
+
+        let provider = json!({"error": {"metadata": {"provider_code": 429}}});
+        assert!(matches!(quota_signal(Some(&provider)), QuotaSignal::Other));
+
+        assert!(matches!(quota_signal(None), QuotaSignal::Unknown));
+        let plain = json!({"error": {"message": "boom"}});
+        assert!(matches!(quota_signal(Some(&plain)), QuotaSignal::Unknown));
+    }
+
+    /// Scenario: la heurística exige `Remaining: 0` y un reset a >5 min.
+    #[test]
+    fn header_heuristic_requires_zero_remaining_and_far_reset() {
+        let remaining = HeaderName::from_static("x-ratelimit-remaining");
+        let reset = HeaderName::from_static("x-ratelimit-reset");
+
+        let mut far = HeaderMap::new();
+        far.insert(remaining.clone(), HeaderValue::from_static("0"));
+        far.insert(
+            reset.clone(),
+            HeaderValue::from_str(&epoch_ms_in(Duration::from_secs(6 * 3600)).to_string())
+                .expect("valor de cabecera"),
+        );
+        assert!(
+            headers_show_daily_exhaustion(&far, quota_reset_epoch_ms(&far)),
+            "Remaining 0 con reset a 6 h debe abrir el gate"
+        );
+
+        let mut near = HeaderMap::new();
+        near.insert(remaining.clone(), HeaderValue::from_static("0"));
+        near.insert(
+            reset.clone(),
+            HeaderValue::from_str(&epoch_ms_in(Duration::from_secs(60)).to_string())
+                .expect("valor de cabecera"),
+        );
+        assert!(
+            !headers_show_daily_exhaustion(&near, quota_reset_epoch_ms(&near)),
+            "un reset a 1 min no es agotamiento diario"
+        );
+
+        let mut with_remaining = HeaderMap::new();
+        with_remaining.insert(remaining, HeaderValue::from_static("5"));
+        with_remaining.insert(
+            reset,
+            HeaderValue::from_str(&epoch_ms_in(Duration::from_secs(6 * 3600)).to_string())
+                .expect("valor de cabecera"),
+        );
+        assert!(
+            !headers_show_daily_exhaustion(&with_remaining, quota_reset_epoch_ms(&with_remaining)),
+            "con cuota restante > 0 no es agotamiento diario"
+        );
+    }
+
+    #[test]
+    fn quota_reset_epoch_ms_reads_header() {
+        let name = HeaderName::from_static("x-ratelimit-reset");
+        let mut headers = HeaderMap::new();
+        assert_eq!(quota_reset_epoch_ms(&headers), None);
+
+        headers.insert(name.clone(), HeaderValue::from_static("1700000000000"));
+        assert_eq!(quota_reset_epoch_ms(&headers), Some(1_700_000_000_000));
+
+        headers.insert(name, HeaderValue::from_static("nope"));
+        assert_eq!(quota_reset_epoch_ms(&headers), None);
+    }
+
+    /// Modelo de pago elegible (precio positivo + tool-calling) de un catálogo.
+    fn paid_model(id: &str, price: &str, context_length: u32) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(context_length),
+            pricing: Some(Pricing {
+                prompt: Some(json!(price)),
+                completion: Some(json!(price)),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Scenario 5.4: `expand_backends` expande un backend de pago en orden de
+    /// precio, sin rotación, y conserva el `static` final como último recurso.
+    #[tokio::test]
+    async fn expand_backends_expands_paid_backend_without_rotation() {
+        // El acceso a la blacklist toca el gauge global (sin etiquetas).
+        let _guard = crate::metrics::BlacklistGaugeGuard::lock();
+        let yaml = r#"
+route:
+  - name: paid-expand-test
+    backend:
+      - kind: openrouter_paid
+        base_url: "http://paid.test/v1"
+        api_key_env: "PAID_KEY"
+        timeout_ms: 4000
+        profile: code
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: 7000
+          allow: ["acme/flash-*"]
+      - base_url: "http://static.test/v1"
+        model: "local/final"
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        let state = AppState::new(config).expect("estado de test");
+        state
+            .discovery
+            .catalog("http://paid.test/v1")
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_model("acme/flash-b", "0.1", 128_000),
+                paid_model("acme/flash-a", "0.04", 8_000),
+            ]);
+
+        let route = &state.config.route[0];
+        let candidates = expand_backends(&state, 0, route).await;
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.model.as_str())
+                .collect::<Vec<_>>(),
+            ["acme/flash-a", "acme/flash-b", "local/final"],
+            "el de pago aporta sus modelos por precio y el estático cierra la ruta"
+        );
+        for candidate in &candidates[..2] {
+            assert_eq!(candidate.slot, 0, "mismo backend de pago");
+            assert_eq!(candidate.base_url, "http://paid.test/v1");
+            assert_eq!(candidate.timeout_ms, Some(4000), "timeout arrastrado");
+            assert_eq!(candidate.api_key_env.as_deref(), Some("PAID_KEY"));
+            assert_eq!(
+                candidate.dynamic_cooldown,
+                Some(Duration::from_millis(7000)),
+                "los fallos del modelo de pago también blacklistean"
+            );
+            assert!(
+                !candidate.free_tier,
+                "el respaldo de pago no pertenece al tier free"
+            );
+        }
+        assert_eq!(
+            candidates[2].slot, 1,
+            "el estático final es el siguiente backend"
+        );
+
+        let again = expand_backends(&state, 0, route).await;
+        assert_eq!(
+            again[0].model, "acme/flash-a",
+            "sin rotación el primer candidato es el mismo en expansiones sucesivas"
+        );
+    }
+
+    /// Scenario 5.7: sin `allow` el backend de pago no aporta candidatos y la
+    /// ruta continúa con el siguiente backend declarado.
+    #[tokio::test]
+    async fn expand_backends_paid_without_allow_ships_only_the_next_backend() {
+        let _guard = crate::metrics::BlacklistGaugeGuard::lock();
+        let yaml = r#"
+route:
+  - name: paid-no-allow-test
+    backend:
+      - kind: openrouter_paid
+        base_url: "http://paid.test/v1"
+        api_key_env: "PAID_KEY"
+        profile: code
+        discovery:
+          refresh_interval_ms: 300000
+          min_context: 1000
+      - base_url: "http://static.test/v1"
+        model: "local/final"
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        let state = AppState::new(config).expect("estado de test");
+        state
+            .discovery
+            .catalog("http://paid.test/v1")
+            .expect("caché del backend de pago")
+            .seed(vec![paid_model("acme/flash-a", "0.04", 8_000)]);
+
+        let route = &state.config.route[0];
+        let candidates = expand_backends(&state, 0, route).await;
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "sin lista curada el backend de pago aporta cero candidatos"
+        );
+        assert_eq!(candidates[0].model, "local/final");
+        assert_eq!(
+            candidates[0].slot, 1,
+            "la ruta sigue con el siguiente backend"
+        );
+    }
+
+    /// Scenario: el cuerpo de un `429` sin `Content-Length` (chunked) se lee de
+    /// forma acotada; un primer fragmento por encima del límite se descarta sin
+    /// esperar al resto del cuerpo.
+    #[tokio::test]
+    async fn read_quota_body_bounds_reads_of_chunked_bodies() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use futures_util::StreamExt as _;
+        use futures_util::stream;
+
+        // Primer fragmento válido como JSON pero más grande que el límite.
+        let first = format!(r#"{{"error":"{}"}}"#, "x".repeat(QUOTA_BODY_LIMIT + 4096));
+        let app = axum::Router::new().route(
+            "/big",
+            get(move || {
+                let first = first.clone();
+                async move {
+                    let head =
+                        stream::once(async move { Ok::<_, std::io::Error>(first.into_bytes()) });
+                    // El resto del cuerpo nunca llega: una lectura acotada no
+                    // debe esperarlo.
+                    Body::from_stream(head.chain(stream::pending()))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve test server") });
+
+        let response = reqwest::get(format!("http://{addr}/big"))
+            .await
+            .expect("GET /big");
+        assert!(
+            response.content_length().is_none(),
+            "el servidor de test debe responder sin Content-Length"
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_millis(500), read_quota_body(response))
+            .await
+            .expect("la lectura acotada no debe esperar al resto del cuerpo");
+        assert!(
+            outcome.is_none(),
+            "un cuerpo por encima del límite debe descartarse"
+        );
     }
 }
