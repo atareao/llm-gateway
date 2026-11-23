@@ -25,8 +25,8 @@
 
 ## 5. Métricas
 
-- [ ] 5.1 Añadir `llm_gateway_tokens_total{route,model,type}`, `llm_gateway_cost_usd_total{route,model}` y `llm_gateway_model_selection_total{route,reason}` en `src/metrics.rs`, con tests de incremento
-- [ ] 5.2 Añadir `llm_gateway_selected_model_price_usd{route,model,side}` y `llm_gateway_allowlist_price_usd{model}`, con tests de que reflejan el precio actual y de que no incluyen `request_id`
+- [x] 5.1 Añadir `llm_gateway_tokens_total{route,model,type}`, `llm_gateway_cost_usd_total{route,model}` y `llm_gateway_model_selection_total{route,reason}` en `src/metrics.rs`, con tests de incremento
+- [x] 5.2 Añadir `llm_gateway_selected_model_price_usd{route,model,side}` y `llm_gateway_allowlist_price_usd{model}`, con tests de que reflejan el precio actual y de que no incluyen `request_id`
 
 ## 6. Configuración, documentación y verificación
 
