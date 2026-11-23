@@ -1282,6 +1282,18 @@ impl Registry {
         &self.blacklist
     }
 
+    // --- Ledger de observabilidad (#39, Grupo 5): gauges de precio -----------
+
+    /// Publica los gauges de precio del ledger desde el snapshot **actual** del
+    /// catálogo de `base_url`: una serie de `llm_gateway_allowlist_price_usd`
+    /// por modelo de la lista curada con precio conocido y el
+    /// `llm_gateway_selected_model_price_usd` de la selección pegajosa de cada
+    /// backend de pago sobre esa `base_url`. RED (TDD): esqueleto.
+    pub(crate) fn publish_price_gauges(&self, base_url: &str) {
+        let _ = (self, base_url);
+        todo!("Grupo 5 (5.2): gauges de precio desde el snapshot del catálogo")
+    }
+
     /// `true` si algún backend dinámico respeta la cuota diaria free.
     pub fn respect_daily_quota(&self) -> bool {
         self.respect_daily_quota
@@ -3498,6 +3510,234 @@ route:
                 .count(),
             1,
             "un modelo elegido sin cambios no emite: {logs:?}"
+        );
+    }
+
+    // --- Grupo 5 (#39): métricas del ledger ----------------------------------
+
+    /// Línea de la serie `name` que contiene todos los pares `key="value"`.
+    fn ledger_line<'a>(text: &'a str, name: &str, pairs: &[(&str, &str)]) -> Option<&'a str> {
+        text.lines().find(|line| {
+            line.starts_with(name)
+                && pairs
+                    .iter()
+                    .all(|(key, expected)| line.contains(&format!(r#"{key}="{expected}""#)))
+        })
+    }
+
+    /// Valor de una línea de serie como `f64` (los precios van en USD/Mtok).
+    fn fnum(line: &str) -> f64 {
+        line.rsplit(' ')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(f64::NAN)
+    }
+
+    /// Registry de pago que comparte el `Metrics` con el test, para renderizar
+    /// las series que el wiring del ledger registra.
+    fn paid_registry_with_metrics(
+        base_url: &str,
+        discovery: &str,
+        models: Vec<ModelEntry>,
+    ) -> (Registry, Arc<Metrics>) {
+        let metrics = metrics();
+        let registry = Registry::new(
+            &paid_config(base_url, discovery),
+            reqwest::Client::new(),
+            Arc::clone(&metrics),
+        );
+        registry
+            .catalog(base_url)
+            .expect("caché del backend de pago")
+            .seed(models);
+        (registry, metrics)
+    }
+
+    /// Scenario «Contador de selecciones por motivo» y «Gauge del modelo
+    /// seleccionado»: un cambio de selección incrementa el contador por motivo
+    /// y fija el gauge con el precio del modelo elegido (USD/Mtok).
+    #[tokio::test]
+    async fn selection_change_records_counter_and_price_gauge() {
+        let _guard = blacklist_gauge_guard();
+        let (registry, metrics) = paid_registry_with_metrics(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+
+        // Primera expansión: selección inicial del más barato (0.04 USD/token).
+        registry.expand(0, 0).await;
+        let text = metrics.render();
+
+        let initial = ledger_line(
+            &text,
+            "llm_gateway_model_selection_total",
+            &[("route", "paid-unit"), ("reason", "initial")],
+        )
+        .unwrap_or_else(|| panic!("falta model_selection_total reason=initial:\n{text}"));
+        assert_eq!(fnum(initial), 1.0, "una selección inicial:\n{initial}");
+
+        let pin = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "paid-unit"),
+                ("model", "acme/flash-a"),
+                ("side", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta el gauge de precio side=prompt:\n{text}"));
+        assert_eq!(
+            fnum(pin),
+            40_000.0,
+            "0.04 USD/token son 40000 USD/Mtok:\n{pin}"
+        );
+
+        let pout = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "paid-unit"),
+                ("model", "acme/flash-a"),
+                ("side", "completion"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta el gauge de precio side=completion:\n{text}"));
+        assert_eq!(fnum(pout), 40_000.0, "precio de salida:\n{pout}");
+
+        // Failover: `A` cae en blacklist y se cambia al más barato disponible.
+        registry
+            .blacklist()
+            .mark("acme/flash-a", Duration::from_secs(60));
+        registry.expand(0, 0).await;
+        let text = metrics.render();
+
+        let failover = ledger_line(
+            &text,
+            "llm_gateway_model_selection_total",
+            &[("route", "paid-unit"), ("reason", "failover")],
+        )
+        .unwrap_or_else(|| panic!("falta model_selection_total reason=failover:\n{text}"));
+        assert_eq!(fnum(failover), 1.0, "un failover:\n{failover}");
+
+        let pin = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "paid-unit"),
+                ("model", "acme/flash-b"),
+                ("side", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("el gauge pasa al modelo de failover:\n{text}"));
+        assert_eq!(
+            fnum(pin),
+            100_000.0,
+            "0.1 USD/token son 100000 USD/Mtok:\n{pin}"
+        );
+    }
+
+    /// Scenario «Gauge de la lista curada» y «Gauge del modelo seleccionado»:
+    /// la publicación desde el snapshot del catálogo emite una serie por modelo
+    /// de la lista curada (blend ponderado) y refresca el precio del modelo
+    /// seleccionado aunque el elegido no cambie.
+    #[tokio::test]
+    async fn publish_price_gauges_reflects_catalog_snapshot() {
+        let _guard = blacklist_gauge_guard();
+        // `flash-a` con patas asimétricas para verificar la ponderación del
+        // blend: 0.75·40000 + 0.25·80000 = 50000 USD/Mtok.
+        let (registry, metrics) = paid_registry_with_metrics(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![
+                paid_entry("acme/flash-a", "0.04", "0.08", 8_000),
+                paid_entry("acme/flash-b", "0.1", "0.2", 128_000),
+            ],
+        );
+
+        registry.publish_price_gauges(PAID_BASE);
+        let text = metrics.render();
+
+        let series = text
+            .lines()
+            .filter(|line| line.starts_with("llm_gateway_allowlist_price_usd"))
+            .count();
+        assert_eq!(series, 2, "una serie por modelo curado:\n{text}");
+
+        let flash_a = ledger_line(
+            &text,
+            "llm_gateway_allowlist_price_usd",
+            &[("model", "acme/flash-a")],
+        )
+        .unwrap_or_else(|| panic!("falta la serie de flash-a:\n{text}"));
+        assert_eq!(
+            fnum(flash_a),
+            50_000.0,
+            "blend ponderado de flash-a:\n{flash_a}"
+        );
+
+        let flash_b = ledger_line(
+            &text,
+            "llm_gateway_allowlist_price_usd",
+            &[("model", "acme/flash-b")],
+        )
+        .unwrap_or_else(|| panic!("falta la serie de flash-b:\n{text}"));
+        assert_eq!(
+            fnum(flash_b),
+            125_000.0,
+            "blend ponderado de flash-b:\n{flash_b}"
+        );
+
+        // Sin selección previa no hay gauge de modelo seleccionado.
+        assert!(
+            ledger_line(
+                &text,
+                "llm_gateway_selected_model_price_usd",
+                &[("route", "paid-unit")],
+            )
+            .is_none(),
+            "sin selección no hay gauge del seleccionado:\n{text}"
+        );
+
+        // Con selección pegajosa, un cambio de precio del catálogo **sin cambio
+        // de selección** se refleja en el gauge al republicar el snapshot.
+        registry.expand(0, 0).await;
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_entry("acme/flash-a", "0.05", "0.08", 8_000),
+                paid_entry("acme/flash-b", "0.1", "0.2", 128_000),
+            ]);
+        registry.publish_price_gauges(PAID_BASE);
+        let text = metrics.render();
+
+        let pin = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "paid-unit"),
+                ("model", "acme/flash-a"),
+                ("side", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta el gauge del seleccionado:\n{text}"));
+        assert_eq!(
+            fnum(pin),
+            50_000.0,
+            "el precio nuevo del snapshot, sin cambio de selección:\n{pin}"
+        );
+
+        let allowlist = ledger_line(
+            &text,
+            "llm_gateway_allowlist_price_usd",
+            &[("model", "acme/flash-a")],
+        )
+        .expect("serie de la lista curada tras el refresco");
+        assert_eq!(
+            fnum(allowlist),
+            57_500.0,
+            "0.75·50000 + 0.25·80000 = 57500:\n{allowlist}"
         );
     }
 }

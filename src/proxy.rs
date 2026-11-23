@@ -1711,12 +1711,12 @@ async fn healthz() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Candidate, MAX_RETRY_AFTER, MAX_SSE_LINE_BYTES, QUOTA_BODY_LIMIT, QuotaSignal,
-        RequestEvent, RequestSink, StreamUsage, TokenUsage, backend_id, chat_url, cost_usd,
-        effective_cooldown, emit_request_event, expand_backends, headers_show_daily_exhaustion,
-        inject_include_usage, parse_body_ledger, parse_retry_after, parse_usage,
-        quota_reset_epoch_ms, quota_signal, read_quota_body, request_requires_tool_call,
-        response_has_tool_call, stream_response,
+        AppState, Candidate, MAX_RETRY_AFTER, MAX_SSE_LINE_BYTES, Metrics, QUOTA_BODY_LIMIT,
+        QuotaSignal, RequestEvent, RequestSink, StreamUsage, TokenUsage, backend_id, chat_url,
+        cost_usd, effective_cooldown, emit_request_event, expand_backends, handle_chat_completions,
+        headers_show_daily_exhaustion, inject_include_usage, parse_body_ledger, parse_retry_after,
+        parse_usage, quota_reset_epoch_ms, quota_signal, read_quota_body,
+        request_requires_tool_call, response_has_tool_call, stream_response,
     };
     use crate::config::{Backend, BackendKind, GatewayConfig};
     use crate::discovery::{ModelEntry, Pricing};
@@ -2961,5 +2961,238 @@ route:
             survived.is_ok(),
             "el fallo del exportador debe quedar aislado en el emisor"
         );
+    }
+
+    // --- Grupo 5 (#39): métricas de tokens y coste ---------------------------
+
+    /// `Metrics` de test: los instrumentos son globales, así que cualquier
+    /// instancia sirve de asa para registrar y renderizar; el aislamiento entre
+    /// tests lo dan las etiquetas `route`/`model` únicas de cada test.
+    fn ledger_metrics() -> Arc<Metrics> {
+        let yaml = r#"
+route:
+  - name: ledger-metrics-test
+    backend:
+      - base_url: "http://127.0.0.1:1/v1"
+        model: "m"
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        Arc::new(Metrics::new(&config))
+    }
+
+    /// Construye el receptor del evento `request` de una petición en streaming
+    /// con el `Metrics` que debe incrementar al fin real del stream.
+    fn ledger_sink(event: RequestEvent, metrics: Arc<Metrics>) -> RequestSink {
+        let _ = metrics;
+        RequestSink {
+            event,
+            started: Instant::now(),
+        }
+    }
+
+    /// Modelo de pago con precios asimétricos, para costar con `pin`/`pout`
+    /// distintos (en USD por token, como los trae el catálogo).
+    fn ledger_model(id: &str, prompt: &str, completion: &str) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(8_000),
+            pricing: Some(Pricing {
+                prompt: Some(json!(prompt)),
+                completion: Some(json!(completion)),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Línea de la serie `name` que contiene todos los pares `key="value"`.
+    fn ledger_line<'a>(text: &'a str, name: &str, pairs: &[(&str, &str)]) -> Option<&'a str> {
+        text.lines().find(|line| {
+            line.starts_with(name)
+                && pairs
+                    .iter()
+                    .all(|(key, expected)| line.contains(&format!(r#"{key}="{expected}""#)))
+        })
+    }
+
+    /// Valor de una línea de serie como `f64`.
+    fn fnum(line: &str) -> f64 {
+        line.rsplit(' ')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(f64::NAN)
+    }
+
+    /// Scenario «Tokens y coste incrementan» (wiring no-stream): una petición
+    /// atendida con `usage` y precios del catálogo incrementa
+    /// `llm_gateway_tokens_total` por `type` y `llm_gateway_cost_usd_total`
+    /// por ruta y modelo.
+    #[tokio::test]
+    async fn nonstream_success_records_tokens_and_cost_metrics() {
+        // Upstream mock: respuesta 2xx con usage de 1000 in / 200 out.
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "hola"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1000, "completion_tokens": 200},
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve test server") });
+
+        let yaml = format!(
+            r#"
+route:
+  - name: ledger-no-stream
+    backend:
+      - kind: openrouter_paid
+        base_url: "http://{addr}/v1"
+        profile: code
+        discovery:
+          refresh_interval_ms: 300000
+          allow: ["mock/*"]
+"#
+        );
+        let config: GatewayConfig = serde_saphyr::from_str(&yaml).expect("config de test válida");
+        let state = AppState::new(config).expect("estado de test");
+        // Precios 2/8 USD/Mtok (0.000002/0.000008 USD por token): coste
+        // 1000·2e-6 + 200·8e-6 = 0.0036 USD.
+        state
+            .discovery
+            .catalog(&format!("http://{addr}/v1"))
+            .expect("caché del backend de pago")
+            .seed(vec![ledger_model("mock/flash", "0.000002", "0.000008")]);
+        let metrics = Arc::clone(&state.metrics);
+
+        let body = Ok(axum::Json(json!({"model": "ledger-no-stream"})));
+        handle_chat_completions(
+            state,
+            body,
+            "req-ledger-nostream".to_owned(),
+            &tracing::Span::none(),
+        )
+        .await;
+
+        let text = metrics.render();
+        let prompt = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-no-stream"),
+                ("model", "mock/flash"),
+                ("type", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=prompt:\n{text}"));
+        assert_eq!(fnum(prompt), 1000.0, "tokens de entrada:\n{prompt}");
+
+        let completion = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-no-stream"),
+                ("model", "mock/flash"),
+                ("type", "completion"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=completion:\n{text}"));
+        assert_eq!(fnum(completion), 200.0, "tokens de salida:\n{completion}");
+
+        let cost = ledger_line(
+            &text,
+            "llm_gateway_cost_usd_total",
+            &[("route", "ledger-no-stream"), ("model", "mock/flash")],
+        )
+        .unwrap_or_else(|| panic!("falta cost_usd_total:\n{text}"));
+        assert_eq!(fnum(cost), 0.0036, "coste en USD:\n{cost}");
+    }
+
+    /// Scenario «Tokens y coste incrementan» (wiring streaming): el evento del
+    /// fin real del stream también alimenta los contadores del ledger.
+    #[tokio::test]
+    async fn stream_end_records_tokens_and_cost_metrics() {
+        let metrics = ledger_metrics();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hola\"},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":200}}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                    chunks,
+                )))
+                .expect("respuesta de test"),
+        );
+        let event = RequestEvent {
+            streaming: true,
+            route: "ledger-stream".to_owned(),
+            model_id: Some("acme/stream-m".to_owned()),
+            ..sample_event()
+        };
+        let response = stream_response(
+            response,
+            "static/test",
+            Some(ledger_sink(event, Arc::clone(&metrics))),
+        );
+
+        http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("cuerpo íntegro");
+
+        let text = metrics.render();
+        let prompt = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-stream"),
+                ("model", "acme/stream-m"),
+                ("type", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=prompt:\n{text}"));
+        assert_eq!(
+            fnum(prompt),
+            1000.0,
+            "tokens de entrada del stream:\n{prompt}"
+        );
+
+        let completion = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-stream"),
+                ("model", "acme/stream-m"),
+                ("type", "completion"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=completion:\n{text}"));
+        assert_eq!(
+            fnum(completion),
+            200.0,
+            "tokens de salida del stream:\n{completion}"
+        );
+
+        let cost = ledger_line(
+            &text,
+            "llm_gateway_cost_usd_total",
+            &[("route", "ledger-stream"), ("model", "acme/stream-m")],
+        )
+        .unwrap_or_else(|| panic!("falta cost_usd_total:\n{text}"));
+        assert_eq!(fnum(cost), 0.0036, "coste en USD del stream:\n{cost}");
     }
 }
