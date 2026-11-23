@@ -161,17 +161,17 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
     p == pattern.len()
 }
 
+/// Peso del precio de prompt en el `blend` (ver [`blend_price`]).
+pub(crate) const PROMPT_WEIGHT: f64 = 0.75;
+/// Peso del precio de completion en el `blend`.
+pub(crate) const COMPLETION_WEIGHT: f64 = 0.25;
+
 /// Precio de referencia de un modelo: `blend = 0.75 · prompt + 0.25 · completion`.
 ///
 /// Un precio ausente o no numérico cuenta como `0`, igual que en el catálogo: un
 /// modelo sin precios obtiene `blend = 0` y queda fuera de la elegibilidad por la
 /// regla de precio estrictamente positivo.
 pub fn blend_price(pricing: &Pricing) -> f64 {
-    /// Peso del precio de prompt en el `blend`.
-    const PROMPT_WEIGHT: f64 = 0.75;
-    /// Peso del precio de completion en el `blend`.
-    const COMPLETION_WEIGHT: f64 = 0.25;
-
     PROMPT_WEIGHT * price_value(pricing.prompt.as_ref())
         + COMPLETION_WEIGHT * price_value(pricing.completion.as_ref())
 }

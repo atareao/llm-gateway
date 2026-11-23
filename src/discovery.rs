@@ -27,7 +27,8 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::classify::{
-    ClassifyContext, PaidContext, blend_price, classify, classify_paid, matches_allow,
+    COMPLETION_WEIGHT, ClassifyContext, PROMPT_WEIGHT, PaidContext, blend_price, classify,
+    classify_paid, matches_allow,
 };
 use crate::config::{ClassifyOverrides, DEFAULT_REFRESH_INTERVAL_MS, GatewayConfig, Profile};
 use crate::metrics::Metrics;
@@ -294,6 +295,9 @@ pub struct CatalogCache {
     /// Serializa los refrescos: el ticker y el refresco on-demand lo consultan
     /// para no lanzar fetches duplicados concurrentes.
     refresh_lock: tokio::sync::Mutex<()>,
+    /// Último snapshot de precios por `model_id`, para el dedup del evento
+    /// `gateway_catalog`.
+    prices: PriceTracker,
     /// Número de refrescos lanzados en segundo plano; solo para tests.
     #[cfg(test)]
     spawns: AtomicUsize,
@@ -317,6 +321,7 @@ impl CatalogCache {
             timeout: CATALOG_TIMEOUT,
             state: RwLock::new(None),
             refresh_lock: tokio::sync::Mutex::new(()),
+            prices: PriceTracker::new(),
             #[cfg(test)]
             spawns: AtomicUsize::new(0),
             metrics,
@@ -411,6 +416,7 @@ impl CatalogCache {
             Ok(models) => {
                 let total = models.len();
                 let eligible = models.iter().filter(|model| is_eligible(model)).count();
+                let events = self.prices.observe(&models);
                 let snapshot = Snapshot {
                     models: Arc::new(models),
                     fetched_at: Instant::now(),
@@ -422,6 +428,7 @@ impl CatalogCache {
                 self.metrics
                     .record_discovery_catalog(&self.base_url, total, eligible);
                 self.metrics.record_discovery_refresh(&self.base_url, true);
+                emit_catalog_events(&events);
                 Ok(())
             }
             Err(err) => {
@@ -479,6 +486,21 @@ impl CatalogCache {
 // Evento de catálogo (`gateway_catalog`)
 // ---------------------------------------------------------------------------
 
+/// Factor de normalización de precios: el catálogo los trae en USD por token y
+/// el evento se expresa en **USD por millón de tokens**.
+const TOKENS_PER_MILLION: f64 = 1_000_000.0;
+
+/// Precio de un modelo en el último snapshot observado (USD por token).
+#[derive(Debug, Clone, Copy)]
+struct TrackedPrice {
+    /// Precio de entrada por token.
+    pin: f64,
+    /// Precio de salida por token.
+    pout: f64,
+    /// Longitud de contexto declarada en ese snapshot.
+    context_length: Option<u32>,
+}
+
 /// Naturaleza del cambio de un modelo respecto al último snapshot del catálogo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -491,6 +513,18 @@ pub enum CatalogChangeKind {
     PriceDown,
     /// El modelo desapareció del catálogo.
     Removed,
+}
+
+impl std::fmt::Display for CatalogChangeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::New => "new",
+            Self::PriceUp => "price_up",
+            Self::PriceDown => "price_down",
+            Self::Removed => "removed",
+        };
+        f.write_str(text)
+    }
 }
 
 /// Evento estructurado `gateway_catalog`: un cambio de precio o de presencia
@@ -529,9 +563,14 @@ pub struct CatalogEvent {
     pub prev_pout: Option<f64>,
 }
 
-/// Último snapshot de precios por `model_id` y detector de cambios.
-#[derive(Default)]
+/// Último snapshot de precios por `model_id` y detector de cambios (D2).
+///
+/// Deduplicación en memoria del evento `gateway_catalog`: un precio idéntico
+/// entre refrescos consecutivos no vuelve a emitir. Tras reiniciar, el
+/// snapshot completo se reemite como `new`, lo que es barato y esperado.
+#[derive(Debug, Default)]
 pub struct PriceTracker {
+    /// Último precio observado por identificador de modelo.
     last: RwLock<HashMap<String, TrackedPrice>>,
 }
 
@@ -544,20 +583,198 @@ impl PriceTracker {
     }
 
     /// Observa un catálogo recién refrescado y devuelve los eventos de cambio.
+    ///
+    /// Emite un evento por modelo que aparece (`new`), desaparece (`removed`)
+    /// o cambia de precio (`price_up`/`price_down`); nada para los que repiten
+    /// precio. Los modelos presentes sin precio parseable no alteran el último
+    /// snapshot conocido ni emiten: «desconocido» no es «gratis».
     pub fn observe(&self, catalog: &[ModelEntry]) -> Vec<CatalogEvent> {
-        let _ = catalog;
-        Vec::new()
+        let mut last = self
+            .last
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (events, next) = diff_prices(&last, catalog, now_ms());
+        *last = next;
+        events
     }
 }
 
-/// Emite los eventos de catálogo como logs estructurados (sumidero actual).
-fn emit_catalog_events(_events: &[CatalogEvent]) {}
+/// Emite los eventos de catálogo como logs estructurados con `event_type`
+/// `catalog` (D5): `tracing` los envía a OpenObserve vía el stack OTLP de
+/// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
+/// sin tocar la detección de cambios.
+fn emit_catalog_events(events: &[CatalogEvent]) {
+    for event in events {
+        tracing::info!(
+            event_type = event.event_type,
+            ts = event.ts,
+            model_id = %event.model_id,
+            org = %event.org,
+            pin = event.pin,
+            pout = event.pout,
+            blend = event.blend,
+            context_length = event.context_length,
+            change_kind = %event.change_kind,
+            prev_pin = event.prev_pin,
+            prev_pout = event.prev_pout,
+            "gateway_catalog"
+        );
+    }
+}
 
-/// Precio de un modelo en el último snapshot observado.
-struct TrackedPrice {
-    pin: f64,
-    pout: f64,
+/// Compara `catalog` contra el snapshot `last` y produce los eventos junto con
+/// el nuevo snapshot. Función pura para poder testear cada transición.
+fn diff_prices(
+    last: &HashMap<String, TrackedPrice>,
+    catalog: &[ModelEntry],
+    ts: u64,
+) -> (Vec<CatalogEvent>, HashMap<String, TrackedPrice>) {
+    let mut events = Vec::new();
+    let mut next: HashMap<String, TrackedPrice> = HashMap::with_capacity(catalog.len());
+    for model in catalog {
+        let Some((pin, pout)) = price_per_token(model) else {
+            continue;
+        };
+        let id = model.id.as_str();
+        let context_length = model.context_length;
+        let (change_kind, prev_pin, prev_pout) = match last.get(id) {
+            None => (CatalogChangeKind::New, None, None),
+            Some(prev) if prev.pin == pin && prev.pout == pout => {
+                next.insert(
+                    id.to_owned(),
+                    TrackedPrice {
+                        pin,
+                        pout,
+                        context_length,
+                    },
+                );
+                continue;
+            }
+            Some(prev) => (
+                change_kind_of(prev, pin, pout),
+                Some(prev.pin),
+                Some(prev.pout),
+            ),
+        };
+        next.insert(
+            id.to_owned(),
+            TrackedPrice {
+                pin,
+                pout,
+                context_length,
+            },
+        );
+        events.push(catalog_event(
+            id,
+            ts,
+            change_kind,
+            Some((pin, pout)),
+            context_length,
+            prev_pin.zip(prev_pout),
+        ));
+    }
+    let mut removed: Vec<(&String, &TrackedPrice)> = last
+        .iter()
+        .filter(|(id, _)| !next.contains_key(id.as_str()))
+        .collect();
+    removed.sort_unstable_by_key(|(id, _)| *id);
+    for (id, prev) in removed {
+        events.push(catalog_event(
+            id,
+            ts,
+            CatalogChangeKind::Removed,
+            None,
+            prev.context_length,
+            Some((prev.pin, prev.pout)),
+        ));
+    }
+    (events, next)
+}
+
+/// Construye un evento `gateway_catalog` con los precios normalizados a
+/// USD/Mtok. `current` es el precio nuevo (`None` en una baja) y `prev` el del
+/// snapshot anterior (`None` en un alta).
+fn catalog_event(
+    model_id: &str,
+    ts: u64,
+    change_kind: CatalogChangeKind,
+    current: Option<(f64, f64)>,
     context_length: Option<u32>,
+    prev: Option<(f64, f64)>,
+) -> CatalogEvent {
+    let to_mtok = |price: (f64, f64)| (TOKENS_PER_MILLION * price.0, TOKENS_PER_MILLION * price.1);
+    let current = current.map(to_mtok);
+    let prev = prev.map(to_mtok);
+    CatalogEvent {
+        event_type: "catalog",
+        ts,
+        model_id: model_id.to_owned(),
+        org: org_of(model_id).to_owned(),
+        pin: current.map(|(pin, _)| pin),
+        pout: current.map(|(_, pout)| pout),
+        blend: current.map(|(pin, pout)| blend_parts(pin, pout)),
+        context_length,
+        change_kind,
+        prev_pin: prev.map(|(pin, _)| pin),
+        prev_pout: prev.map(|(_, pout)| pout),
+    }
+}
+
+/// Clasifica un cambio de precio por la variación del `blend`; si empata (sube
+/// una pata y baja la otra en la misma proporción), decide el lado del `pin`.
+fn change_kind_of(prev: &TrackedPrice, pin: f64, pout: f64) -> CatalogChangeKind {
+    let blend = blend_parts(pin, pout);
+    let prev_blend = blend_parts(prev.pin, prev.pout);
+    if blend > prev_blend {
+        CatalogChangeKind::PriceUp
+    } else if blend < prev_blend {
+        CatalogChangeKind::PriceDown
+    } else if pin > prev.pin {
+        CatalogChangeKind::PriceUp
+    } else {
+        CatalogChangeKind::PriceDown
+    }
+}
+
+/// `blend = 0.75 · pin + 0.25 · pout`, la ponderación de
+/// [`crate::classify::blend_price`] aplicada a precios numéricos.
+fn blend_parts(pin: f64, pout: f64) -> f64 {
+    PROMPT_WEIGHT * pin + COMPLETION_WEIGHT * pout
+}
+
+/// Precios por token (`prompt`, `completion`) de un modelo, o `None` si falta
+/// alguno o no es numérico. A diferencia de `classify::price_value`, un valor
+/// ausente no cuenta como `0`.
+fn price_per_token(model: &ModelEntry) -> Option<(f64, f64)> {
+    let pricing = model.pricing.as_ref()?;
+    Some((
+        price_field(pricing.prompt.as_ref())?,
+        price_field(pricing.completion.as_ref())?,
+    ))
+}
+
+/// Parsea un campo de precio (cadena o número) a `f64`.
+fn price_field(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// Organización de un identificador de modelo: el prefijo antes de `/`
+/// (`acme/flash-a` → `acme`). Sin barra, el propio identificador.
+fn org_of(model_id: &str) -> &str {
+    model_id.split_once('/').map_or(model_id, |(org, _)| org)
+}
+
+/// Instante actual en ms epoch (`0` si el reloj del sistema va detrás del epoch).
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Blacklist global de modelos dinámicos.
@@ -2316,7 +2533,11 @@ route:
 
         let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
 
-        assert_eq!(events.len(), 1, "la primera observación da de alta: {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "la primera observación da de alta: {events:?}"
+        );
         let event = &events[0];
         assert_eq!(event.change_kind, CatalogChangeKind::New);
         assert_eq!(event.model_id, "acme/flash-a");
@@ -2324,8 +2545,14 @@ route:
         assert_eq!(event.context_length, Some(8_000));
         assert_price_close(event.pin.expect("pin nuevo"), 1.5);
         assert_price_close(event.pout.expect("pout nuevo"), 2.0);
-        assert!(event.prev_pin.is_none(), "un modelo nuevo no tiene precio previo");
-        assert!(event.prev_pout.is_none(), "un modelo nuevo no tiene precio previo");
+        assert!(
+            event.prev_pin.is_none(),
+            "un modelo nuevo no tiene precio previo"
+        );
+        assert!(
+            event.prev_pout.is_none(),
+            "un modelo nuevo no tiene precio previo"
+        );
     }
 
     /// Transición `price_up`: sube el precio de salida y el evento conserva el
@@ -2370,7 +2597,10 @@ route:
         assert_eq!(events.len(), 1, "la baja del modelo emite: {events:?}");
         assert_eq!(events[0].change_kind, CatalogChangeKind::Removed);
         assert_eq!(events[0].model_id, "acme/flash-a");
-        assert_eq!(events[0].pin, None, "un modelo removed no tiene precio nuevo");
+        assert_eq!(
+            events[0].pin, None,
+            "un modelo removed no tiene precio nuevo"
+        );
         assert_eq!(events[0].pout, None);
         assert_price_close(events[0].prev_pin.expect("pin previo"), 1.5);
         assert_price_close(events[0].prev_pout.expect("pout previo"), 2.0);
@@ -2390,7 +2620,10 @@ route:
 
         let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
 
-        assert!(events.is_empty(), "un precio sin cambios no emite: {events:?}");
+        assert!(
+            events.is_empty(),
+            "un precio sin cambios no emite: {events:?}"
+        );
     }
 
     /// Un cambio de precio emite exactamente un evento, y solo para el modelo
@@ -2408,7 +2641,11 @@ route:
             priced("acme/flash-b", "0.000001", "0.000002"),
         ]);
 
-        assert_eq!(events.len(), 1, "solo el modelo que cambió emite: {events:?}");
+        assert_eq!(
+            events.len(),
+            1,
+            "solo el modelo que cambió emite: {events:?}"
+        );
         assert_eq!(events[0].model_id, "acme/flash-b");
         assert_eq!(events[0].change_kind, CatalogChangeKind::PriceUp);
     }
@@ -2458,7 +2695,10 @@ route:
         let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
         let json = serde_json::to_value(&events[0]).expect("evento serializable");
 
-        assert!(json.get("prev_pin").is_none(), "sin precio previo no hay prev_pin");
+        assert!(
+            json.get("prev_pin").is_none(),
+            "sin precio previo no hay prev_pin"
+        );
         assert!(json.get("prev_pout").is_none());
     }
 
