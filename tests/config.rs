@@ -824,3 +824,87 @@ fn example_config_uses_paid_backend_with_curated_allow_and_static_resort() {
         );
     }
 }
+
+// --- Grupo 6 (#39): bloque `observability` con `events` (opt-out del ledger) ---
+
+/// Config válida con el bloque `observability` desactivando los eventos.
+const CONFIG_EVENTS_FALSE: &str = r#"
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://localhost:11434/v1"
+        model: "qwen2.5:7b-instruct"
+observability:
+  events: false
+"#;
+
+/// Config válida con el bloque `observability` pero sin el campo `events`.
+const CONFIG_EVENTS_ABSENT: &str = r#"
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://localhost:11434/v1"
+        model: "qwen2.5:7b-instruct"
+observability: {}
+"#;
+
+/// 6.1: `observability.events: false` se parsea tal cual.
+#[test]
+fn observability_events_false_is_parsed() {
+    let file = write_temp(CONFIG_EVENTS_FALSE);
+
+    let config = load(file.path()).expect("config con events=false debe cargar");
+
+    let observability = config
+        .observability
+        .as_ref()
+        .expect("el bloque observability se parsea");
+    assert!(
+        !observability.events,
+        "events: false debe parsearse como false"
+    );
+}
+
+/// 6.1: sin campo `events` dentro del bloque, el default es `true`.
+#[test]
+fn observability_events_absent_defaults_to_true() {
+    let file = write_temp(CONFIG_EVENTS_ABSENT);
+
+    let config = load(file.path()).expect("config sin events debe cargar");
+
+    let observability = config
+        .observability
+        .as_ref()
+        .expect("el bloque observability se parsea");
+    assert!(
+        observability.events,
+        "events ausente dentro del bloque debe quedar a true"
+    );
+}
+
+/// 6.1: sin bloque `observability` por completo, los eventos del ledger
+/// siguen activos (`ledger_events_enabled()` resuelve el default).
+#[test]
+fn observability_block_absent_enables_events_by_default() {
+    let file = write_temp(VALID_YAML);
+
+    let config = load(file.path()).expect("config válida");
+
+    assert!(
+        config.ledger_events_enabled(),
+        "sin bloque observability los eventos del ledger quedan activos"
+    );
+}
+
+/// 6.1: el flag resuelto respeta el opt-out explícito.
+#[test]
+fn ledger_events_enabled_resolves_explicit_optout() {
+    let file = write_temp(CONFIG_EVENTS_FALSE);
+
+    let config = load(file.path()).expect("config con events=false debe cargar");
+
+    assert!(
+        !config.ledger_events_enabled(),
+        "events: false debe desactivar los eventos del ledger"
+    );
+}
