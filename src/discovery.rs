@@ -1269,8 +1269,12 @@ impl Registry {
     /// catálogo para esa `base_url`, el modelo no está en él o su precio no es
     /// parseable (un precio desconocido no se inventa).
     pub fn model_price(&self, base_url: &str, model_id: &str) -> Option<(f64, f64)> {
-        let _ = (base_url, model_id);
-        None
+        let catalog = self.catalog(base_url)?.cached()?;
+        catalog
+            .iter()
+            .find(|model| model.id == model_id)
+            .and_then(price_per_token)
+            .map(|(pin, pout)| (TOKENS_PER_MILLION * pin, TOKENS_PER_MILLION * pout))
     }
 
     /// Blacklist global compartida.

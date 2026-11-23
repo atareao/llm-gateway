@@ -64,7 +64,9 @@ fn ensure_api_key() {
 
 /// Levanta un servidor efímero y devuelve su `http://ip:puerto`.
 async fn spawn(app: Router) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve mock");
@@ -77,16 +79,16 @@ async fn spawn_paid_mock(chat_body: &'static str, chat_content_type: &'static st
     let app = Router::new()
         .route(
             "/models",
-            get(|| async { Json(json!(serde_json::from_str::<Value>(CATALOG_JSON).expect("catálogo"))) }),
+            get(|| async {
+                Json(json!(
+                    serde_json::from_str::<Value>(CATALOG_JSON).expect("catálogo")
+                ))
+            }),
         )
         .route(
             "/chat/completions",
             post(move || async move {
-                (
-                    [(header::CONTENT_TYPE, chat_content_type)],
-                    chat_body,
-                )
-                    .into_response()
+                ([(header::CONTENT_TYPE, chat_content_type)], chat_body).into_response()
             }),
         );
     spawn(app).await

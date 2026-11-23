@@ -31,8 +31,7 @@ const CHAT_JSON: &str = r#"{
 }"#;
 
 /// Respuesta de ejemplo **sin** `usage`: el upstream no informó tokens.
-const CHAT_JSON_NO_USAGE: &str =
-    r#"{"choices": [{"message": {"role": "assistant", "content": "hola"}, "finish_reason": "stop"}]}"#;
+const CHAT_JSON_NO_USAGE: &str = r#"{"choices": [{"message": {"role": "assistant", "content": "hola"}, "finish_reason": "stop"}]}"#;
 
 /// Stream SSE de ejemplo: contenido, `finish_reason`, chunk final con `usage`
 /// y `[DONE]`.
@@ -123,7 +122,9 @@ fn ensure_api_key() {
 
 /// Levanta un servidor efímero y devuelve su `http://ip:puerto`.
 async fn spawn(app: Router) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve mock");
@@ -137,16 +138,16 @@ async fn spawn_paid_mock(chat_body: &'static str, chat_content_type: &'static st
     let app = Router::new()
         .route(
             "/models",
-            get(|| async { Json(json!(serde_json::from_str::<Value>(CATALOG_JSON).expect("catálogo"))) }),
+            get(|| async {
+                Json(json!(
+                    serde_json::from_str::<Value>(CATALOG_JSON).expect("catálogo")
+                ))
+            }),
         )
         .route(
             "/chat/completions",
             post(move || async move {
-                (
-                    [(header::CONTENT_TYPE, chat_content_type)],
-                    chat_body,
-                )
-                    .into_response()
+                ([(header::CONTENT_TYPE, chat_content_type)], chat_body).into_response()
             }),
         );
     spawn(app).await
@@ -229,9 +230,7 @@ fn find_request_event(captured: &Arc<Mutex<Vec<String>>>, request_id: &str) -> S
         .find(|log| log.contains("event_type=request") && log.contains(request_id))
         .cloned()
         .unwrap_or_else(|| {
-            panic!(
-                "no se emitió gateway_requests para {request_id}; logs: {logs:?}"
-            )
+            panic!("no se emitió gateway_requests para {request_id}; logs: {logs:?}")
         })
 }
 
@@ -249,7 +248,11 @@ async fn request_event_logged_for_non_stream_response_with_usage_and_cost() {
     let response = post_chat(&gateway, "req-ledger-ok", false).await;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body: Value = response.json().await.expect("json de respuesta");
-    assert_eq!(body["choices"][0]["finish_reason"], json!("stop"), "la respuesta al cliente no se altera");
+    assert_eq!(
+        body["choices"][0]["finish_reason"],
+        json!("stop"),
+        "la respuesta al cliente no se altera"
+    );
 
     let event = find_request_event(&captured, "req-ledger-ok");
     assert!(event.contains("event_type=request"), "{event}");

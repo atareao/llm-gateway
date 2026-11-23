@@ -720,7 +720,9 @@ async fn route_with_failover(
                     // camino de bytes. Los precios se resuelven ahora, en el
                     // momento de la petición; tokens, `finish_reason`, latencia
                     // y coste se completan al terminar el stream.
-                    let price = state.discovery.model_price(&candidate.base_url, &candidate.model);
+                    let price = state
+                        .discovery
+                        .model_price(&candidate.base_url, &candidate.model);
                     let event = RequestEvent {
                         event_type: REQUEST_EVENT_TYPE,
                         ts: 0,
@@ -808,7 +810,9 @@ async fn route_with_failover(
                         // con los precios del modelo en el momento de la
                         // petición; un fallo del emisor no altera la respuesta
                         // (4.3).
-                        let price = state.discovery.model_price(&candidate.base_url, &candidate.model);
+                        let price = state
+                            .discovery
+                            .model_price(&candidate.base_url, &candidate.model);
                         let event = RequestEvent {
                             event_type: REQUEST_EVENT_TYPE,
                             ts: crate::discovery::now_ms(),
@@ -892,7 +896,9 @@ async fn route_with_failover(
     // etiqueta con el modelo del último intento (si lo hubo) y registra el
     // resto de campos con lo conocido: un fallo también es un dato del ledger.
     let (model_id, price) = last.map_or((None, None), |candidate| {
-        let price = state.discovery.model_price(&candidate.base_url, &candidate.model);
+        let price = state
+            .discovery
+            .model_price(&candidate.base_url, &candidate.model);
         (Some(candidate.model.clone()), price)
     });
     let event = RequestEvent {
@@ -1250,15 +1256,6 @@ fn parse_usage(value: &Value) -> TokenUsage {
     }
 }
 
-/// Parsea el cuerpo de una respuesta no-stream y extrae su `usage`.
-///
-/// Un cuerpo que no sea JSON válido produce tokens desconocidos.
-fn parse_body_usage(bytes: &[u8]) -> TokenUsage {
-    serde_json::from_slice::<Value>(bytes)
-        .map(|value| parse_usage(&value))
-        .unwrap_or_default()
-}
-
 /// Inyecta `stream_options.include_usage: true` en el payload de una petición
 /// en streaming, para que el upstream añada el `usage` al chunk final.
 ///
@@ -1364,8 +1361,9 @@ impl StreamUsage {
     }
 
     /// Consume una línea SSE completa. Solo los eventos `data:` con un JSON
-    /// que traiga `usage` **conocido** actualizan el valor retenido: los
-    /// intermedios (`usage: null`) y `data: [DONE]` no lo tocan.
+    /// que traiga `usage` conocido o `finish_reason` informado actualizan el
+    /// valor retenido: los intermedios (`usage: null`, `finish_reason: null`)
+    /// y `data: [DONE]` no lo tocan.
     fn consume_line(&mut self, line: &str) {
         let Some(data) = line.strip_prefix("data:") else {
             return;
@@ -1375,15 +1373,18 @@ impl StreamUsage {
             return;
         }
         // Pre-filtro barato: la gran mayoría de los chunks del stream no traen
-        // `usage`, y así se evita parsear JSON por cada línea. Comportamiento
-        // idéntico (salvo claves `\uXXXX` escapadas, irreales en la práctica).
-        if !data.contains("\"usage\"") {
+        // ni `usage` ni `finish_reason`, y así se evita parsear JSON por cada
+        // línea. Comportamiento idéntico (salvo claves `\uXXXX` escapadas,
+        // irreales en la práctica).
+        let has_usage = data.contains("\"usage\"");
+        let has_finish_reason = data.contains("\"finish_reason\"");
+        if !has_usage && !has_finish_reason {
             return;
         }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return;
         };
-        if data.contains("\"usage\"") {
+        if has_usage {
             let usage = parse_usage(&value);
             if !usage.is_unknown() && usage != self.usage {
                 tracing::debug!(
@@ -1474,31 +1475,65 @@ fn cost_usd(
     pin: Option<f64>,
     pout: Option<f64>,
 ) -> Option<f64> {
-    let _ = (tokens_in, tokens_out, pin, pout);
-    None
+    Some(
+        (tokens_in? as f64 * pin? + tokens_out? as f64 * pout?)
+            / crate::discovery::TOKENS_PER_MILLION,
+    )
 }
 
 /// `finish_reason` del primer `choices[0]` de una respuesta o evento SSE de
 /// chat. Un `null` (chunks intermedios del stream) o su ausencia devuelven
 /// `None`: solo un valor informado cuenta.
 fn extract_finish_reason(value: &Value) -> Option<String> {
-    let _ = value;
-    None
+    value
+        .get("choices")?
+        .get(0)?
+        .get("finish_reason")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// `usage` y `finish_reason` de una respuesta no-stream, con un **único**
 /// parseo del cuerpo (hot path del ledger). Un cuerpo que no sea JSON válido
 /// produce tokens desconocidos y `finish_reason` `None`.
 fn parse_body_ledger(bytes: &[u8]) -> (TokenUsage, Option<String>) {
-    let _ = bytes;
-    (TokenUsage::default(), None)
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(value) => (parse_usage(&value), extract_finish_reason(&value)),
+        Err(_) => (TokenUsage::default(), None),
+    }
 }
 
 /// Emite el evento `gateway_requests` como log estructurado con `event_type`
 /// `request` (D5): `tracing` lo envía a OpenObserve vía el stack OTLP de
 /// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
 /// sin tocar la lógica de la petición.
-fn emit_request_event(_event: &RequestEvent) {}
+///
+/// La emisión va aislada con `catch_unwind`: un fallo del exportador —hoy, un
+/// panic en un subscriber/layer; mañana, un fallo del transport real— NO
+/// propaga el error a la petición, cuya respuesta queda intacta (4.3).
+fn emit_request_event(event: &RequestEvent) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracing::info!(
+            event_type = event.event_type,
+            ts = event.ts,
+            request_id = %event.request_id,
+            route = %event.route,
+            model_id = event.model_id,
+            streaming = event.streaming,
+            attempts = event.attempts,
+            failover = event.failover,
+            outcome = event.outcome,
+            finish_reason = event.finish_reason,
+            latency_ms = event.latency_ms,
+            tokens_in = event.tokens_in,
+            tokens_out = event.tokens_out,
+            pin = event.pin,
+            pout = event.pout,
+            cost_usd = event.cost_usd,
+            "gateway_requests"
+        );
+    }));
+}
 
 /// Receptor del evento `gateway_requests` de una petición **en streaming**.
 ///
@@ -1508,7 +1543,7 @@ fn emit_request_event(_event: &RequestEvent) {}
 /// único que lo lee, al final).
 struct RequestSink {
     /// Campos ya conocidos en el momento del enrutado, con los precios del
-    /// modelo resueltos entonces (`momento de la petición`).
+    /// modelo resueltos entonces (el «momento de la petición»).
     event: RequestEvent,
     /// Instante de inicio de la petición: la latencia del evento cubre todo el
     /// streaming, no solo hasta el primer byte.
@@ -1518,7 +1553,20 @@ struct RequestSink {
 impl RequestSink {
     /// Completa el evento con el `usage`/`finish_reason` retenidos por el
     /// extractor del stream y lo emite.
-    fn complete(self, _extractor: &StreamUsage) {}
+    fn complete(mut self, extractor: &StreamUsage) {
+        self.event.ts = crate::discovery::now_ms();
+        self.event.latency_ms = self.started.elapsed().as_millis() as u64;
+        self.event.tokens_in = extractor.usage.prompt_tokens;
+        self.event.tokens_out = extractor.usage.completion_tokens;
+        self.event.finish_reason = extractor.finish_reason.clone();
+        self.event.cost_usd = cost_usd(
+            self.event.tokens_in,
+            self.event.tokens_out,
+            self.event.pin,
+            self.event.pout,
+        );
+        emit_request_event(&self.event);
+    }
 }
 
 /// Clona `body` y sustituye su `model` por `model`. El resto de campos
@@ -1634,11 +1682,10 @@ async fn healthz() -> &'static str {
 mod tests {
     use super::{
         AppState, Candidate, MAX_RETRY_AFTER, MAX_SSE_LINE_BYTES, QUOTA_BODY_LIMIT, QuotaSignal,
-        RequestEvent, StreamUsage, TokenUsage, backend_id, chat_url, cost_usd,
-        effective_cooldown, emit_request_event, expand_backends,
-        headers_show_daily_exhaustion, inject_include_usage, parse_body_ledger, parse_body_usage,
-        parse_retry_after, parse_usage, quota_reset_epoch_ms, quota_signal, read_quota_body,
-        request_requires_tool_call, response_has_tool_call,
+        RequestEvent, StreamUsage, TokenUsage, backend_id, chat_url, cost_usd, effective_cooldown,
+        emit_request_event, expand_backends, headers_show_daily_exhaustion, inject_include_usage,
+        parse_body_ledger, parse_retry_after, parse_usage, quota_reset_epoch_ms, quota_signal,
+        read_quota_body, request_requires_tool_call, response_has_tool_call,
     };
     use crate::config::{Backend, BackendKind, GatewayConfig};
     use crate::discovery::{ModelEntry, Pricing};
@@ -2258,7 +2305,7 @@ route:
     fn parse_body_usage_extracts_tokens_from_valid_json() {
         let body = br#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}"#;
 
-        let usage = parse_body_usage(body);
+        let (usage, _) = parse_body_ledger(body);
 
         assert_eq!(
             usage,
@@ -2293,7 +2340,7 @@ route:
     /// inventados).
     #[test]
     fn parse_body_usage_invalid_json_is_unknown() {
-        assert_eq!(parse_body_usage(b"no es json"), TokenUsage::default());
+        assert_eq!(parse_body_ledger(b"no es json").0, TokenUsage::default());
     }
 
     /// `usage` parcial (solo `prompt_tokens`): el campo que falta queda
@@ -2632,12 +2679,15 @@ route:
     /// `finish_reason` del upstream se registra igualmente.
     #[test]
     fn parse_body_ledger_without_usage_keeps_tokens_unknown() {
-        let body =
-            br#"{"choices": [{"message": {"role": "assistant"}, "finish_reason": "stop"}]}"#;
+        let body = br#"{"choices": [{"message": {"role": "assistant"}, "finish_reason": "stop"}]}"#;
 
         let (usage, finish_reason) = parse_body_ledger(body);
 
-        assert_eq!(usage, TokenUsage::default(), "sin usage: desconocidos, no 0");
+        assert_eq!(
+            usage,
+            TokenUsage::default(),
+            "sin usage: desconocidos, no 0"
+        );
         assert_eq!(finish_reason.as_deref(), Some("stop"));
     }
 
@@ -2656,11 +2706,13 @@ route:
     fn stream_usage_captures_finish_reason_from_chunks() {
         let mut extractor = StreamUsage::default();
 
-        extractor
-            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"h\"},\"finish_reason\":null}]}\n\n");
-        extractor
-            .feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
-        extractor.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\n");
+        extractor.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"h\"},\"finish_reason\":null}]}\n\n",
+        );
+        extractor.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        extractor.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\n",
+        );
         extractor.feed(b"data: [DONE]\n\n");
 
         assert_eq!(
@@ -2677,10 +2729,10 @@ route:
     fn stream_usage_finish_reason_null_does_not_overwrite() {
         let mut extractor = StreamUsage::default();
 
-        extractor
-            .feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
-        extractor
-            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"mas\"},\"finish_reason\":null}]}\n\n");
+        extractor.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        extractor.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"mas\"},\"finish_reason\":null}]}\n\n",
+        );
 
         assert_eq!(extractor.finish_reason.as_deref(), Some("stop"));
     }
@@ -2714,7 +2766,11 @@ route:
         fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
             let mut visitor = EventFieldsVisitor::default();
             event.record(&mut visitor);
-            if visitor.fields.iter().any(|field| field == "event_type=request") {
+            if visitor
+                .fields
+                .iter()
+                .any(|field| field == "event_type=request")
+            {
                 panic!("exportador caído");
             }
         }
