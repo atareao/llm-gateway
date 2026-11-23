@@ -19,9 +19,9 @@
 
 ## 4. Evento de petición (`gateway_requests`)
 
-- [ ] 4.1 Emitir un evento por petición con `ts`, `request_id`, `route`, `model_id`, `streaming`, `attempts`, `failover`, `outcome`, `finish_reason`, `latency_ms`, `tokens_in`, `tokens_out`, `pin`, `pout`, `cost_usd`, con tests de éxito y de respuesta sin `usage`
-- [ ] 4.2 Calcular `cost_usd` con los precios del modelo en el momento de la petición, con un test que compara el valor esperado
-- [ ] 4.3 Verificar con un test de integración que un fallo del exportador no altera la respuesta al cliente
+- [x] 4.1 Emitir un evento por petición con `ts`, `request_id`, `route`, `model_id`, `streaming`, `attempts`, `failover`, `outcome`, `finish_reason`, `latency_ms`, `tokens_in`, `tokens_out`, `pin`, `pout`, `cost_usd`, con tests de éxito y de respuesta sin `usage`
+- [x] 4.2 Calcular `cost_usd` con los precios del modelo en el momento de la petición, con un test que compara el valor esperado
+- [x] 4.3 Verificar con un test de integración que un fallo del exportador no altera la respuesta al cliente
 
 ## 5. Métricas
 
