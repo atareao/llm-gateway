@@ -490,8 +490,12 @@ async fn spawn_sse_usage_backend() -> String {
             Ok(Bytes::from_static(
                 b"data: {\"choices\":[{\"delta\":{\"content\":\"Hola\"}}],\"usage\":null}\n\n",
             )),
-            Ok(Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tok")),
-            Ok(Bytes::from_static(b"ens\":100,\"completion_tokens\":8}}\n\n")),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tok",
+            )),
+            Ok(Bytes::from_static(
+                b"ens\":100,\"completion_tokens\":8}}\n\n",
+            )),
             Ok(Bytes::from_static(b"data: [DONE]\n\n")),
         ];
         let stream = futures_util::stream::iter(chunks);

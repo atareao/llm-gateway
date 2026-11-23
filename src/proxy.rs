@@ -35,7 +35,8 @@ use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde_json::{Value, json};
+use futures_util::StreamExt as _;
+use serde_json::{Map, Value, json};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
@@ -635,7 +636,12 @@ async fn route_with_failover(
         };
         attempts += 1;
 
-        let payload = body_for_model(body, &candidate.model);
+        let mut payload = body_for_model(body, &candidate.model);
+        // En streaming se pide al upstream que incluya el `usage` en el chunk
+        // final (`stream_options.include_usage: true`), base del ledger.
+        if streaming {
+            inject_include_usage(&mut payload);
+        }
         let send_result = send(
             &state.client,
             candidate,
@@ -727,6 +733,17 @@ async fn route_with_failover(
                             );
                             no_tool_call_seen = true;
                             continue;
+                        }
+                        // Ledger de observabilidad (#39): tokens de la
+                        // respuesta no-stream; sin `usage` quedan desconocidos.
+                        let usage = parse_body_usage(&body_bytes);
+                        if !usage.is_unknown() {
+                            tracing::debug!(
+                                backend = %candidate_id,
+                                tokens_in = ?usage.prompt_tokens,
+                                tokens_out = ?usage.completion_tokens,
+                                "usage de la respuesta"
+                            );
                         }
                         state.metrics.record_attempt(
                             route_idx,
@@ -1023,12 +1040,21 @@ async fn full_response(
 /// Reenvía el cuerpo del upstream como stream SSE, **sin bufferizar**, usando
 /// el stream de `reqwest` directamente.
 ///
+/// A medida que el stream fluye, extrae el `usage` del chunk final ([`StreamUsage`])
+/// para el ledger de observabilidad, sin alterar los bytes que recibe el cliente.
+///
 /// Si el upstream se corta a mitad, el error del stream propaga al cliente y
 /// la conexión se cierra con error; no se reintenta (limitación documentada).
 fn stream_response(response: reqwest::Response, backend_label: &str) -> Response {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
-    let body = Body::from_stream(response.bytes_stream());
+    let mut usage = StreamUsage::default();
+    let body = Body::from_stream(response.bytes_stream().map(move |result| {
+        if let Ok(bytes) = &result {
+            usage.feed(bytes);
+        }
+        result
+    }));
 
     assemble(
         status,
@@ -1088,16 +1114,24 @@ impl TokenUsage {
 /// Campos ausentes, `usage: null` o valores no numéricos quedan como `None`
 /// (desconocidos); no se inventan ceros.
 fn parse_usage(value: &Value) -> TokenUsage {
-    let _ = value;
-    TokenUsage::default()
+    let usage = value.get("usage");
+    TokenUsage {
+        prompt_tokens: usage
+            .and_then(|usage| usage.get("prompt_tokens"))
+            .and_then(Value::as_u64),
+        completion_tokens: usage
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(Value::as_u64),
+    }
 }
 
 /// Parsea el cuerpo de una respuesta no-stream y extrae su `usage`.
 ///
 /// Un cuerpo que no sea JSON válido produce tokens desconocidos.
 fn parse_body_usage(bytes: &[u8]) -> TokenUsage {
-    let _ = bytes;
-    TokenUsage::default()
+    serde_json::from_slice::<Value>(bytes)
+        .map(|value| parse_usage(&value))
+        .unwrap_or_default()
 }
 
 /// Inyecta `stream_options.include_usage: true` en el payload de una petición
@@ -1105,7 +1139,17 @@ fn parse_body_usage(bytes: &[u8]) -> TokenUsage {
 ///
 /// Preserva el resto de `stream_options` y fuerza `include_usage` a `true`
 /// aunque el cliente no lo pida (el ledger lo necesita).
-fn inject_include_usage(_payload: &mut Value) {}
+fn inject_include_usage(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    let options = object
+        .entry("stream_options".to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(options) = options.as_object_mut() {
+        options.insert("include_usage".to_owned(), Value::Bool(true));
+    }
+}
 
 /// Acumula las líneas SSE que llegan troceadas y retiene el último `usage`
 /// conocido visto (el del chunk final de un stream con `include_usage`).
@@ -1118,7 +1162,41 @@ struct StreamUsage {
 impl StreamUsage {
     /// Procesa un fragmento de bytes del stream (límites de chunk arbitrarios;
     /// una línea `data:` puede llegar partida entre varios fragmentos).
-    fn feed(&mut self, _chunk: &[u8]) {}
+    ///
+    /// Solo se procesan las líneas completas: el resto queda en el buffer a la
+    /// espera del siguiente fragmento.
+    fn feed(&mut self, chunk: &[u8]) {
+        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        while let Some(pos) = self.buffer.find('\n') {
+            let line: String = self.buffer.drain(..=pos).collect();
+            self.consume_line(line.trim_end_matches(['\r', '\n']));
+        }
+    }
+
+    /// Consume una línea SSE completa. Solo los eventos `data:` con un JSON
+    /// que traiga `usage` **conocido** actualizan el valor retenido: los
+    /// intermedios (`usage: null`) y `data: [DONE]` no lo tocan.
+    fn consume_line(&mut self, line: &str) {
+        let Some(data) = line.strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim_start();
+        if data == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        let usage = parse_usage(&value);
+        if !usage.is_unknown() && usage != self.usage {
+            tracing::debug!(
+                tokens_in = ?usage.prompt_tokens,
+                tokens_out = ?usage.completion_tokens,
+                "usage del stream (chunk final)"
+            );
+            self.usage = usage;
+        }
+    }
 }
 
 /// Clona `body` y sustituye su `model` por `model`. El resto de campos
@@ -1859,7 +1937,13 @@ route:
 
         let usage = parse_body_usage(body);
 
-        assert_eq!(usage, TokenUsage { prompt_tokens: Some(3), completion_tokens: Some(4) });
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: Some(3),
+                completion_tokens: Some(4)
+            }
+        );
     }
 
     /// Scenario: Sin usage los tokens quedan desconocidos — y **no** se
@@ -1873,7 +1957,11 @@ route:
         assert_eq!(usage.prompt_tokens, None);
         assert_eq!(usage.completion_tokens, None);
         assert!(
-            usage != TokenUsage { prompt_tokens: Some(0), completion_tokens: Some(0) },
+            usage
+                != TokenUsage {
+                    prompt_tokens: Some(0),
+                    completion_tokens: Some(0)
+                },
             "los tokens desconocidos no deben representarse como 0"
         );
     }
@@ -1893,7 +1981,13 @@ route:
 
         let usage = parse_usage(&body);
 
-        assert_eq!(usage, TokenUsage { prompt_tokens: Some(5), completion_tokens: None });
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: None
+            }
+        );
     }
 
     /// Scenario: Streaming inyecta include_usage — un body con `stream: true`
@@ -1923,7 +2017,10 @@ route:
 
         inject_include_usage(&mut body);
 
-        assert_eq!(body.pointer("/stream_options/include_usage"), Some(&json!(true)));
+        assert_eq!(
+            body.pointer("/stream_options/include_usage"),
+            Some(&json!(true))
+        );
         assert_eq!(body.pointer("/stream_options/foo"), Some(&json!(1)));
     }
 
@@ -1932,8 +2029,7 @@ route:
     #[test]
     fn stream_usage_reads_usage_from_final_chunk() {
         let mut extractor = StreamUsage::default();
-        extractor
-            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n");
+        extractor.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n");
 
         extractor.feed(
             b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n",
@@ -1942,7 +2038,10 @@ route:
 
         assert_eq!(
             extractor.usage,
-            TokenUsage { prompt_tokens: Some(7), completion_tokens: Some(9) }
+            TokenUsage {
+                prompt_tokens: Some(7),
+                completion_tokens: Some(9)
+            }
         );
     }
 
@@ -1957,7 +2056,10 @@ route:
 
         assert_eq!(
             extractor.usage,
-            TokenUsage { prompt_tokens: Some(100), completion_tokens: Some(8) }
+            TokenUsage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(8)
+            }
         );
     }
 
