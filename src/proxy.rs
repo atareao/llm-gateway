@@ -1134,6 +1134,20 @@ async fn full_response(
     Ok((response, body))
 }
 
+/// Frame del stream del upstream, ya sea datos reales o el centinela de fin.
+///
+/// En HTTP/2 los frames DATA vacíos **intermedios** llegan a `bytes_stream()`
+/// como chunks vacíos, igual que el `DATA(0, END_STREAM)` final, así que un
+/// chunk vacío no puede usarse como señal de fin. El fin real se etiqueta con
+/// [`Frame::End`] —único, inyectado tras agotar la fuente— y solo él dispara
+/// el cierre del extractor y la emisión del evento del ledger.
+enum Frame {
+    /// Frame DATA del upstream (con bytes, o vacío: frame DATA(0) de h2).
+    Data(Bytes),
+    /// Señal única de fin real del stream (inyectada tras agotar la fuente).
+    End,
+}
+
 /// Reenvía el cuerpo del upstream como stream SSE, **sin bufferizar**, usando
 /// el stream de `reqwest` directamente.
 ///
@@ -1142,6 +1156,17 @@ async fn full_response(
 ///
 /// Si el upstream se corta a mitad, el error del stream propaga al cliente y
 /// la conexión se cierra con error; no se reintenta (limitación documentada).
+///
+/// Limitaciones del evento en streaming (aceptadas, sin reintento):
+///
+/// - Aborto del cliente a mitad del stream: el body se descarta y el closure
+///   muere antes del fin real → **no hay evento** `gateway_requests` para esa
+///   petición.
+/// - Corte del upstream a mitad: si el stream termina en error no llega el fin
+///   real y **no hay evento**; si el upstream cierra limpio pero incompleto
+///   (sin chunk de `usage` o sin `finish_reason`), el evento se emite con los
+///   datos parciales acumulados (tokens/`finish_reason` desconocidos, sin
+///   ceros inventados).
 fn stream_response(
     response: reqwest::Response,
     backend_label: &str,
@@ -1151,25 +1176,30 @@ fn stream_response(
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let mut usage = StreamUsage::default();
     let mut sink = sink;
-    // Centinela de fin de stream (un `Bytes` vacío tras el último chunk) para
-    // procesar la línea parcial pendiente (EOF sin `\n` final). En HTTP/2 un
-    // DATA(0, END_STREAM) sí llega como chunk vacío en `bytes_stream` (igual
-    // que los frames vacíos intermedios); no colisiona con datos reales
-    // porque un chunk vacío no aporta bytes, `finish` es idempotente (sin
-    // línea pendiente no hace nada) y el `usage` solo se retiene con JSON
-    // válido.
+    // El `chain` terminal añade un único `Frame::End` tras agotarse la fuente:
+    // solo él cierra el extractor y emite el evento. Los chunks vacíos
+    // intermedios de h2 (frames DATA(0)) se tragan sin tocar el sink — no
+    // aportan bytes y no cierran el stream.
     let body = Body::from_stream(
         response
             .bytes_stream()
+            // El `map` solo etiqueta los datos: conserva el tipo de error del
+            // upstream para que un corte a mitad siga propagando al cliente.
+            .map(|result| result.map(Frame::Data))
             .chain(futures_util::stream::once(std::future::ready(Ok(
-                Bytes::new(),
+                Frame::End,
             ))))
             .filter_map(move |result| {
-                let keep = match &result {
-                    Ok(bytes) if bytes.is_empty() => {
+                let keep = match result {
+                    Ok(Frame::Data(bytes)) if bytes.is_empty() => None,
+                    Ok(Frame::Data(bytes)) => {
+                        usage.feed(&bytes);
+                        Some(Ok(bytes))
+                    }
+                    Ok(Frame::End) => {
                         usage.finish();
                         // Ledger de observabilidad (#39): el evento `request`
-                        // se emite al agotarse el stream, fuera del camino de
+                        // se emite al fin real del stream, fuera del camino de
                         // bytes; el passthrough no se altera y un fallo del
                         // emisor queda aislado (4.3).
                         if let Some(sink) = sink.take() {
@@ -1177,11 +1207,7 @@ fn stream_response(
                         }
                         None
                     }
-                    Ok(bytes) => {
-                        usage.feed(bytes);
-                        Some(result)
-                    }
-                    Err(_) => Some(result),
+                    Err(err) => Some(Err(err)),
                 };
                 std::future::ready(keep)
             }),
@@ -1395,12 +1421,11 @@ impl StreamUsage {
                 self.usage = usage;
             }
         }
-        // Pre-filtro barato análogo al del `usage`: solo se parsea la línea
-        // cuando puede traer `finish_reason` (los chunks intermedios traen
-        // `null`, que no sobrescribe el último conocido).
-        if data.contains("\"finish_reason\"")
-            && let Some(reason) = extract_finish_reason(&value)
-        {
+        // El pre-filtro de `finish_reason` ya se calculó arriba junto al del
+        // `usage`: solo se consulta el valor cuando la línea puede traerlo
+        // (los chunks intermedios traen `null`, que no sobrescribe el último
+        // conocido).
+        if has_finish_reason && let Some(reason) = extract_finish_reason(&value) {
             self.finish_reason = Some(reason);
         }
     }
@@ -1537,10 +1562,15 @@ fn emit_request_event(event: &RequestEvent) {
 
 /// Receptor del evento `gateway_requests` de una petición **en streaming**.
 ///
-/// Se emite al agotarse el stream (el centinela de [`stream_response`]), fuera
-/// del camino de bytes: el passthrough no se toca y no hay locks contenciosos
-/// (el `StreamUsage` queda atrapado en el closure del stream y este sink es el
-/// único que lo lee, al final).
+/// Se emite al fin real del stream (el [`Frame::End`] inyectado por
+/// [`stream_response`]), fuera del camino de bytes: el passthrough no se toca
+/// y no hay locks contenciosos (el `StreamUsage` queda atrapado en el closure
+/// del stream y este sink es el único que lo lee, al final).
+///
+/// Limitaciones: un aborto del cliente a mitad del stream descarta el sink con
+/// el body y **no emite evento**; un corte del upstream a mitad tampoco lo
+/// emite, o lo emite con datos parciales si el upstream cierra limpio pero
+/// incompleto (ver [`stream_response`]).
 struct RequestSink {
     /// Campos ya conocidos en el momento del enrutado, con los precios del
     /// modelo resueltos entonces (el «momento de la petición»).
@@ -1682,16 +1712,18 @@ async fn healthz() -> &'static str {
 mod tests {
     use super::{
         AppState, Candidate, MAX_RETRY_AFTER, MAX_SSE_LINE_BYTES, QUOTA_BODY_LIMIT, QuotaSignal,
-        RequestEvent, StreamUsage, TokenUsage, backend_id, chat_url, cost_usd, effective_cooldown,
-        emit_request_event, expand_backends, headers_show_daily_exhaustion, inject_include_usage,
-        parse_body_ledger, parse_retry_after, parse_usage, quota_reset_epoch_ms, quota_signal,
-        read_quota_body, request_requires_tool_call, response_has_tool_call,
+        RequestEvent, RequestSink, StreamUsage, TokenUsage, backend_id, chat_url, cost_usd,
+        effective_cooldown, emit_request_event, expand_backends, headers_show_daily_exhaustion,
+        inject_include_usage, parse_body_ledger, parse_retry_after, parse_usage,
+        quota_reset_epoch_ms, quota_signal, read_quota_body, request_requires_tool_call,
+        response_has_tool_call, stream_response,
     };
     use crate::config::{Backend, BackendKind, GatewayConfig};
     use crate::discovery::{ModelEntry, Pricing};
-    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
     use serde_json::json;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     /// Modelo elegible (free + tool-calling) para precargar un catálogo.
     fn eligible_model(id: &str, context_length: u32) -> ModelEntry {
@@ -2735,6 +2767,82 @@ route:
         );
 
         assert_eq!(extractor.finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// Regresión (h2): un frame DATA vacío **intermedio** llega como chunk
+    /// vacío y NO es el fin del stream. El evento `gateway_requests` se emite
+    /// una sola vez, al fin real, con el `usage`/`finish_reason` completos.
+    #[tokio::test]
+    async fn stream_response_emits_single_complete_event_after_intermediate_empty_chunk() {
+        let (captured, _guard) = capture_ledger_logs();
+
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hola\"},\"finish_reason\":null}]}\n\n",
+            )),
+            // Chunk vacío INTERMEDIO (frame DATA(0) de h2): no cierra el stream.
+            Ok(Bytes::new()),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        // Simula lo que `bytes_stream()` entrega en h2: cada frame como un
+        // chunk, vacíos intermedios incluidos, sin centinela propio (el fin lo
+        // añade `stream_response`).
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                    chunks,
+                )))
+                .expect("respuesta de test"),
+        );
+        let event = RequestEvent {
+            streaming: true,
+            request_id: "req-empty-chunk".to_owned(),
+            ..sample_event()
+        };
+        let response = stream_response(
+            response,
+            "static/test",
+            Some(RequestSink {
+                event,
+                started: Instant::now(),
+            }),
+        );
+
+        let passthrough = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("cuerpo íntegro")
+            .to_bytes();
+        let passthrough = String::from_utf8_lossy(&passthrough);
+        assert!(
+            passthrough.contains("[DONE]"),
+            "el stream llega íntegro al cliente: {passthrough}"
+        );
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let events: Vec<&String> = logs
+            .iter()
+            .filter(|log| log.contains("event_type=request"))
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "un solo evento, emitido al fin real del stream: {events:?}"
+        );
+        assert!(
+            events[0].contains("request_id=req-empty-chunk"),
+            "{}",
+            events[0]
+        );
+        assert!(events[0].contains("finish_reason=stop"), "{}", events[0]);
+        assert!(events[0].contains("tokens_in=7"), "{}", events[0]);
+        assert!(events[0].contains("tokens_out=9"), "{}", events[0]);
     }
 
     /// Capa que captura los campos de los logs `INFO` del hilo actual.
