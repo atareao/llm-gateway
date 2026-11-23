@@ -744,7 +744,11 @@ async fn route_with_failover(
                     return Ok(stream_response(
                         response,
                         &candidate_id,
-                        Some(RequestSink { event, started }),
+                        Some(RequestSink {
+                            event,
+                            started,
+                            metrics: Arc::clone(&state.metrics),
+                        }),
                     ));
                 }
 
@@ -837,6 +841,18 @@ async fn route_with_failover(
                             ),
                         };
                         emit_request_event(&event);
+                        // Métricas del ledger (#39, Grupo 5): los contadores de
+                        // tokens y coste se alimentan de los mismos datos que
+                        // el evento, solo con lo conocido.
+                        if let Some(model) = event.model_id.as_deref() {
+                            state.metrics.record_ledger_usage(
+                                &event.route,
+                                model,
+                                event.tokens_in,
+                                event.tokens_out,
+                                event.cost_usd,
+                            );
+                        }
                         return Ok(response);
                     }
                     Err(err) => {
@@ -1578,11 +1594,14 @@ struct RequestSink {
     /// Instante de inicio de la petición: la latencia del evento cubre todo el
     /// streaming, no solo hasta el primer byte.
     started: Instant,
+    /// Asa a los instrumentos del ledger: los contadores de tokens y coste se
+    /// incrementan junto con el evento, al fin real del stream.
+    metrics: Arc<Metrics>,
 }
 
 impl RequestSink {
     /// Completa el evento con el `usage`/`finish_reason` retenidos por el
-    /// extractor del stream y lo emite.
+    /// extractor del stream, lo emite y alimenta los contadores del ledger.
     fn complete(mut self, extractor: &StreamUsage) {
         self.event.ts = crate::discovery::now_ms();
         self.event.latency_ms = self.started.elapsed().as_millis() as u64;
@@ -1596,6 +1615,16 @@ impl RequestSink {
             self.event.pout,
         );
         emit_request_event(&self.event);
+        // Métricas del ledger (#39, Grupo 5): mismos datos que el evento.
+        if let Some(model) = self.event.model_id.as_deref() {
+            self.metrics.record_ledger_usage(
+                &self.event.route,
+                model,
+                self.event.tokens_in,
+                self.event.tokens_out,
+                self.event.cost_usd,
+            );
+        }
     }
 }
 
@@ -2812,6 +2841,7 @@ route:
             Some(RequestSink {
                 event,
                 started: Instant::now(),
+                metrics: ledger_metrics(),
             }),
         );
 
@@ -2983,10 +3013,10 @@ route:
     /// Construye el receptor del evento `request` de una petición en streaming
     /// con el `Metrics` que debe incrementar al fin real del stream.
     fn ledger_sink(event: RequestEvent, metrics: Arc<Metrics>) -> RequestSink {
-        let _ = metrics;
         RequestSink {
             event,
             started: Instant::now(),
+            metrics,
         }
     }
 

@@ -861,8 +861,15 @@ fn selection_event(
 /// `selection` (D5): `tracing` los envía a OpenObserve vía el stack OTLP de
 /// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
 /// sin tocar la detección de cambios.
-fn emit_selection_events(events: &[SelectionEvent]) {
+///
+/// Es también el wiring de las métricas del ledger (#39, Grupo 5): cada cambio
+/// incrementa `llm_gateway_model_selection_total{route,reason}` y fija el
+/// gauge `llm_gateway_selected_model_price_usd{route,model,side}` con el precio
+/// del modelo recién elegido.
+fn emit_selection_events(metrics: &Metrics, events: &[SelectionEvent]) {
     for event in events {
+        metrics.record_model_selection(&event.route, &event.reason.to_string());
+        metrics.set_selected_model_price(&event.route, &event.model_id, event.pin, event.pout);
         tracing::info!(
             event_type = event.event_type,
             ts = event.ts,
@@ -1288,10 +1295,65 @@ impl Registry {
     /// catálogo de `base_url`: una serie de `llm_gateway_allowlist_price_usd`
     /// por modelo de la lista curada con precio conocido y el
     /// `llm_gateway_selected_model_price_usd` de la selección pegajosa de cada
-    /// backend de pago sobre esa `base_url`. RED (TDD): esqueleto.
+    /// backend de pago sobre esa `base_url`.
+    ///
+    /// Se llama tras cada refresco del catálogo (ticker de
+    /// [`Registry::spawn_refresh`]), **no** por petición: el precio del
+    /// seleccionado queda así fresco aunque el elegido no cambie (histéresis).
+    /// Sin catálogo en caché no publica nada; los modelos con precio no
+    /// parseable no emiten serie (nunca un precio `0` falso).
     pub(crate) fn publish_price_gauges(&self, base_url: &str) {
-        let _ = (self, base_url);
-        todo!("Grupo 5 (5.2): gauges de precio desde el snapshot del catálogo")
+        let Some(cache) = self.catalogs.get(base_url) else {
+            return;
+        };
+        let Some(catalog) = cache.cached() else {
+            return;
+        };
+
+        // Gauge del seleccionado: la selección pegajosa de cada backend de pago
+        // sobre esta base, con el precio del snapshot vigente.
+        let selections = self
+            .paid_selections
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for ((route_idx, backend_idx), selection) in selections.iter() {
+            let Some(entry) = self.dynamic(*route_idx, *backend_idx) else {
+                continue;
+            };
+            if entry.base_url != base_url || entry.tier != Tier::Paid {
+                continue;
+            }
+            if let Some((pin, pout)) = self.model_price(base_url, &selection.model) {
+                self.metrics.set_selected_model_price(
+                    self.route_name(*route_idx),
+                    &selection.model,
+                    Some(pin),
+                    Some(pout),
+                );
+            }
+        }
+        drop(selections);
+
+        // Gauge de la lista curada: una serie por modelo de `allow` con precio
+        // conocido, etiquetada solo con `model`. Dos backends que comparten
+        // `base_url` publican los mismos valores (mismo catálogo): idempotente.
+        for entry in &self.dynamic {
+            if entry.base_url != base_url || entry.tier != Tier::Paid || entry.allow.is_empty() {
+                continue;
+            }
+            for model in catalog.iter() {
+                if !matches_allow(&model.id, &entry.allow) {
+                    continue;
+                }
+                if let Some((pin, pout)) = price_per_token(model) {
+                    // Del catálogo (USD por token) a USD/Mtok, la unidad de los
+                    // eventos y gauges del ledger.
+                    let (pin, pout) = (TOKENS_PER_MILLION * pin, TOKENS_PER_MILLION * pout);
+                    self.metrics
+                        .set_allowlist_price(&model.id, blend_parts(pin, pout));
+                }
+            }
+        }
     }
 
     /// `true` si algún backend dinámico respeta la cuota diaria free.
@@ -1536,7 +1598,7 @@ impl Registry {
             &candidates,
             now_ms(),
         ) {
-            emit_selection_events(std::slice::from_ref(&event));
+            emit_selection_events(&self.metrics, std::slice::from_ref(&event));
         }
 
         // El elegido al frente; el resto, en orden de precio, es el failover.
@@ -1631,16 +1693,22 @@ impl Registry {
     /// con [`MissedTickBehavior::Delay`]. Un refresco fallido nunca aborta el
     /// bucle (la caché previa se conserva).
     ///
+    /// Tras cada tick se publican los gauges de precio del ledger
+    /// ([`Registry::publish_price_gauges`]): es el punto donde ya se ha
+    /// actualizado el snapshot de precios y no es camino de petición.
+    ///
     /// Devuelve un `JoinHandle` por catálogo; el llamante decide qué hacer con
     /// ellos (`main.rs` los aborta en el cierre ordenado).
-    pub fn spawn_refresh(&self) -> Vec<JoinHandle<()>> {
+    pub fn spawn_refresh(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
         let mut handles = Vec::new();
-        for cache in self.catalogs.values() {
+        for (base_url, cache) in self.catalogs.iter() {
             let interval = cache.ttl();
             if interval.is_zero() {
                 continue;
             }
             let cache = Arc::clone(cache);
+            let this = Arc::clone(self);
+            let base_url = base_url.clone();
             handles.push(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1649,6 +1717,8 @@ impl Registry {
                     // Pasa por el mismo guardián que el refresco on-demand para
                     // no solapar dos fetches de `/models`.
                     cache.refresh_guarded().await;
+                    // Gauges de precio del ledger (#39, Grupo 5).
+                    this.publish_price_gauges(&base_url);
                 }
             }));
         }
@@ -2323,12 +2393,21 @@ route:
     /// `base_url` del backend de pago de los tests.
     const PAID_BASE: &str = "http://paid.test/v1";
 
-    /// Config mínima con un backend de pago sobre `base_url`.
+    /// Config mínima con un backend de pago sobre `base_url` y ruta `paid-unit`.
+    ///
+    /// El nombre de ruta es el de los tests históricos; los nuevos tests del
+    /// ledger (Grupo 5) usan [`paid_config_named`] para aislar sus series del
+    /// registro global de métricas.
     fn paid_config(base_url: &str, discovery: &str) -> GatewayConfig {
+        paid_config_named(base_url, discovery, "paid-unit")
+    }
+
+    /// Config mínima con un backend de pago sobre `base_url` y ruta propia.
+    fn paid_config_named(base_url: &str, discovery: &str, route: &str) -> GatewayConfig {
         let yaml = format!(
             r#"
 route:
-  - name: paid-unit
+  - name: {route}
     backend:
       - kind: openrouter_paid
         profile: code
@@ -3535,14 +3614,19 @@ route:
 
     /// Registry de pago que comparte el `Metrics` con el test, para renderizar
     /// las series que el wiring del ledger registra.
+    ///
+    /// El nombre de ruta es propio de cada test: los instrumentos viven en el
+    /// registro global y otros tests de selección (que usan `paid-unit`)
+    /// ejecutan en paralelo y también incrementan estos contadores.
     fn paid_registry_with_metrics(
+        route: &str,
         base_url: &str,
         discovery: &str,
         models: Vec<ModelEntry>,
     ) -> (Registry, Arc<Metrics>) {
         let metrics = metrics();
         let registry = Registry::new(
-            &paid_config(base_url, discovery),
+            &paid_config_named(base_url, discovery, route),
             reqwest::Client::new(),
             Arc::clone(&metrics),
         );
@@ -3560,6 +3644,7 @@ route:
     async fn selection_change_records_counter_and_price_gauge() {
         let _guard = blacklist_gauge_guard();
         let (registry, metrics) = paid_registry_with_metrics(
+            "paid-ledger-sel",
             PAID_BASE,
             &paid_discovery(""),
             vec![paid_expensive(), paid_cheap()],
@@ -3572,7 +3657,7 @@ route:
         let initial = ledger_line(
             &text,
             "llm_gateway_model_selection_total",
-            &[("route", "paid-unit"), ("reason", "initial")],
+            &[("route", "paid-ledger-sel"), ("reason", "initial")],
         )
         .unwrap_or_else(|| panic!("falta model_selection_total reason=initial:\n{text}"));
         assert_eq!(fnum(initial), 1.0, "una selección inicial:\n{initial}");
@@ -3581,7 +3666,7 @@ route:
             &text,
             "llm_gateway_selected_model_price_usd",
             &[
-                ("route", "paid-unit"),
+                ("route", "paid-ledger-sel"),
                 ("model", "acme/flash-a"),
                 ("side", "prompt"),
             ],
@@ -3597,7 +3682,7 @@ route:
             &text,
             "llm_gateway_selected_model_price_usd",
             &[
-                ("route", "paid-unit"),
+                ("route", "paid-ledger-sel"),
                 ("model", "acme/flash-a"),
                 ("side", "completion"),
             ],
@@ -3615,7 +3700,7 @@ route:
         let failover = ledger_line(
             &text,
             "llm_gateway_model_selection_total",
-            &[("route", "paid-unit"), ("reason", "failover")],
+            &[("route", "paid-ledger-sel"), ("reason", "failover")],
         )
         .unwrap_or_else(|| panic!("falta model_selection_total reason=failover:\n{text}"));
         assert_eq!(fnum(failover), 1.0, "un failover:\n{failover}");
@@ -3624,7 +3709,7 @@ route:
             &text,
             "llm_gateway_selected_model_price_usd",
             &[
-                ("route", "paid-unit"),
+                ("route", "paid-ledger-sel"),
                 ("model", "acme/flash-b"),
                 ("side", "prompt"),
             ],
@@ -3647,6 +3732,7 @@ route:
         // `flash-a` con patas asimétricas para verificar la ponderación del
         // blend: 0.75·40000 + 0.25·80000 = 50000 USD/Mtok.
         let (registry, metrics) = paid_registry_with_metrics(
+            "paid-ledger-snap",
             PAID_BASE,
             &paid_discovery(""),
             vec![
@@ -3660,7 +3746,10 @@ route:
 
         let series = text
             .lines()
-            .filter(|line| line.starts_with("llm_gateway_allowlist_price_usd"))
+            .filter(|line| {
+                line.starts_with("llm_gateway_allowlist_price_usd")
+                    && line.contains(r#"model="acme/flash-"#)
+            })
             .count();
         assert_eq!(series, 2, "una serie por modelo curado:\n{text}");
 
@@ -3693,7 +3782,7 @@ route:
             ledger_line(
                 &text,
                 "llm_gateway_selected_model_price_usd",
-                &[("route", "paid-unit")],
+                &[("route", "paid-ledger-snap")],
             )
             .is_none(),
             "sin selección no hay gauge del seleccionado:\n{text}"
@@ -3716,7 +3805,7 @@ route:
             &text,
             "llm_gateway_selected_model_price_usd",
             &[
-                ("route", "paid-unit"),
+                ("route", "paid-ledger-snap"),
                 ("model", "acme/flash-a"),
                 ("side", "prompt"),
             ],

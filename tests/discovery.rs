@@ -334,7 +334,7 @@ route:
 "#
     );
     let config: GatewayConfig = serde_saphyr::from_str(&yaml).expect("config de test válida");
-    let registry = Registry::new(&config, reqwest::Client::new(), metrics());
+    let registry = Arc::new(Registry::new(&config, reqwest::Client::new(), metrics()));
     let handles = registry.spawn_refresh();
 
     let cache = registry.catalog(&base).expect("catálogo registrado");
