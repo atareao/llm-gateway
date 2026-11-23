@@ -142,6 +142,10 @@ route:
 # Observabilidad (opcional). Ausente → el gateway no exporta nada por OTLP y
 # solo expone /metrics en formato Prometheus, como antes.
 # observability:
+#   # Emisión de los eventos del ledger (`catalog`, `selection`, `request`).
+#   # Default true. `false` desactiva los tres eventos sin tocar las métricas
+#   # Prometheus ni la exportación OTLP. Ver docs/observability-ledger.md.
+#   # events: false
 #   otlp:
 #     # Base del colector, sin `/api/<organización>`.
 #     endpoint: "http://localhost:5080"
