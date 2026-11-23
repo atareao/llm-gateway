@@ -196,3 +196,53 @@ con `llm_gateway_rs::config::load` en un test.
   `blacklist_size` es por instancia y la serie OTel es global; varias
   instancias en el mismo proceso podrían desincronizar la caché del valor
   publicado. En el binario hay una sola instancia.
+
+## Cierre del milestone B — respaldo de pago dinámico (#37)
+
+Cierre del **milestone B** (respaldo de pago dinámico) del change
+`openspec/changes/add-openrouter-free-quota-guard/` (issue #37). No cambia
+endpoints ni esquema: añade un `kind: openrouter_paid` opcional y campos
+opcionales en `discovery`. La verificación E2E manual queda para el
+coordinador.
+
+### Qué se ha cerrado
+
+- **Gate de cuota free, reactivo y proactivo.** El `429` de cuota diaria
+  (`limit_source == openrouter_free_tier_daily`, con heurística
+  `X-RateLimit-Remaining: 0` + `X-RateLimit-Reset` > 5 min) abre un gate
+  global con deadline `T` (epoch de `X-RateLimit-Reset`, fallback al siguiente
+  `00:00 UTC`, tope `MAX_QUOTA_GATE` de 24 h). En paralelo, el sondeo de
+  `GET {base_url}/key` abre el mismo gate cuando
+  `free_model_daily_requests.remaining == 0`. Con el gate abierto la expansión
+  dinámica free devuelve cero candidatos y la ruta salta al respaldo.
+- **`kind: openrouter_paid` con lista curada `discovery.allow`.** Un backend de
+  pago reutiliza el catálogo cacheado (mismo `/models` y mismo TTL por
+  `base_url`, sin tráfico extra) y propone únicamente modelos que coinciden con
+  algún patrón glob de `allow`, soportan tool-calling, tienen precio positivo
+  (excluye el tier free y los `:batch`) y cumplen `min_context`. Un `allow`
+  ausente o vacío aporta cero candidatos; un patrón válido sin coincidencias se
+  registra como aviso, no como error.
+- **Más barato de la allowlist por `blend`.** Los elegibles se ordenan por
+  `blend = 0.75·entrada + 0.25·salida` ascendente, con desempate por
+  `context_length` desc y `id` asc. El primero es el modelo elegido y el resto
+  el orden de failover, **sin round-robin** (a diferencia de `openrouter_free`).
+- **Selección pegajosa con histéresis.** El modelo elegido por `(route, backend)`
+  solo cambia si falla o sale del catálogo, o si ha pasado
+  `reselect_interval_ms` (default 4 h) **y** el más barato mejora el precio al
+  menos `min_price_delta` (default 0.20). El refresco del catálogo no cambia el
+  modelo por sí solo; el estado no persiste entre reinicios.
+- **`static` final opcional.** `gateway.yaml.example` conserva un `kind: static`
+  como último recurso tras el `openrouter_paid`.
+
+### Follow-ups vivos
+
+- **Deduplicar el alias `z-ai/glm-flash-latest` ≈ `z-ai/glm-5.3-flash`.** El
+  catálogo de OpenRouter publica alias que apuntan al mismo modelo; con
+  `allow: ["z-ai/glm-5.*-flash"]` pueden aparecer dos entradas equivalentes y
+  ocupar dos posiciones del failover.
+- **Permitir `allow` por backend/ruta si algún día se quiere afinar por
+  perfil.** Hoy `allow` es global al bloque `discovery`; si los perfiles
+  necesitaran listas curadas distintas, habría que moverlo a nivel de backend.
+- **Histórico de precios y coste por petición: change aparte
+  `add-observability-ledger` (issue #39).** La selección por precio actual no
+  guarda serie temporal ni imputa coste por petición; eso vive en ese change.

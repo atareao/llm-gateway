@@ -18,6 +18,15 @@ pub const DEFAULT_REFRESH_INTERVAL_MS: u64 = 300_000;
 /// Cooldown por defecto de la blacklist dinámica (1 min).
 pub const DEFAULT_BLACKLIST_COOLDOWN_MS: u64 = 60_000;
 
+/// Intervalo por defecto del sondeo de la cuota free (1 min).
+pub const DEFAULT_QUOTA_POLL_INTERVAL_MS: u64 = 60_000;
+
+/// Cadencia por defecto de reselección del modelo de pago (4 h).
+pub const DEFAULT_RESELECT_INTERVAL_MS: u64 = 4 * 60 * 60 * 1_000;
+
+/// Mejora relativa por defecto exigida para cambiar de modelo de pago (20 %).
+pub const DEFAULT_MIN_PRICE_DELTA: f64 = 0.20;
+
 /// Configuración completa del gateway.
 #[derive(Debug, Deserialize)]
 pub struct GatewayConfig {
@@ -142,6 +151,19 @@ pub enum BackendKind {
     Static,
     /// Backend dinámico que se expande al catálogo free de OpenRouter.
     OpenrouterFree,
+    /// Backend dinámico que se expande a la lista curada de modelos de pago.
+    OpenrouterPaid,
+}
+
+impl BackendKind {
+    /// Etiqueta estable del tipo de backend, usada en los mensajes de configuración.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::OpenrouterFree => "openrouter_free",
+            Self::OpenrouterPaid => "openrouter_paid",
+        }
+    }
 }
 
 /// Perfil de uso que determina la clasificación de modelos dinámicos.
@@ -178,6 +200,26 @@ fn default_blacklist_cooldown_ms() -> u64 {
     DEFAULT_BLACKLIST_COOLDOWN_MS
 }
 
+/// Valor por defecto de `respect_daily_quota` (`true`).
+fn default_respect_daily_quota() -> bool {
+    true
+}
+
+/// Valor por defecto de `quota_poll_interval_ms` ([`DEFAULT_QUOTA_POLL_INTERVAL_MS`]).
+fn default_quota_poll_interval_ms() -> u64 {
+    DEFAULT_QUOTA_POLL_INTERVAL_MS
+}
+
+/// Valor por defecto de `reselect_interval_ms` ([`DEFAULT_RESELECT_INTERVAL_MS`]).
+fn default_reselect_interval_ms() -> u64 {
+    DEFAULT_RESELECT_INTERVAL_MS
+}
+
+/// Valor por defecto de `min_price_delta` ([`DEFAULT_MIN_PRICE_DELTA`]).
+fn default_min_price_delta() -> f64 {
+    DEFAULT_MIN_PRICE_DELTA
+}
+
 /// Configuración de descubrimiento de un backend `openrouter_free`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Discovery {
@@ -192,6 +234,26 @@ pub struct Discovery {
     /// Reclasificaciones manuales por perfil (opcional).
     #[serde(default)]
     pub overrides: Option<ClassifyOverrides>,
+    /// Respetar la cuota diaria free: abre el gate global al detectar el
+    /// agotamiento y sondea `GET {base_url}/key` para anticiparlo. Por defecto
+    /// `true`; `false` desactiva gate y sondeo para este backend.
+    #[serde(default = "default_respect_daily_quota")]
+    pub respect_daily_quota: bool,
+    /// Intervalo del sondeo de cuota, en milisegundos (debe ser mayor que 0).
+    #[serde(default = "default_quota_poll_interval_ms")]
+    pub quota_poll_interval_ms: u64,
+    /// Lista curada de patrones glob (`*` = cero o más caracteres) sobre el
+    /// `model_id` para un backend `openrouter_paid`. Sin lista por defecto en el
+    /// código: ausente o vacía ⇒ el backend de pago aporta cero candidatos; la
+    /// curación vive en la configuración.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Cadencia mínima de reselección del modelo de pago, en milisegundos.
+    #[serde(default = "default_reselect_interval_ms")]
+    pub reselect_interval_ms: u64,
+    /// Mejora relativa mínima de precio exigida para cambiar de modelo de pago.
+    #[serde(default = "default_min_price_delta")]
+    pub min_price_delta: f64,
 }
 
 /// Reclasificaciones manuales aplicadas a la heurística de clasificación.
@@ -215,11 +277,30 @@ impl Discovery {
     pub fn blacklist_cooldown(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.blacklist_cooldown_ms)
     }
+
+    /// Intervalo efectivo del sondeo de cuota del bloque.
+    pub fn quota_poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.quota_poll_interval_ms)
+    }
+
+    /// Cadencia efectiva de reselección del modelo de pago del bloque.
+    pub fn reselect_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.reselect_interval_ms)
+    }
 }
 
 impl Backend {
-    /// `true` si el backend es dinámico (`openrouter_free`).
+    /// `true` si el backend es dinámico (`openrouter_free` u `openrouter_paid`).
     pub fn is_dynamic(&self) -> bool {
+        matches!(
+            self.kind,
+            BackendKind::OpenrouterFree | BackendKind::OpenrouterPaid
+        )
+    }
+
+    /// `true` si el backend pertenece al tier free (`openrouter_free`): solo esos
+    /// abren el gate global de cuota diaria.
+    pub fn is_free_tier(&self) -> bool {
         self.kind == BackendKind::OpenrouterFree
     }
 
@@ -321,12 +402,13 @@ fn validate(config: &GatewayConfig) -> Result<()> {
                         );
                     }
                 }
-                BackendKind::OpenrouterFree => {
+                BackendKind::OpenrouterFree | BackendKind::OpenrouterPaid => {
                     if backend.api_key_env.as_deref().is_none_or(str::is_empty) {
                         bail!(
-                            "config: la ruta '{}' backend '{}' es de tipo openrouter_free y requiere 'api_key_env'",
+                            "config: la ruta '{}' backend '{}' es de tipo {} y requiere 'api_key_env'",
                             route.name,
-                            backend.label()
+                            backend.label(),
+                            backend.kind.label()
                         );
                     }
                     if let Some(discovery) = &backend.discovery {
@@ -340,6 +422,33 @@ fn validate(config: &GatewayConfig) -> Result<()> {
                         if discovery.blacklist_cooldown_ms == 0 {
                             bail!(
                                 "config: la ruta '{}' backend '{}' tiene discovery.blacklist_cooldown_ms = 0; debe ser mayor que 0",
+                                route.name,
+                                backend.label()
+                            );
+                        }
+                        if discovery.quota_poll_interval_ms == 0 {
+                            bail!(
+                                "config: la ruta '{}' backend '{}' tiene discovery.quota_poll_interval_ms = 0; debe ser mayor que 0",
+                                route.name,
+                                backend.label()
+                            );
+                        }
+                        if discovery.min_price_delta < 0.0 || !discovery.min_price_delta.is_finite()
+                        {
+                            bail!(
+                                "config: la ruta '{}' backend '{}' tiene discovery.min_price_delta = {}; debe ser mayor o igual que 0",
+                                route.name,
+                                backend.label(),
+                                discovery.min_price_delta
+                            );
+                        }
+                        if let Some(position) = discovery
+                            .allow
+                            .iter()
+                            .position(|pattern| pattern.trim().is_empty())
+                        {
+                            bail!(
+                                "config: la ruta '{}' backend '{}' tiene discovery.allow con un patrón vacío en la posición {position}",
                                 route.name,
                                 backend.label()
                             );
@@ -498,7 +607,11 @@ fn config_path() -> PathBuf {
 mod tests {
     use std::io::Write;
 
-    use super::{DEFAULT_BLACKLIST_COOLDOWN_MS, DEFAULT_REFRESH_INTERVAL_MS, load};
+    use super::{
+        BackendKind, DEFAULT_BLACKLIST_COOLDOWN_MS, DEFAULT_MIN_PRICE_DELTA,
+        DEFAULT_QUOTA_POLL_INTERVAL_MS, DEFAULT_REFRESH_INTERVAL_MS, DEFAULT_RESELECT_INTERVAL_MS,
+        Profile, load,
+    };
 
     fn write_temp(contents: &str) -> tempfile::NamedTempFile {
         let mut file = tempfile::Builder::new()
@@ -541,6 +654,59 @@ route:
     /// Ruta YAML con nombre y los bloques de backend ya renderizados.
     fn route_yaml(name: &str, backends: &[String]) -> String {
         format!("  - name: {name}\n    backend:\n{}", backends.concat())
+    }
+
+    /// Scenario: `discovery` vacío habilita el gate y el sondeo por defecto.
+    #[test]
+    fn empty_discovery_enables_daily_quota_with_default_poll_interval() {
+        let file = write_temp(&dynamic_yaml("{}"));
+
+        let config = load(file.path()).expect("empty discovery should load");
+
+        let discovery = config.route[0].backend[0]
+            .discovery
+            .as_ref()
+            .expect("discovery block should be present");
+        assert!(
+            discovery.respect_daily_quota,
+            "respect_daily_quota debe ser true por defecto"
+        );
+        assert_eq!(
+            discovery.quota_poll_interval_ms, DEFAULT_QUOTA_POLL_INTERVAL_MS,
+            "el intervalo de sondeo debe tomar el default"
+        );
+    }
+
+    /// Scenario: valores explícitos de gate y sondeo se respetan.
+    #[test]
+    fn explicit_respect_and_poll_interval_are_parsed() {
+        let file = write_temp(&dynamic_yaml(
+            "{ respect_daily_quota: false, quota_poll_interval_ms: 5000 }",
+        ));
+
+        let config = load(file.path()).expect("explicit quota fields should load");
+
+        let discovery = config.route[0].backend[0]
+            .discovery
+            .as_ref()
+            .expect("discovery block should be present");
+        assert!(!discovery.respect_daily_quota);
+        assert_eq!(discovery.quota_poll_interval_ms, 5_000);
+    }
+
+    /// Scenario: `quota_poll_interval_ms: 0` es error de configuración.
+    #[test]
+    fn explicit_zero_quota_poll_interval_is_rejected() {
+        let file = write_temp(&dynamic_yaml("{ quota_poll_interval_ms: 0 }"));
+
+        let err = load(file.path()).expect_err("zero poll interval should be rejected");
+        let message = err.to_string();
+
+        assert!(message.contains("mech-writer"), "message: {message}");
+        assert!(
+            message.contains("quota_poll_interval_ms"),
+            "el mensaje debe nombrar el campo: {message}"
+        );
     }
 
     /// Scenario: `discovery` con solo `min_context`
@@ -876,5 +1042,176 @@ route:
         let file = write_temp(&yaml);
 
         load(file.path()).expect("distinct base_urls should keep independent TTLs");
+    }
+
+    /// Backend de pago con el bloque `discovery` inyectado tal cual (indentado).
+    fn paid_yaml(discovery_block: &str) -> String {
+        format!(
+            r#"
+route:
+  - name: mech-code
+    backend:
+      - kind: openrouter_paid
+        profile: code
+        base_url: "{SHARED_BASE_URL}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+{discovery_block}
+"#
+        )
+    }
+
+    /// Scenario 5.1: `openrouter_paid` se parsea como backend dinámico con su
+    /// perfil y sin exigir `model`.
+    #[test]
+    fn openrouter_paid_is_parsed_with_profile_and_without_model() {
+        let file = write_temp(&paid_yaml("          min_context: 32768"));
+
+        let config = load(file.path()).expect("el backend de pago debe cargar");
+
+        let backend = &config.route[0].backend[0];
+        assert_eq!(backend.kind, BackendKind::OpenrouterPaid);
+        assert!(backend.is_dynamic(), "el backend de pago es dinámico");
+        assert!(
+            !backend.is_free_tier(),
+            "el backend de pago no pertenece al tier free"
+        );
+        assert_eq!(backend.profile(), Profile::Code);
+        assert_eq!(
+            backend.model, None,
+            "el modelo explícito se ignora en dinámicos"
+        );
+    }
+
+    /// Scenario 5.1: `openrouter_paid` sin `api_key_env` es error de configuración.
+    #[test]
+    fn openrouter_paid_requires_api_key_env() {
+        let yaml = format!(
+            r#"
+route:
+  - name: mech-code
+    backend:
+      - kind: openrouter_paid
+        profile: code
+        base_url: "{SHARED_BASE_URL}"
+"#
+        );
+        let file = write_temp(&yaml);
+
+        let err = load(file.path()).expect_err("sin api_key_env debe fallar");
+        let message = err.to_string();
+
+        assert!(message.contains("mech-code"), "message: {message}");
+        assert!(message.contains("openrouter_paid"), "message: {message}");
+        assert!(message.contains("api_key_env"), "message: {message}");
+    }
+
+    /// Scenario 5.1: un backend de pago sin `base_url` no deserializa.
+    #[test]
+    fn openrouter_paid_without_base_url_is_rejected() {
+        let yaml = r#"
+route:
+  - name: mech-code
+    backend:
+      - kind: openrouter_paid
+        profile: code
+        api_key_env: "OPENROUTER_API_KEY"
+"#;
+        let file = write_temp(yaml);
+
+        let err = load(file.path()).expect_err("sin base_url debe fallar");
+
+        assert!(
+            err.to_string().contains("base_url"),
+            "el error debe nombrar el campo ausente: {err}"
+        );
+    }
+
+    /// Scenario 5.2: defaults de `allow`, `reselect_interval_ms` y `min_price_delta`.
+    #[test]
+    fn paid_discovery_defaults_are_applied() {
+        let file = write_temp(&paid_yaml("          min_context: 32768"));
+
+        let config = load(file.path()).expect("discovery de pago con defaults debe cargar");
+        let discovery = config.route[0].backend[0]
+            .discovery
+            .as_ref()
+            .expect("bloque discovery presente");
+
+        assert!(
+            discovery.allow.is_empty(),
+            "sin `allow` no hay lista curada por defecto en el código"
+        );
+        assert_eq!(
+            discovery.reselect_interval_ms, DEFAULT_RESELECT_INTERVAL_MS,
+            "la cadencia de reselección debe tomar el default"
+        );
+        assert_eq!(
+            discovery.min_price_delta, DEFAULT_MIN_PRICE_DELTA,
+            "la mejora mínima debe tomar el default"
+        );
+    }
+
+    /// Scenario 5.2: los campos de pago explícitos se respetan tal cual.
+    #[test]
+    fn paid_discovery_explicit_fields_are_parsed() {
+        let file = write_temp(&paid_yaml(
+            "          allow: [\"z-ai/glm-5.*-flash\", \"qwen/qwen3.7-flash\"]\n          reselect_interval_ms: 600000\n          min_price_delta: 0.5",
+        ));
+
+        let config = load(file.path()).expect("discovery de pago explícito debe cargar");
+        let discovery = config.route[0].backend[0]
+            .discovery
+            .as_ref()
+            .expect("bloque discovery presente");
+
+        assert_eq!(
+            discovery.allow,
+            vec![
+                "z-ai/glm-5.*-flash".to_owned(),
+                "qwen/qwen3.7-flash".to_owned()
+            ],
+            "la lista curada conserva el orden declarado"
+        );
+        assert_eq!(discovery.reselect_interval_ms, 600_000);
+        assert_eq!(discovery.min_price_delta, 0.5);
+    }
+
+    /// Scenario: Patrón vacío es error (backend de pago).
+    #[test]
+    fn empty_allow_pattern_is_rejected_for_paid_backend() {
+        let file = write_temp(&paid_yaml("          allow: [\"\"]"));
+
+        let err = load(file.path()).expect_err("un patrón vacío debe rechazarse");
+        let message = err.to_string();
+
+        assert!(message.contains("mech-code"), "message: {message}");
+        assert!(message.contains("allow"), "message: {message}");
+        assert!(message.contains("vacío"), "message: {message}");
+    }
+
+    /// Un patrón vacío también es error en un backend free: la lista curada es
+    /// una invariante de configuración, no del tier.
+    #[test]
+    fn empty_allow_pattern_is_rejected_for_free_backend() {
+        let file = write_temp(&dynamic_yaml("{ allow: [\"\"] }"));
+
+        let err = load(file.path()).expect_err("un patrón vacío debe rechazarse");
+        let message = err.to_string();
+
+        assert!(message.contains("mech-writer"), "message: {message}");
+        assert!(message.contains("allow"), "message: {message}");
+    }
+
+    /// Scenario 5.2: `min_price_delta` negativo es error de configuración.
+    #[test]
+    fn negative_min_price_delta_is_rejected() {
+        let file = write_temp(&paid_yaml("          min_price_delta: -0.1"));
+
+        let err = load(file.path()).expect_err("una mejora negativa no tiene sentido");
+        let message = err.to_string();
+
+        assert!(message.contains("mech-code"), "message: {message}");
+        assert!(message.contains("min_price_delta"), "message: {message}");
     }
 }
