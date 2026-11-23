@@ -40,6 +40,5 @@ opentelemetry-http = "0.33"
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = "3"
 http-body-util = "0.1"
-futures-util = "0.3"
 opentelemetry-proto = { version = "0.33", default-features = false, features = ["gen-tonic-messages", "metrics", "logs", "trace"] }
 prost = "0.14"

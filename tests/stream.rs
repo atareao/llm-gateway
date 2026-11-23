@@ -557,3 +557,46 @@ async fn stream_relay_preserves_final_usage_chunk() {
     );
     assert!(body.contains("data: [DONE]"), "falta el terminador: {body}");
 }
+
+/// Mock SSE que emite la línea del `usage` **sin `\n` final** y cierra el
+/// stream (upstream descuidado que no termina la última línea).
+async fn spawn_sse_usage_backend_no_trailing_newline() -> String {
+    async fn sse() -> Response {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from_static(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}",
+        ))];
+        let stream = futures_util::stream::iter(chunks);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .expect("construir respuesta SSE")
+    }
+
+    let app = Router::new().route("/v1/chat/completions", post(sse));
+    spawn(app).await
+}
+
+/// Scenario: el upstream cierra el stream sin `\n` final tras la línea del
+/// `usage` — el relay no debe colgarse ni alterar los bytes que recibe el
+/// cliente (el flush de la línea pendiente es transparente).
+#[tokio::test]
+async fn stream_with_usage_line_without_trailing_newline_passes_through() {
+    let backend = spawn_sse_usage_backend_no_trailing_newline().await;
+    let gateway = spawn_gateway(&[(&backend, "qwen2.5:7b-instruct")]).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .json(&json!({"model": "mech-writer", "stream": true, "messages": []}))
+        .send()
+        .await
+        .expect("request al gateway");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.expect("cuerpo del stream");
+    assert!(
+        body.contains("\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}"),
+        "la línea sin \\n final debe llegar íntegra al cliente: {body}"
+    );
+}

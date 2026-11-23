@@ -1049,12 +1049,31 @@ fn stream_response(response: reqwest::Response, backend_label: &str) -> Response
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let mut usage = StreamUsage::default();
-    let body = Body::from_stream(response.bytes_stream().map(move |result| {
-        if let Ok(bytes) = &result {
-            usage.feed(bytes);
-        }
-        result
-    }));
+    // Centinela de fin de stream (un `Bytes` vacío tras el último chunk) para
+    // procesar la línea parcial pendiente (EOF sin `\n` final). `hyper` no
+    // emite data frames vacíos en `bytes_stream`, así que no colisiona con
+    // chunks reales del upstream; y `finish` es idempotente por si acaso.
+    let body = Body::from_stream(
+        response
+            .bytes_stream()
+            .chain(futures_util::stream::once(std::future::ready(Ok(
+                Bytes::new(),
+            ))))
+            .filter_map(move |result| {
+                let keep = match &result {
+                    Ok(bytes) if bytes.is_empty() => {
+                        usage.finish();
+                        None
+                    }
+                    Ok(bytes) => {
+                        usage.feed(bytes);
+                        Some(result)
+                    }
+                    Err(_) => Some(result),
+                };
+                std::future::ready(keep)
+            }),
+    );
 
     assemble(
         status,
@@ -1145,17 +1164,36 @@ fn inject_include_usage(payload: &mut Value) {
     };
     let options = object
         .entry("stream_options".to_owned())
+        .and_modify(|value| {
+            // Un valor presente pero no-objeto (p. ej. `null`) se reemplaza:
+            // con `entry().or_insert_with` a secas sobreviviría y la inyección
+            // se perdería en silencio (`as_object_mut` daría `None`).
+            if !value.is_object() {
+                *value = Value::Object(Map::new());
+            }
+        })
         .or_insert_with(|| Value::Object(Map::new()));
     if let Some(options) = options.as_object_mut() {
         options.insert("include_usage".to_owned(), Value::Bool(true));
     }
 }
 
+/// Cap del buffer de reensamblado de líneas SSE (bytes). Una línea parcial que
+/// lo supere se descarta: el `usage` del chunk final siempre llega en una
+/// línea corta, y el cap solo acota la memoria ante upstreams malformados.
+const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
+
 /// Acumula las líneas SSE que llegan troceadas y retiene el último `usage`
 /// conocido visto (el del chunk final de un stream con `include_usage`).
+///
+/// El buffer es de bytes: la conversión a UTF-8 (lossy) se hace una vez por
+/// línea completa, no en cada fragmento (así un codepoint multibyte partido
+/// entre chunks no se corrompe con caracteres de reemplazo espurios).
 #[derive(Default)]
 struct StreamUsage {
-    buffer: String,
+    buffer: Vec<u8>,
+    /// `true` mientras se descarta una línea parcial sobredimensionada.
+    discarding: bool,
     usage: TokenUsage,
 }
 
@@ -1164,13 +1202,57 @@ impl StreamUsage {
     /// una línea `data:` puede llegar partida entre varios fragmentos).
     ///
     /// Solo se procesan las líneas completas: el resto queda en el buffer a la
-    /// espera del siguiente fragmento.
+    /// espera del siguiente fragmento. Una línea parcial que supere
+    /// [`MAX_SSE_LINE_BYTES`] se descarta (junto con todo lo que reste de ella
+    /// hasta su `\n`) para acotar la memoria del reensamblado.
     fn feed(&mut self, chunk: &[u8]) {
-        self.buffer.push_str(&String::from_utf8_lossy(chunk));
-        while let Some(pos) = self.buffer.find('\n') {
-            let line: String = self.buffer.drain(..=pos).collect();
-            self.consume_line(line.trim_end_matches(['\r', '\n']));
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            if self.discarding {
+                // Línea sobredimensionada en curso: se salta hasta su `\n`
+                // (incluido) sin acumular nada.
+                let Some(pos) = rest.iter().position(|&byte| byte == b'\n') else {
+                    return;
+                };
+                self.discarding = false;
+                rest = &rest[pos + 1..];
+            } else if let Some(pos) = rest.iter().position(|&byte| byte == b'\n') {
+                let (line, tail) = rest.split_at(pos);
+                self.buffer.extend_from_slice(line);
+                self.consume_buffered_line();
+                rest = &tail[1..];
+            } else {
+                self.buffer.extend_from_slice(rest);
+                if self.buffer.len() > MAX_SSE_LINE_BYTES {
+                    self.buffer.clear();
+                    self.discarding = true;
+                }
+                return;
+            }
         }
+    }
+
+    /// Procesa la línea parcial pendiente al terminar el stream (EOF sin `\n`
+    /// final), para no perder el `usage` de upstreams que no cierran la última
+    /// línea. Idempotente: sin línea pendiente no hace nada.
+    fn finish(&mut self) {
+        if self.buffer.is_empty() {
+            self.discarding = false;
+            return;
+        }
+        self.consume_buffered_line();
+    }
+
+    /// Consume la línea completa acumulada en el buffer. Las líneas
+    /// sobredimensionadas se descartan sin parsear (el `usage` del chunk final
+    /// siempre llega en una línea corta).
+    fn consume_buffered_line(&mut self) {
+        let bytes = std::mem::take(&mut self.buffer);
+        if bytes.len() > MAX_SSE_LINE_BYTES {
+            return;
+        }
+        let line = String::from_utf8_lossy(&bytes);
+        self.consume_line(line.trim_end_matches(['\r', '\n']));
     }
 
     /// Consume una línea SSE completa. Solo los eventos `data:` con un JSON
@@ -1182,6 +1264,12 @@ impl StreamUsage {
         };
         let data = data.trim_start();
         if data == "[DONE]" {
+            return;
+        }
+        // Pre-filtro barato: la gran mayoría de los chunks del stream no traen
+        // `usage`, y así se evita parsear JSON por cada línea. Comportamiento
+        // idéntico (salvo claves `\uXXXX` escapadas, irreales en la práctica).
+        if !data.contains("\"usage\"") {
             return;
         }
         let Ok(value) = serde_json::from_str::<Value>(data) else {
@@ -1311,8 +1399,8 @@ async fn healthz() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Candidate, MAX_RETRY_AFTER, QUOTA_BODY_LIMIT, QuotaSignal, StreamUsage,
-        TokenUsage, backend_id, chat_url, effective_cooldown, expand_backends,
+        AppState, Candidate, MAX_RETRY_AFTER, MAX_SSE_LINE_BYTES, QUOTA_BODY_LIMIT, QuotaSignal,
+        StreamUsage, TokenUsage, backend_id, chat_url, effective_cooldown, expand_backends,
         headers_show_daily_exhaustion, inject_include_usage, parse_body_usage, parse_retry_after,
         parse_usage, quota_reset_epoch_ms, quota_signal, read_quota_body,
         request_requires_tool_call, response_has_tool_call,
@@ -2073,5 +2161,99 @@ route:
 
         assert_eq!(extractor.usage.prompt_tokens, Some(7));
         assert_eq!(extractor.usage.completion_tokens, Some(9));
+    }
+
+    /// Scenario: una línea parcial sin `\n` que supera el cap de reensamblado
+    /// se descarta (el buffer no crece sin límite) y el stream sigue
+    /// funcionando: el `usage` posterior se registra con normalidad.
+    #[test]
+    fn stream_usage_discards_oversized_partial_line_and_keeps_working() {
+        let mut extractor = StreamUsage::default();
+
+        // Línea parcial enorme (sin `\n`) que supera el cap: se descarta.
+        let big = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        extractor.feed(&big);
+        assert!(
+            extractor.buffer.len() <= MAX_SSE_LINE_BYTES,
+            "el buffer de reensamblado no debe crecer sin límite: {} bytes",
+            extractor.buffer.len()
+        );
+
+        // El resto de la línea descartada (hasta su `\n`) no se interpreta.
+        extractor.feed(
+            b"resto de la linea descartada\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\ndata: [DONE]\n\n",
+        );
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage {
+                prompt_tokens: Some(3),
+                completion_tokens: Some(4)
+            }
+        );
+    }
+
+    /// Scenario: el pre-filtro de `usage` no altera el comportamiento: una
+    /// línea que menciona `"usage"` dentro de un string (sin usage real) no
+    /// toca el valor retenido, y el chunk final con usage sí lo actualiza.
+    #[test]
+    fn stream_usage_prefilter_keeps_behavior_identical() {
+        let mut extractor = StreamUsage::default();
+
+        extractor.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"the word \\\"usage\\\" here\"}}]}\n\n",
+        );
+        extractor.feed(b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n");
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage {
+                prompt_tokens: Some(1),
+                completion_tokens: Some(2)
+            }
+        );
+    }
+
+    /// Scenario: el stream termina sin `\n` final (EOF con línea parcial
+    /// pendiente): `finish` procesa la última línea para no perder el `usage`
+    /// de upstreams que no cierran la línea. Es idempotente si se llama de más.
+    #[test]
+    fn stream_usage_finish_processes_last_partial_line() {
+        let mut extractor = StreamUsage::default();
+        extractor.feed(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}");
+        assert_eq!(
+            extractor.usage,
+            TokenUsage::default(),
+            "sin \\n aún no se procesa"
+        );
+
+        extractor.finish();
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(6)
+            }
+        );
+
+        // Idempotente: llamar de más no altera el resultado.
+        extractor.finish();
+        assert_eq!(extractor.usage.prompt_tokens, Some(5));
+    }
+
+    /// Scenario: `stream_options: null` del cliente se reemplaza por el objeto
+    /// con `include_usage: true` (un `null` no debe silenciar la inyección).
+    #[test]
+    fn inject_include_usage_replaces_null_stream_options() {
+        let mut body = json!({"stream": true, "stream_options": null});
+
+        inject_include_usage(&mut body);
+
+        assert_eq!(
+            body.pointer("/stream_options/include_usage"),
+            Some(&json!(true)),
+            "un stream_options null debe reemplazarse por el objeto con include_usage"
+        );
     }
 }
