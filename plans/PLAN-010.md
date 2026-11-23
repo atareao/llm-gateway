@@ -2,7 +2,7 @@
 
 - **Issue**: #37 (atareao/llm-gateway)
 - **Change OpenSpec**: `add-openrouter-free-quota-guard`
-- **Estado**: pendiente de aprobación
+- **Estado**: implementado, auditado (APROBADO) y E2E verificada 2026-11-23 (PR #38)
 
 ## Objetivo
 

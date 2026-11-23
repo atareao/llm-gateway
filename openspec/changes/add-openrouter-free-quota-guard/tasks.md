@@ -37,4 +37,4 @@
 - [x] 6.1 Actualizar `gateway.yaml.example`: respaldo `kind: openrouter_paid` con `profile` en `architect`/`code`/`writer`, `discovery.allow` con la lista por defecto y un `kind: static` final; verificar con los tests de configuración que el ejemplo sigue cargando (`cargo test`)
 - [x] 6.2 Documentar el gate, el sondeo, las métricas, `openrouter_paid`, la lista curada, la cadencia de selección y la histéresis en `docs/openrouter-free-routing.md`, y anotar los follow-ups en `docs/openrouter-free-followups.md`
 - [x] 6.3 Test de integración: con cuota agotada simulada, la ruta `code` responde desde el backend de pago sin ningún intento free, el contador de saltos incrementa y el modelo servido es el más barato de la lista curada
-- [ ] 6.4 Verificación manual E2E: `curl -s http://127.0.0.1:4010/metrics | rg free_quota` y una inferencia real con `finish_reason: stop`
+- [x] 6.4 Verificación manual E2E: `curl -s http://127.0.0.1:4010/metrics | rg free_quota` y una inferencia real con `finish_reason: stop`
