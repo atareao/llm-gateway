@@ -14,8 +14,8 @@
 
 ## 3. Evento de selección (`gateway_selection`)
 
-- [ ] 3.1 Emitir el evento al cambiar el modelo elegido de un `(route, backend)`, con `reason` en `initial`/`cheaper`/`failover`/`removed`, `pin`, `pout` y `prev_model_id`, verificado con tests de las cuatro transiciones (consume el estado de selección de #37)
-- [ ] 3.2 Verificar con un test que no se emite evento cuando el modelo elegido no cambia
+- [x] 3.1 Emitir el evento al cambiar el modelo elegido de un `(route, backend)`, con `reason` en `initial`/`cheaper`/`failover`/`removed`, `pin`, `pout` y `prev_model_id`, verificado con tests de las cuatro transiciones (consume el estado de selección de #37)
+- [x] 3.2 Verificar con un test que no se emite evento cuando el modelo elegido no cambia
 
 ## 4. Evento de petición (`gateway_requests`)
 
