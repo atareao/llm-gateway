@@ -36,6 +36,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt as _;
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -603,6 +604,9 @@ async fn route_with_failover(
     let started = Instant::now();
     let mut attempts = 0usize;
     let mut considered = 0usize;
+    // Último candidato probado: el evento `gateway_requests` etiqueta con el
+    // modelo del último intento (el elegido si hubo éxito).
+    let mut last: Option<&Candidate> = None;
     // Se decide una sola vez por petición y solo aplica en no-stream.
     let requires_tool_call = !streaming && request_requires_tool_call(body);
     let mut no_tool_call_seen = false;
@@ -612,6 +616,7 @@ async fn route_with_failover(
 
     for candidate in &candidates {
         considered += 1;
+        last = Some(candidate);
         let backend_idx = candidate.slot;
         // Resuelto una vez por intento: alimenta los logs de todos los caminos y
         // la cabecera `x-gateway-backend`, sin `format!` repetidos.
@@ -710,7 +715,35 @@ async fn route_with_failover(
                         latency_ms = started.elapsed().as_millis() as u64,
                         "petición completada"
                     );
-                    return Ok(stream_response(response, &candidate_id));
+                    // Ledger de observabilidad (#39): el evento `request` se
+                    // emite al agotarse el stream (chunk centinela), fuera del
+                    // camino de bytes. Los precios se resuelven ahora, en el
+                    // momento de la petición; tokens, `finish_reason`, latencia
+                    // y coste se completan al terminar el stream.
+                    let price = state.discovery.model_price(&candidate.base_url, &candidate.model);
+                    let event = RequestEvent {
+                        event_type: REQUEST_EVENT_TYPE,
+                        ts: 0,
+                        request_id: request_id.to_owned(),
+                        route: route.name.clone(),
+                        model_id: Some(candidate.model.clone()),
+                        streaming,
+                        attempts,
+                        failover: attempts > 1,
+                        outcome: Outcome::Success.label(),
+                        finish_reason: None,
+                        latency_ms: 0,
+                        tokens_in: None,
+                        tokens_out: None,
+                        pin: price.map(|(pin, _)| pin),
+                        pout: price.map(|(_, pout)| pout),
+                        cost_usd: None,
+                    };
+                    return Ok(stream_response(
+                        response,
+                        &candidate_id,
+                        Some(RequestSink { event, started }),
+                    ));
                 }
 
                 match full_response(response, &candidate_id).await {
@@ -734,9 +767,11 @@ async fn route_with_failover(
                             no_tool_call_seen = true;
                             continue;
                         }
-                        // Ledger de observabilidad (#39): tokens de la
-                        // respuesta no-stream; sin `usage` quedan desconocidos.
-                        let usage = parse_body_usage(&body_bytes);
+                        // Ledger de observabilidad (#39): tokens y
+                        // `finish_reason` de la respuesta no-stream, con un
+                        // único parseo del cuerpo; sin `usage` quedan
+                        // desconocidos.
+                        let (usage, finish_reason) = parse_body_ledger(&body_bytes);
                         if !usage.is_unknown() {
                             tracing::debug!(
                                 backend = %candidate_id,
@@ -769,6 +804,35 @@ async fn route_with_failover(
                             latency_ms = started.elapsed().as_millis() as u64,
                             "petición completada"
                         );
+                        // Ledger de observabilidad (#39): el evento `request`
+                        // con los precios del modelo en el momento de la
+                        // petición; un fallo del emisor no altera la respuesta
+                        // (4.3).
+                        let price = state.discovery.model_price(&candidate.base_url, &candidate.model);
+                        let event = RequestEvent {
+                            event_type: REQUEST_EVENT_TYPE,
+                            ts: crate::discovery::now_ms(),
+                            request_id: request_id.to_owned(),
+                            route: route.name.clone(),
+                            model_id: Some(candidate.model.clone()),
+                            streaming,
+                            attempts,
+                            failover: attempts > 1,
+                            outcome: Outcome::Success.label(),
+                            finish_reason,
+                            latency_ms: started.elapsed().as_millis() as u64,
+                            tokens_in: usage.prompt_tokens,
+                            tokens_out: usage.completion_tokens,
+                            pin: price.map(|(pin, _)| pin),
+                            pout: price.map(|(_, pout)| pout),
+                            cost_usd: cost_usd(
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                                price.map(|(pin, _)| pin),
+                                price.map(|(_, pout)| pout),
+                            ),
+                        };
+                        emit_request_event(&event);
                         return Ok(response);
                     }
                     Err(err) => {
@@ -823,6 +887,33 @@ async fn route_with_failover(
         latency_ms = started.elapsed().as_millis() as u64,
         "petición fallida"
     );
+
+    // Ledger de observabilidad (#39): la petición agotó la cadena; el evento
+    // etiqueta con el modelo del último intento (si lo hubo) y registra el
+    // resto de campos con lo conocido: un fallo también es un dato del ledger.
+    let (model_id, price) = last.map_or((None, None), |candidate| {
+        let price = state.discovery.model_price(&candidate.base_url, &candidate.model);
+        (Some(candidate.model.clone()), price)
+    });
+    let event = RequestEvent {
+        event_type: REQUEST_EVENT_TYPE,
+        ts: crate::discovery::now_ms(),
+        request_id: request_id.to_owned(),
+        route: route.name.clone(),
+        model_id,
+        streaming,
+        attempts,
+        failover: attempts > 1,
+        outcome: Outcome::AllFailed.label(),
+        finish_reason: None,
+        latency_ms: started.elapsed().as_millis() as u64,
+        tokens_in: None,
+        tokens_out: None,
+        pin: price.map(|(pin, _)| pin),
+        pout: price.map(|(_, pout)| pout),
+        cost_usd: None,
+    };
+    emit_request_event(&event);
 
     // Se distingue el motivo del agotamiento: si algún intento falló por no
     // traer `tool_calls`, el cliente recibe un código específico.
@@ -1045,10 +1136,15 @@ async fn full_response(
 ///
 /// Si el upstream se corta a mitad, el error del stream propaga al cliente y
 /// la conexión se cierra con error; no se reintenta (limitación documentada).
-fn stream_response(response: reqwest::Response, backend_label: &str) -> Response {
+fn stream_response(
+    response: reqwest::Response,
+    backend_label: &str,
+    sink: Option<RequestSink>,
+) -> Response {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let mut usage = StreamUsage::default();
+    let mut sink = sink;
     // Centinela de fin de stream (un `Bytes` vacío tras el último chunk) para
     // procesar la línea parcial pendiente (EOF sin `\n` final). En HTTP/2 un
     // DATA(0, END_STREAM) sí llega como chunk vacío en `bytes_stream` (igual
@@ -1066,6 +1162,13 @@ fn stream_response(response: reqwest::Response, backend_label: &str) -> Response
                 let keep = match &result {
                     Ok(bytes) if bytes.is_empty() => {
                         usage.finish();
+                        // Ledger de observabilidad (#39): el evento `request`
+                        // se emite al agotarse el stream, fuera del camino de
+                        // bytes; el passthrough no se altera y un fallo del
+                        // emisor queda aislado (4.3).
+                        if let Some(sink) = sink.take() {
+                            sink.complete(&usage);
+                        }
                         None
                     }
                     Ok(bytes) => {
@@ -1198,6 +1301,8 @@ struct StreamUsage {
     /// `true` mientras se descarta una línea parcial sobredimensionada.
     discarding: bool,
     usage: TokenUsage,
+    /// Último `finish_reason` **no nulo** visto en los chunks (`choices[0]`).
+    finish_reason: Option<String>,
 }
 
 impl StreamUsage {
@@ -1278,16 +1383,142 @@ impl StreamUsage {
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return;
         };
-        let usage = parse_usage(&value);
-        if !usage.is_unknown() && usage != self.usage {
-            tracing::debug!(
-                tokens_in = ?usage.prompt_tokens,
-                tokens_out = ?usage.completion_tokens,
-                "usage del stream (chunk final)"
-            );
-            self.usage = usage;
+        if data.contains("\"usage\"") {
+            let usage = parse_usage(&value);
+            if !usage.is_unknown() && usage != self.usage {
+                tracing::debug!(
+                    tokens_in = ?usage.prompt_tokens,
+                    tokens_out = ?usage.completion_tokens,
+                    "usage del stream (chunk final)"
+                );
+                self.usage = usage;
+            }
+        }
+        // Pre-filtro barato análogo al del `usage`: solo se parsea la línea
+        // cuando puede traer `finish_reason` (los chunks intermedios traen
+        // `null`, que no sobrescribe el último conocido).
+        if data.contains("\"finish_reason\"")
+            && let Some(reason) = extract_finish_reason(&value)
+        {
+            self.finish_reason = Some(reason);
         }
     }
+}
+
+// --- Ledger de observabilidad: evento de petición (`gateway_requests`) ------
+
+/// `event_type` del evento de petición del ledger (singular, como el resto de
+/// eventos: `catalog`, `selection`, `request`).
+const REQUEST_EVENT_TYPE: &str = "request";
+
+/// Evento estructurado `gateway_requests`: un evento por petición atendida
+/// (D5), con el resultado del enrutado, el `usage` del upstream y el coste
+/// calculado con los precios **en el momento de la petición**.
+///
+/// Los precios (`pin`, `pout`) van en USD por millón de tokens, la misma
+/// unidad de `gateway_catalog` y `gateway_selection`; `cost_usd` se calcula
+/// como `tokens_in·pin + tokens_out·pout` (precios por token, es decir,
+/// divididos entre un millón) y va en USD. Cuando falta el `usage` (o el
+/// precio del modelo), tokens y coste quedan **desconocidos** (`null`): nunca
+/// se inventa un `0`.
+#[derive(Debug, Clone, Serialize)]
+struct RequestEvent {
+    /// Tipo de evento del ledger: siempre `request`.
+    event_type: &'static str,
+    /// Momento de la emisión (fin de la petición), en ms epoch.
+    ts: u64,
+    /// Identificador de correlación de la petición.
+    request_id: String,
+    /// Nombre de la ruta atendida (`route.name` de la configuración).
+    route: String,
+    /// Modelo del último intento; `None` si no se intentó ninguno.
+    model_id: Option<String>,
+    /// `true` si la petición era `stream: true`.
+    streaming: bool,
+    /// Intentos reales contra upstream (con la API key resuelta).
+    attempts: usize,
+    /// `true` si hizo falta más de un intento (failover antes del primer
+    /// byte).
+    failover: bool,
+    /// Resultado global de la petición (`success`/`all_failed`).
+    outcome: &'static str,
+    /// `finish_reason` informado por el upstream, si se conoció.
+    finish_reason: Option<String>,
+    /// Latencia total de la petición, en ms (en streaming, hasta agotar el
+    /// stream).
+    latency_ms: u64,
+    /// Tokens de entrada (`usage.prompt_tokens`); `None` si no se informó.
+    tokens_in: Option<u64>,
+    /// Tokens de salida (`usage.completion_tokens`); `None` si no se informó.
+    tokens_out: Option<u64>,
+    /// Precio de entrada del modelo elegido, en USD/Mtok, en el momento de la
+    /// petición.
+    pin: Option<f64>,
+    /// Precio de salida del modelo elegido, en USD/Mtok, en el momento de la
+    /// petición.
+    pout: Option<f64>,
+    /// Coste de la petición en USD; `None` si faltan tokens o precios.
+    cost_usd: Option<f64>,
+}
+
+/// `cost_usd` de una petición: `tokens_in·pin + tokens_out·pout`, con los
+/// precios en USD/Mtok y el resultado en USD.
+///
+/// Devuelve `None` si falta cualquier pieza (un token desconocido o un precio
+/// desconocido): datos parciales no inventan un coste. Un coste `0.0` **con
+/// precios conocidos** sí es legítimo (0 tokens consumidos es un dato, no una
+/// ausencia).
+fn cost_usd(
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
+    pin: Option<f64>,
+    pout: Option<f64>,
+) -> Option<f64> {
+    let _ = (tokens_in, tokens_out, pin, pout);
+    None
+}
+
+/// `finish_reason` del primer `choices[0]` de una respuesta o evento SSE de
+/// chat. Un `null` (chunks intermedios del stream) o su ausencia devuelven
+/// `None`: solo un valor informado cuenta.
+fn extract_finish_reason(value: &Value) -> Option<String> {
+    let _ = value;
+    None
+}
+
+/// `usage` y `finish_reason` de una respuesta no-stream, con un **único**
+/// parseo del cuerpo (hot path del ledger). Un cuerpo que no sea JSON válido
+/// produce tokens desconocidos y `finish_reason` `None`.
+fn parse_body_ledger(bytes: &[u8]) -> (TokenUsage, Option<String>) {
+    let _ = bytes;
+    (TokenUsage::default(), None)
+}
+
+/// Emite el evento `gateway_requests` como log estructurado con `event_type`
+/// `request` (D5): `tracing` lo envía a OpenObserve vía el stack OTLP de
+/// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
+/// sin tocar la lógica de la petición.
+fn emit_request_event(_event: &RequestEvent) {}
+
+/// Receptor del evento `gateway_requests` de una petición **en streaming**.
+///
+/// Se emite al agotarse el stream (el centinela de [`stream_response`]), fuera
+/// del camino de bytes: el passthrough no se toca y no hay locks contenciosos
+/// (el `StreamUsage` queda atrapado en el closure del stream y este sink es el
+/// único que lo lee, al final).
+struct RequestSink {
+    /// Campos ya conocidos en el momento del enrutado, con los precios del
+    /// modelo resueltos entonces (`momento de la petición`).
+    event: RequestEvent,
+    /// Instante de inicio de la petición: la latencia del evento cubre todo el
+    /// streaming, no solo hasta el primer byte.
+    started: Instant,
+}
+
+impl RequestSink {
+    /// Completa el evento con el `usage`/`finish_reason` retenidos por el
+    /// extractor del stream y lo emite.
+    fn complete(self, _extractor: &StreamUsage) {}
 }
 
 /// Clona `body` y sustituye su `model` por `model`. El resto de campos
@@ -1403,9 +1634,10 @@ async fn healthz() -> &'static str {
 mod tests {
     use super::{
         AppState, Candidate, MAX_RETRY_AFTER, MAX_SSE_LINE_BYTES, QUOTA_BODY_LIMIT, QuotaSignal,
-        StreamUsage, TokenUsage, backend_id, chat_url, effective_cooldown, expand_backends,
-        headers_show_daily_exhaustion, inject_include_usage, parse_body_usage, parse_retry_after,
-        parse_usage, quota_reset_epoch_ms, quota_signal, read_quota_body,
+        RequestEvent, StreamUsage, TokenUsage, backend_id, chat_url, cost_usd,
+        effective_cooldown, emit_request_event, expand_backends,
+        headers_show_daily_exhaustion, inject_include_usage, parse_body_ledger, parse_body_usage,
+        parse_retry_after, parse_usage, quota_reset_epoch_ms, quota_signal, read_quota_body,
         request_requires_tool_call, response_has_tool_call,
     };
     use crate::config::{Backend, BackendKind, GatewayConfig};
@@ -2257,6 +2489,313 @@ route:
             body.pointer("/stream_options/include_usage"),
             Some(&json!(true)),
             "un stream_options null debe reemplazarse por el objeto con include_usage"
+        );
+    }
+
+    // --- Evento de petición (`gateway_requests`) -----------------------------
+
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::subscriber::DefaultGuard;
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    /// Evento de ejemplo con usage y precios conocidos (1000 in / 200 out a
+    /// 2.0/8.0 USD/Mtok → coste 0.0036 USD).
+    fn sample_event() -> RequestEvent {
+        RequestEvent {
+            event_type: "request",
+            ts: 1_700_000_000_000,
+            request_id: "req-test-1".to_owned(),
+            route: "code".to_owned(),
+            model_id: Some("acme/flash-a".to_owned()),
+            streaming: false,
+            attempts: 1,
+            failover: false,
+            outcome: "success",
+            finish_reason: Some("stop".to_owned()),
+            latency_ms: 42,
+            tokens_in: Some(1000),
+            tokens_out: Some(200),
+            pin: Some(2.0),
+            pout: Some(8.0),
+            cost_usd: Some(0.0036),
+        }
+    }
+
+    /// Escenario 4.1: el evento serializa **todos** los campos del contrato,
+    /// con `event_type` `request` (singular).
+    #[test]
+    fn request_event_serializes_contract_fields() {
+        let json = serde_json::to_value(sample_event()).expect("evento serializable");
+
+        assert_eq!(json["event_type"], json!("request"));
+        assert_eq!(json["ts"], json!(1_700_000_000_000u64));
+        assert_eq!(json["request_id"], json!("req-test-1"));
+        assert_eq!(json["route"], json!("code"));
+        assert_eq!(json["model_id"], json!("acme/flash-a"));
+        assert_eq!(json["streaming"], json!(false));
+        assert_eq!(json["attempts"], json!(1));
+        assert_eq!(json["failover"], json!(false));
+        assert_eq!(json["outcome"], json!("success"));
+        assert_eq!(json["finish_reason"], json!("stop"));
+        assert_eq!(json["latency_ms"], json!(42));
+        assert_eq!(json["tokens_in"], json!(1000));
+        assert_eq!(json["tokens_out"], json!(200));
+        assert_eq!(json["pin"], json!(2.0));
+        assert_eq!(json["pout"], json!(8.0));
+        assert_eq!(json["cost_usd"], json!(0.0036));
+    }
+
+    /// Escenario «Sin usage el coste queda desconocido»: tokens y coste van
+    /// `null` (nunca `0`) y el resto de campos se registran igualmente.
+    #[test]
+    fn request_event_without_usage_keeps_tokens_and_cost_null() {
+        let event = RequestEvent {
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            finish_reason: Some("stop".to_owned()),
+            ..sample_event()
+        };
+        let json = serde_json::to_value(&event).expect("evento serializable");
+
+        assert!(json["tokens_in"].is_null(), "{json}");
+        assert!(json["tokens_out"].is_null(), "{json}");
+        assert!(json["cost_usd"].is_null(), "{json}");
+        assert_eq!(json["route"], json!("code"), "route se registra igualmente");
+        assert_eq!(json["model_id"], json!("acme/flash-a"));
+        assert_eq!(json["latency_ms"], json!(42));
+        assert_eq!(json["outcome"], json!("success"));
+        assert_eq!(json["finish_reason"], json!("stop"));
+    }
+
+    /// Escenario 4.2: el coste es `tokens_in·pin + tokens_out·pout` en USD
+    /// (precios de entrada en USD/Mtok, divididos entre un millón).
+    #[test]
+    fn cost_usd_combines_tokens_and_prices_in_usd() {
+        let cost = cost_usd(Some(1000), Some(200), Some(2.0), Some(8.0))
+            .expect("coste con usage y precios completos");
+        assert!(
+            (cost - 0.0036).abs() < 1e-12,
+            "1000·2/1e6 + 200·8/1e6 = 0.0036 USD, coste: {cost}"
+        );
+        assert_eq!(
+            cost_usd(Some(1_000_000), Some(0), Some(2.0), Some(8.0)),
+            Some(2.0),
+            "un millón de tokens de entrada a 2 USD/Mtok cuesta 2 USD"
+        );
+    }
+
+    /// Datos parciales no inventan coste: falta cualquier pieza → desconocido.
+    #[test]
+    fn cost_usd_is_unknown_without_full_usage_or_prices() {
+        assert_eq!(cost_usd(None, Some(200), Some(2.0), Some(8.0)), None);
+        assert_eq!(cost_usd(Some(1000), None, Some(2.0), Some(8.0)), None);
+        assert_eq!(cost_usd(Some(1000), Some(200), None, Some(8.0)), None);
+        assert_eq!(cost_usd(Some(1000), Some(200), Some(2.0), None), None);
+    }
+
+    /// Un coste `0.0` con precios y tokens conocidos es un **dato** (0 tokens
+    /// consumidos), no una ausencia: no se confunde con desconocido.
+    #[test]
+    fn cost_usd_zero_tokens_with_known_prices_is_zero() {
+        assert_eq!(
+            cost_usd(Some(0), Some(0), Some(2.0), Some(8.0)),
+            Some(0.0),
+            "0 tokens con precios conocidos es coste 0, no desconocido"
+        );
+    }
+
+    /// Escenario 4.1 (no-stream): un único parseo del cuerpo extrae `usage` y
+    /// `finish_reason`.
+    #[test]
+    fn parse_body_ledger_reads_usage_and_finish_reason() {
+        let body = br#"{
+            "choices": [{"message": {"role": "assistant"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 200}
+        }"#;
+
+        let (usage, finish_reason) = parse_body_ledger(body);
+
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: Some(1000),
+                completion_tokens: Some(200)
+            }
+        );
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// Escenario «Sin usage»: los tokens quedan desconocidos (nunca `0`) y el
+    /// `finish_reason` del upstream se registra igualmente.
+    #[test]
+    fn parse_body_ledger_without_usage_keeps_tokens_unknown() {
+        let body =
+            br#"{"choices": [{"message": {"role": "assistant"}, "finish_reason": "stop"}]}"#;
+
+        let (usage, finish_reason) = parse_body_ledger(body);
+
+        assert_eq!(usage, TokenUsage::default(), "sin usage: desconocidos, no 0");
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// Un cuerpo que no es JSON válido produce todo desconocido (sin panic).
+    #[test]
+    fn parse_body_ledger_invalid_json_is_all_unknown() {
+        let (usage, finish_reason) = parse_body_ledger(b"<html>gateway error</html>");
+
+        assert_eq!(usage, TokenUsage::default());
+        assert_eq!(finish_reason, None);
+    }
+
+    /// Escenario 4.1 (streaming): el extractor del stream retiene el
+    /// `finish_reason` de los chunks (el chunk final con `usage` no lo trae).
+    #[test]
+    fn stream_usage_captures_finish_reason_from_chunks() {
+        let mut extractor = StreamUsage::default();
+
+        extractor
+            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"h\"},\"finish_reason\":null}]}\n\n");
+        extractor
+            .feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        extractor.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\n");
+        extractor.feed(b"data: [DONE]\n\n");
+
+        assert_eq!(
+            extractor.finish_reason.as_deref(),
+            Some("stop"),
+            "el finish_reason del chunk de contenido se retiene"
+        );
+        assert_eq!(extractor.usage.prompt_tokens, Some(3));
+        assert_eq!(extractor.usage.completion_tokens, Some(5));
+    }
+
+    /// Un `finish_reason: null` intermedio no sobrescribe el último conocido.
+    #[test]
+    fn stream_usage_finish_reason_null_does_not_overwrite() {
+        let mut extractor = StreamUsage::default();
+
+        extractor
+            .feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        extractor
+            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"mas\"},\"finish_reason\":null}]}\n\n");
+
+        assert_eq!(extractor.finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// Capa que captura los campos de los logs `INFO` del hilo actual.
+    #[derive(Clone)]
+    struct LedgerLayer {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for LedgerLayer {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().level() != &Level::INFO {
+                return;
+            }
+            let mut visitor = EventFieldsVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("lock captured ledger logs")
+                .push(visitor.fields.join(" "));
+        }
+    }
+
+    /// Capa que **entra en panic** al registrar el evento `request`: simula un
+    /// exportador caído para el aislamiento del emisor (4.3).
+    #[derive(Clone)]
+    struct PanickingLedgerLayer;
+
+    impl<S: Subscriber> Layer<S> for PanickingLedgerLayer {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut visitor = EventFieldsVisitor::default();
+            event.record(&mut visitor);
+            if visitor.fields.iter().any(|field| field == "event_type=request") {
+                panic!("exportador caído");
+            }
+        }
+    }
+
+    /// Visitante que serializa los campos del evento como `campo=valor`.
+    #[derive(Default)]
+    struct EventFieldsVisitor {
+        fields: Vec<String>,
+    }
+
+    impl Visit for EventFieldsVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+
+    /// Captura los logs `INFO` solo para el hilo actual.
+    fn capture_ledger_logs() -> (Arc<Mutex<Vec<String>>>, DefaultGuard) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(LedgerLayer {
+            events: Arc::clone(&events),
+        });
+        (events, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Suscriptor que entra en panic con el evento `request` (exportador
+    /// caído), solo para el hilo actual.
+    fn panicking_ledger_subscriber() -> impl Subscriber + Send + Sync {
+        tracing_subscriber::registry().with(PanickingLedgerLayer)
+    }
+
+    /// El emisor registra el evento como log estructurado con `event_type`
+    /// `request` y los campos del contrato (D5).
+    #[test]
+    fn emit_request_event_logs_contract_fields() {
+        let (captured, _guard) = capture_ledger_logs();
+
+        emit_request_event(&sample_event());
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let request = logs
+            .iter()
+            .find(|log| log.contains("event_type=request"))
+            .expect("el evento de petición se emite como log estructurado");
+        assert!(request.contains("request_id=req-test-1"), "{request}");
+        assert!(request.contains("route=code"), "{request}");
+        assert!(request.contains("model_id=acme/flash-a"), "{request}");
+        assert!(request.contains("streaming=false"), "{request}");
+        assert!(request.contains("attempts=1"), "{request}");
+        assert!(request.contains("failover=false"), "{request}");
+        assert!(request.contains("outcome=success"), "{request}");
+        assert!(request.contains("finish_reason=stop"), "{request}");
+        assert!(request.contains("latency_ms=42"), "{request}");
+        assert!(request.contains("tokens_in=1000"), "{request}");
+        assert!(request.contains("tokens_out=200"), "{request}");
+        assert!(request.contains("pin=2"), "{request}");
+        assert!(request.contains("pout=8"), "{request}");
+        assert!(request.contains("cost_usd=0.0036"), "{request}");
+    }
+
+    /// Escenario 4.3 (emisor): un fallo del exportador —aquí, un panic en el
+    /// subscriber al registrar el evento— queda aislado y no se propaga a la
+    /// petición.
+    #[test]
+    fn emit_request_event_survives_panicking_exporter() {
+        let event = sample_event();
+
+        let survived = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracing::subscriber::with_default(panicking_ledger_subscriber(), || {
+                emit_request_event(&event);
+            });
+        }));
+
+        assert!(
+            survived.is_ok(),
+            "el fallo del exportador debe quedar aislado en el emisor"
         );
     }
 }

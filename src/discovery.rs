@@ -488,7 +488,10 @@ impl CatalogCache {
 
 /// Factor de normalización de precios: el catálogo los trae en USD por token y
 /// el evento se expresa en **USD por millón de tokens**.
-const TOKENS_PER_MILLION: f64 = 1_000_000.0;
+/// Tokens por millón, para normalizar los precios del catálogo (USD por
+/// token) a USD/Mtok. `pub(crate)`: el coste de `gateway_requests`
+/// ([`crate::proxy`]) comparte la misma normalización.
+pub(crate) const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 
 /// Precio de un modelo en el último snapshot observado (USD por token).
 #[derive(Debug, Clone, Copy)]
@@ -926,7 +929,9 @@ fn org_of(model_id: &str) -> &str {
 }
 
 /// Instante actual en ms epoch (`0` si el reloj del sistema va detrás del epoch).
-fn now_ms() -> u64 {
+/// `pub(crate)`: el evento `gateway_requests` de [`crate::proxy`] lo usa para
+/// sellar el `ts` del evento en el momento de la emisión.
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| {
@@ -1252,6 +1257,20 @@ impl Registry {
     /// Caché de catálogo asociada a una `base_url`, si existe.
     pub fn catalog(&self, base_url: &str) -> Option<&Arc<CatalogCache>> {
         self.catalogs.get(base_url)
+    }
+
+    /// Precio (`pin`, `pout`) de un modelo en el último snapshot del catálogo
+    /// de `base_url`, normalizado a **USD por millón de tokens** (la misma
+    /// unidad de los eventos `catalog` y `selection`).
+    ///
+    /// Es el precio **en el momento de la consulta**: lo usa el evento
+    /// `gateway_requests` para costar la petición con el precio vigente al
+    /// enrutarse, no el de una configuración estática. `None` si no hay
+    /// catálogo para esa `base_url`, el modelo no está en él o su precio no es
+    /// parseable (un precio desconocido no se inventa).
+    pub fn model_price(&self, base_url: &str, model_id: &str) -> Option<(f64, f64)> {
+        let _ = (base_url, model_id);
+        None
     }
 
     /// Blacklist global compartida.
@@ -3110,6 +3129,37 @@ route:
         assert!(catalog.contains("org=acme"), "{catalog}");
         assert!(catalog.contains("change_kind=new"), "{catalog}");
         assert!(catalog.contains("pin=1.5"), "{catalog}");
+    }
+
+    // --- Precio en el momento de la petición (`gateway_requests`) ------------
+
+    /// Escenario 4.2: el precio del modelo elegido se consulta del snapshot
+    /// de catálogo en el momento de la petición, normalizado a USD/Mtok (la
+    /// misma unidad de los eventos `catalog`/`selection`); un modelo fuera del
+    /// catálogo (o sin precio parseable) es precio desconocido, no `0`.
+    #[test]
+    fn model_price_returns_normalized_prices_of_cached_catalog() {
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_entry("acme/flash-a", "0.000002", "0.000008", 8_000)],
+        );
+
+        assert_eq!(
+            registry.model_price(PAID_BASE, "acme/flash-a"),
+            Some((2.0, 8.0)),
+            "USD/token del catálogo normalizado a USD/Mtok"
+        );
+        assert_eq!(
+            registry.model_price(PAID_BASE, "acme/flash-z"),
+            None,
+            "modelo fuera del catálogo: precio desconocido"
+        );
+        assert_eq!(
+            registry.model_price("http://otro.test/v1", "acme/flash-a"),
+            None,
+            "base_url sin catálogo: precio desconocido"
+        );
     }
 
     // --- Evento de selección (`gateway_selection`) ---------------------------
