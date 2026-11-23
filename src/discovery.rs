@@ -730,6 +730,110 @@ fn catalog_event(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Evento de selección (`gateway_selection`)
+// ---------------------------------------------------------------------------
+
+/// Naturaleza del cambio de selección de un `(route, backend)` de pago.
+///
+/// Vocabulario del contrato `gateway_selection` (delta del change
+/// `add-observability-ledger`): `initial`, `cheaper`, `failover`, `removed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionReason {
+    /// Primera elección observada para el `(route, backend)`.
+    Initial,
+    /// Tras `reselect_interval_ms`, el más barato mejoró al menos
+    /// `min_price_delta` y releva al pegajoso.
+    Cheaper,
+    /// El modelo pegajoso quedó en blacklist y deja de ser elegible.
+    Failover,
+    /// El modelo pegajoso desapareció del catálogo.
+    Removed,
+}
+
+impl std::fmt::Display for SelectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::Initial => "initial",
+            Self::Cheaper => "cheaper",
+            Self::Failover => "failover",
+            Self::Removed => "removed",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Evento estructurado `gateway_selection`: un cambio del modelo elegido de un
+/// `(route, backend)` de pago, emitido solo cuando el modelo cambia (D2).
+///
+/// Los precios (`pin`, `pout`) se normalizan del catálogo (USD por token) a
+/// **USD por millón de tokens**, igual que [`CatalogEvent`], y son los del
+/// modelo **recién elegido**.
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectionEvent {
+    /// Tipo de evento del ledger: siempre `selection`.
+    pub event_type: &'static str,
+    /// Momento de la elección, en ms epoch.
+    pub ts: u64,
+    /// Nombre de la ruta (`route.name` de la configuración).
+    pub route: String,
+    /// `base_url` del backend de pago.
+    pub backend: String,
+    /// Identificador del modelo recién elegido.
+    pub model_id: String,
+    /// Naturaleza del cambio.
+    pub reason: SelectionReason,
+    /// Precio de entrada del modelo elegido, en USD/Mtok.
+    pub pin: Option<f64>,
+    /// Precio de salida del modelo elegido, en USD/Mtok.
+    pub pout: Option<f64>,
+    /// Modelo elegido antes del cambio, si lo había.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_model_id: Option<String>,
+}
+
+/// Determina la razón del cambio de selección entre el modelo elegido antes
+/// (`prev`) y el elegido ahora (`chosen`). Función pura para poder testear
+/// cada transición.
+///
+/// Devuelve `None` cuando no hay cambio: un mismo modelo no emite evento. La
+/// elegibilidad previa se juzga contra `catalog` (presencia real en el
+/// catálogo) y `candidates` (elegibles tras blacklist): el pegajoso que sigue
+/// en el catálogo pero no entre los candidatos cayó en blacklist
+/// (`failover`); el que ya no está en el catálogo es una baja (`removed`).
+fn selection_reason(
+    prev: Option<&str>,
+    chosen: &str,
+    catalog: &[ModelEntry],
+    candidates: &[String],
+) -> Option<SelectionReason> {
+    let _ = (prev, chosen, catalog, candidates);
+    None
+}
+
+/// Construye el evento `gateway_selection` de un cambio de selección, con los
+/// precios del modelo recién elegido normalizados a USD/Mtok. `None` cuando no
+/// hay cambio de modelo.
+fn selection_event(
+    route: &str,
+    backend: &str,
+    prev: Option<&str>,
+    chosen: &str,
+    catalog: &[ModelEntry],
+    candidates: &[String],
+    ts: u64,
+) -> Option<SelectionEvent> {
+    let _ = (route, backend, prev, chosen, catalog, candidates, ts);
+    None
+}
+
+/// Emite los eventos de selección como logs estructurados con `event_type`
+/// `selection` (D5): `tracing` los envía a OpenObserve vía el stack OTLP de
+/// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
+/// sin tocar la detección de cambios.
+fn emit_selection_events(_events: &[SelectionEvent]) {}
+
 /// Clasifica un cambio de precio por la variación del `blend`; si empata (sube
 /// una pata y baja la otra en la misma proporción), decide el lado del `pin`.
 fn change_kind_of(prev: &TrackedPrice, pin: f64, pout: f64) -> CatalogChangeKind {
@@ -2931,5 +3035,340 @@ route:
         assert!(catalog.contains("org=acme"), "{catalog}");
         assert!(catalog.contains("change_kind=new"), "{catalog}");
         assert!(catalog.contains("pin=1.5"), "{catalog}");
+    }
+
+    // --- Evento de selección (`gateway_selection`) ---------------------------
+
+    /// Transición `initial`: sin selección previa, el primer elegido emite
+    /// `initial`.
+    #[test]
+    fn selection_reason_is_initial_without_prev() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-a".to_owned(), "acme/flash-b".to_owned()];
+
+        let reason = selection_reason(None, "acme/flash-a", &catalog, &candidates);
+
+        assert_eq!(
+            reason,
+            Some(SelectionReason::Initial),
+            "sin selección previa la razón es initial: {reason:?}"
+        );
+    }
+
+    /// Transición `cheaper`: el pegajoso sigue siendo elegible pero, pasado el
+    /// intervalo, el más barato mejora lo suficiente.
+    #[test]
+    fn selection_reason_is_cheaper_when_prev_still_eligible() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned(), "acme/flash-a".to_owned()];
+
+        let reason = selection_reason(Some("acme/flash-a"), "acme/flash-b", &catalog, &candidates);
+
+        assert_eq!(
+            reason,
+            Some(SelectionReason::Cheaper),
+            "el pegajoso elegible relevado por precio es cheaper: {reason:?}"
+        );
+    }
+
+    /// Transición `failover`: el pegajoso sigue en el catálogo pero ya no es
+    /// elegible (cayó en blacklist).
+    #[test]
+    fn selection_reason_is_failover_when_prev_in_catalog_but_not_eligible() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned()];
+
+        let reason = selection_reason(Some("acme/flash-a"), "acme/flash-b", &catalog, &candidates);
+
+        assert_eq!(
+            reason,
+            Some(SelectionReason::Failover),
+            "el pegajoso blacklisteado es failover: {reason:?}"
+        );
+    }
+
+    /// Transición `removed`: el pegajoso desapareció del catálogo.
+    #[test]
+    fn selection_reason_is_removed_when_prev_absent_from_catalog() {
+        let catalog = vec![paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned()];
+
+        let reason = selection_reason(Some("acme/flash-a"), "acme/flash-b", &catalog, &candidates);
+
+        assert_eq!(
+            reason,
+            Some(SelectionReason::Removed),
+            "el pegajoso ausente del catálogo es removed: {reason:?}"
+        );
+    }
+
+    /// Un mismo modelo elegido en refrescos consecutivos no emite evento (D2).
+    #[test]
+    fn selection_reason_is_none_when_model_unchanged() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-a".to_owned(), "acme/flash-b".to_owned()];
+
+        let reason = selection_reason(Some("acme/flash-a"), "acme/flash-a", &catalog, &candidates);
+
+        assert!(reason.is_none(), "sin cambio no hay razón: {reason:?}");
+    }
+
+    /// El evento incluye los campos del contrato y los precios del modelo
+    /// recién elegido, normalizados a USD/Mtok.
+    #[test]
+    fn selection_event_builds_contract_fields() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned(), "acme/flash-a".to_owned()];
+
+        let event = selection_event(
+            "code",
+            "http://paid.test/v1",
+            Some("acme/flash-a"),
+            "acme/flash-b",
+            &catalog,
+            &candidates,
+            1_000,
+        )
+        .expect("un cambio de selección produce evento");
+
+        assert_eq!(event.event_type, "selection");
+        assert_eq!(event.ts, 1_000);
+        assert_eq!(event.route, "code");
+        assert_eq!(event.backend, "http://paid.test/v1");
+        assert_eq!(event.model_id, "acme/flash-b");
+        assert_eq!(event.reason, SelectionReason::Cheaper);
+        assert_eq!(
+            event.prev_model_id.as_deref(),
+            Some("acme/flash-a"),
+            "el modelo relevado queda como prev_model_id"
+        );
+        // 0.1 USD por token (`flash-b`) → 100_000 USD/Mtok.
+        assert_price_close(event.pin.expect("pin del elegido"), 100_000.0);
+        assert_price_close(event.pout.expect("pout del elegido"), 100_000.0);
+    }
+
+    /// El evento serializa los campos del contrato (`event_type`, `reason` en
+    /// minúscula, `prev_model_id` cuando existe).
+    #[test]
+    fn selection_event_serializes_contract_fields() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned(), "acme/flash-a".to_owned()];
+
+        let event = selection_event(
+            "code",
+            "http://paid.test/v1",
+            Some("acme/flash-a"),
+            "acme/flash-b",
+            &catalog,
+            &candidates,
+            1_000,
+        )
+        .expect("un cambio de selección produce evento");
+        let json = serde_json::to_value(&event).expect("evento serializable");
+
+        assert_eq!(json["event_type"], "selection");
+        assert_eq!(json["ts"], 1_000);
+        assert_eq!(json["route"], "code");
+        assert_eq!(json["backend"], "http://paid.test/v1");
+        assert_eq!(json["model_id"], "acme/flash-b");
+        assert_eq!(json["reason"], "cheaper");
+        assert!(json["pin"].is_number());
+        assert!(json["pout"].is_number());
+        assert_eq!(json["prev_model_id"], "acme/flash-a");
+    }
+
+    /// Una elección `initial` omite `prev_model_id` del JSON («cuando exista»).
+    #[test]
+    fn selection_event_initial_omits_prev_model_id() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-a".to_owned(), "acme/flash-b".to_owned()];
+
+        let event = selection_event(
+            "code",
+            "http://paid.test/v1",
+            None,
+            "acme/flash-a",
+            &catalog,
+            &candidates,
+            1_000,
+        )
+        .expect("una elección inicial produce evento");
+        let json = serde_json::to_value(&event).expect("evento serializable");
+
+        assert_eq!(json["reason"], "initial");
+        assert!(
+            json.get("prev_model_id").is_none(),
+            "sin selección previa no hay prev_model_id: {json}"
+        );
+    }
+
+    /// Scenario «Elección inicial»: la primera expansión emite el log
+    /// `selection` con `reason: initial`, la ruta y el backend, y sin
+    /// `prev_model_id`.
+    #[tokio::test]
+    async fn selection_event_logged_on_first_expansion() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+
+        registry.expand(0, 0).await;
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let selection = logs
+            .iter()
+            .find(|log| log.contains("event_type=selection"))
+            .expect("el evento de selección se emite como log estructurado");
+        assert!(selection.contains("reason=initial"), "{selection}");
+        assert!(selection.contains("route=paid-unit"), "{selection}");
+        assert!(
+            selection.contains("backend=http://paid.test/v1"),
+            "{selection}"
+        );
+        assert!(selection.contains("model_id=acme/flash-a"), "{selection}");
+        assert!(
+            !selection.contains("prev_model_id=acme"),
+            "sin selección previa no hay prev_model_id: {selection}"
+        );
+    }
+
+    /// Scenario «Cambio por modelo más barato»: tras `reselect_interval_ms`, un
+    /// candidato claramente más barato emite `reason: cheaper` con
+    /// `prev_model_id`.
+    #[tokio::test]
+    async fn selection_event_reason_cheaper_is_logged() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 50\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        // Refresco del catálogo: `B` pasa a ser un 30 % más barato que `A`.
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_cheap(),
+                paid_entry("acme/flash-b", "0.028", "0.028", 128_000),
+            ]);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        registry.expand(0, 0).await;
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let selection = logs
+            .iter()
+            .rev()
+            .find(|log| log.contains("event_type=selection"))
+            .expect("el cambio de selección se emite");
+        assert!(selection.contains("reason=cheaper"), "{selection}");
+        assert!(selection.contains("model_id=acme/flash-b"), "{selection}");
+        assert!(
+            selection.contains("prev_model_id=acme/flash-a"),
+            "{selection}"
+        );
+    }
+
+    /// Scenario «Cambio por failover»: el pegajoso cae en blacklist y se emite
+    /// `reason: failover` con `prev_model_id`.
+    #[tokio::test]
+    async fn selection_event_reason_failover_is_logged() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .blacklist()
+            .mark("acme/flash-a", Duration::from_secs(60));
+
+        registry.expand(0, 0).await;
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let selection = logs
+            .iter()
+            .rev()
+            .find(|log| log.contains("event_type=selection"))
+            .expect("el cambio de selección por blacklist se emite");
+        assert!(selection.contains("reason=failover"), "{selection}");
+        assert!(selection.contains("model_id=acme/flash-b"), "{selection}");
+        assert!(
+            selection.contains("prev_model_id=acme/flash-a"),
+            "{selection}"
+        );
+    }
+
+    /// El pegajoso que desaparece del catálogo emite `reason: removed` con
+    /// `prev_model_id`.
+    #[tokio::test]
+    async fn selection_event_reason_removed_is_logged() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![paid_expensive()]);
+
+        registry.expand(0, 0).await;
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let selection = logs
+            .iter()
+            .rev()
+            .find(|log| log.contains("event_type=selection"))
+            .expect("el cambio de selección por baja del catálogo se emite");
+        assert!(selection.contains("reason=removed"), "{selection}");
+        assert!(selection.contains("model_id=acme/flash-b"), "{selection}");
+        assert!(
+            selection.contains("prev_model_id=acme/flash-a"),
+            "{selection}"
+        );
+    }
+
+    /// El modelo elegido que no cambia entre refrescos no emite evento (D2):
+    /// solo cuenta la elección inicial.
+    #[tokio::test]
+    async fn selection_event_not_logged_when_model_unchanged() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        // Refresco con el mismo catálogo: el elegido no cambia.
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![paid_cheap(), paid_expensive()]);
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        assert_eq!(
+            logs.iter()
+                .filter(|log| log.contains("event_type=selection"))
+                .count(),
+            1,
+            "un modelo elegido sin cambios no emite: {logs:?}"
+        );
     }
 }
