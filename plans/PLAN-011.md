@@ -2,7 +2,7 @@
 
 - **Issue**: #39 (atareao/llm-gateway)
 - **Change OpenSpec**: `add-observability-ledger`
-- **Estado**: pendiente de aprobación
+- **Estado**: implementado (TDD, grupos 1-6) y auditado — PR #40 ready for review (base `development`). Consulta SQL en OpenObserve real: pendiente post-despliegue.
 - **Depende de**: #37 (`add-openrouter-free-quota-guard`), que introduce la selección pegajosa y el respaldo dinámico cuyos eventos consume.
 
 ## Objetivo
@@ -18,10 +18,10 @@ Registrar de forma consultable, en OpenObserve, la evolución de precios del cat
 
 ## Tareas
 
-Ver `openspec/changes/add-observability-ledger/tasks.md`.
+Ver `openspec/changes/add-observability-ledger/tasks.md` (todas marcadas; 6.4 parcial: consulta OpenObserve pendiente post-despliegue).
 
 ## Verificación
 
-- `cargo test`, `cargo clippy -- -D warnings`, `cargo fmt --check`.
-- `curl -s http://127.0.0.1:4010/metrics | rg 'tokens_total|cost_usd'`.
-- Consulta en OpenObserve: coste por modelo y día.
+- `cargo test` ✅ (369 tests), `cargo clippy -- -D warnings` ✅, `cargo fmt --check` ✅, `openspec validate --strict` ✅.
+- `curl -s http://127.0.0.1:4010/metrics | rg 'tokens_total|cost_usd'` ✅ en E2E local con binario de la rama (puertos scratch 4091/4093 + mock); pendiente repetir contra la instancia desplegada tras el deploy.
+- Consulta en OpenObserve: coste por modelo y día — **pendiente post-despliegue** (ver `docs/observability-ledger.md`).
