@@ -205,6 +205,8 @@ WHERE r.event_type = 'request'
 GROUP BY r.route, r.model_id, s.reason
 ```
 
+> **Caveat:** este join no tiene constraint temporal ni de `backend`, así que con varias rutas/backends pagados puede mezclar `reason` históricos; en producción, filtra además por `_timestamp` y `backend`.
+
 ## Notas de la auditoría (Grupo 5): gauges de precio
 
 Dos limitaciones del **SDK OTel** (no del gateway) a tener en cuenta al
