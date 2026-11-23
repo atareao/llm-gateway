@@ -36,12 +36,35 @@ pub struct GatewayConfig {
     pub observability: Option<Observability>,
 }
 
+impl GatewayConfig {
+    /// ¿Emite el gateway los eventos del ledger (`catalog`, `selection`,
+    /// `request`)? Resuelve el default del bloque ausente o del campo
+    /// `events` ausente: siempre `true` salvo opt-out explícito.
+    pub fn ledger_events_enabled(&self) -> bool {
+        self.observability
+            .as_ref()
+            .is_none_or(|observability| observability.events)
+    }
+}
+
 /// Configuración de observabilidad. Ausente en el YAML → `None` y el gateway
 /// no inicializa ningún exportador.
 #[derive(Debug, Deserialize)]
 pub struct Observability {
+    /// Emisión de los eventos del ledger (`catalog`, `selection`, `request`)
+    /// como logs estructurados por `tracing`. Por defecto `true`;
+    /// `false` desactiva los tres eventos **sin** afectar a las métricas
+    /// Prometheus ni a la exportación OTLP. Ver `docs/observability-ledger.md`.
+    #[serde(default = "default_events")]
+    pub events: bool,
     /// Exportación OTLP opcional.
     pub otlp: Option<Otlp>,
+}
+
+/// Valor por defecto de `observability.events` (`true`): los eventos se emiten
+/// salvo opt-out explícito.
+fn default_events() -> bool {
+    true
 }
 
 /// Exportación OTLP hacia un colector (p. ej. OpenObserve).

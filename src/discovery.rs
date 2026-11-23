@@ -302,6 +302,9 @@ pub struct CatalogCache {
     #[cfg(test)]
     spawns: AtomicUsize,
     metrics: Arc<Metrics>,
+    /// `false` con `observability.events: false`: el refresco no emite el
+    /// evento `gateway_catalog` (el resto de camino no cambia).
+    ledger_events: bool,
 }
 
 impl CatalogCache {
@@ -313,6 +316,7 @@ impl CatalogCache {
         base_url: String,
         ttl: Duration,
         metrics: Arc<Metrics>,
+        ledger_events: bool,
     ) -> Self {
         Self {
             client,
@@ -325,6 +329,7 @@ impl CatalogCache {
             #[cfg(test)]
             spawns: AtomicUsize::new(0),
             metrics,
+            ledger_events,
         }
     }
 
@@ -428,7 +433,7 @@ impl CatalogCache {
                 self.metrics
                     .record_discovery_catalog(&self.base_url, total, eligible);
                 self.metrics.record_discovery_refresh(&self.base_url, true);
-                emit_catalog_events(&events);
+                emit_catalog_events(&events, self.ledger_events);
                 Ok(())
             }
             Err(err) => {
@@ -606,7 +611,12 @@ impl PriceTracker {
 /// `catalog` (D5): `tracing` los envía a OpenObserve vía el stack OTLP de
 /// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
 /// sin tocar la detección de cambios.
-fn emit_catalog_events(events: &[CatalogEvent]) {
+///
+/// Con `observability.events: false` (`enabled = false`) no se emite ninguno.
+fn emit_catalog_events(events: &[CatalogEvent], enabled: bool) {
+    if !enabled {
+        return;
+    }
     for event in events {
         tracing::info!(
             event_type = event.event_type,
@@ -865,11 +875,15 @@ fn selection_event(
 /// Es también el wiring de las métricas del ledger (#39, Grupo 5): cada cambio
 /// incrementa `llm_gateway_model_selection_total{route,reason}` y fija el
 /// gauge `llm_gateway_selected_model_price_usd{route,model,side}` con el precio
-/// del modelo recién elegido.
-fn emit_selection_events(metrics: &Metrics, events: &[SelectionEvent]) {
+/// del modelo recién elegido. Esas métricas se registran SIEMPRE: el opt-out
+/// `observability.events: false` solo suprime el log, nunca las métricas.
+fn emit_selection_events(metrics: &Metrics, events: &[SelectionEvent], enabled: bool) {
     for event in events {
-        metrics.record_model_selection(&event.route, &event.reason.to_string());
+        metrics.record_model_selection(&event.route, event.reason);
         metrics.set_selected_model_price(&event.route, &event.model_id, event.pin, event.pout);
+        if !enabled {
+            continue;
+        }
         tracing::info!(
             event_type = event.event_type,
             ts = event.ts,
@@ -1137,6 +1151,9 @@ pub struct Registry {
     route_names: Vec<String>,
     blacklist: Arc<Blacklist>,
     metrics: Arc<Metrics>,
+    /// `false` con `observability.events: false`: suprime los tres eventos del
+    /// ledger (catálogo, selección y petición) sin tocar métricas ni OTLP.
+    ledger_events: bool,
     /// Deadline del gate global de cuota free agotada; `None` si está cerrado.
     free_quota_exhausted_until: RwLock<Option<Instant>>,
     /// `true` si algún backend dinámico respeta la cuota diaria.
@@ -1176,6 +1193,7 @@ impl Registry {
                         backend.base_url.clone(),
                         ttl,
                         Arc::clone(&metrics),
+                        config.ledger_events_enabled(),
                     ))
                 });
                 let respect = backend.is_free_tier()
@@ -1253,6 +1271,7 @@ impl Registry {
                 .collect(),
             blacklist: Arc::new(Blacklist::new(Arc::clone(&metrics))),
             metrics,
+            ledger_events: config.ledger_events_enabled(),
             free_quota_exhausted_until: RwLock::new(None),
             respect_daily_quota,
             quota_targets,
@@ -1598,7 +1617,11 @@ impl Registry {
             &candidates,
             now_ms(),
         ) {
-            emit_selection_events(&self.metrics, std::slice::from_ref(&event));
+            emit_selection_events(
+                &self.metrics,
+                std::slice::from_ref(&event),
+                self.ledger_events,
+            );
         }
 
         // El elegido al frente; el resto, en orden de precio, es el failover.
@@ -2066,6 +2089,7 @@ route:
             "http://127.0.0.1:1/v1".to_owned(),
             Duration::ZERO,
             metrics(),
+            true,
         ));
         *cache
             .state
@@ -3213,7 +3237,7 @@ route:
         let tracker = PriceTracker::new();
 
         let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
-        emit_catalog_events(&events);
+        emit_catalog_events(&events, true);
 
         let logs = captured.lock().expect("lock captured ledger logs").clone();
         let catalog = logs

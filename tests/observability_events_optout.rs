@@ -125,7 +125,9 @@ async fn spawn_paid_mock() -> String {
         .route(
             "/models",
             get(|| async {
-                Json(json!(serde_json::from_str::<Value>(CATALOG_JSON).expect("catálogo")))
+                Json(json!(
+                    serde_json::from_str::<Value>(CATALOG_JSON).expect("catálogo")
+                ))
             }),
         )
         .route(
@@ -138,19 +140,14 @@ async fn spawn_paid_mock() -> String {
                 .await
                 .expect("cuerpo de la petición");
                 let value: Value = serde_json::from_slice(&body).expect("JSON de la petición");
-                let streaming = value.get("stream").and_then(Value::as_bool).unwrap_or(false);
+                let streaming = value
+                    .get("stream")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if streaming {
-                    (
-                        [(header::CONTENT_TYPE, "text/event-stream")],
-                        CHAT_SSE,
-                    )
-                        .into_response()
+                    ([(header::CONTENT_TYPE, "text/event-stream")], CHAT_SSE).into_response()
                 } else {
-                    (
-                        [(header::CONTENT_TYPE, "application/json")],
-                        CHAT_JSON,
-                    )
-                        .into_response()
+                    ([(header::CONTENT_TYPE, "application/json")], CHAT_JSON).into_response()
                 }
             }),
         );
@@ -250,7 +247,10 @@ async fn events_false_emits_no_catalog_selection_nor_request_events() {
         response.status()
     );
     let body = response.text().await.expect("cuerpo del stream");
-    assert!(body.contains("[DONE]"), "el stream llega al centinela: {body}");
+    assert!(
+        body.contains("[DONE]"),
+        "el stream llega al centinela: {body}"
+    );
 
     let logs = captured.lock().expect("lock captured ledger logs").clone();
     assert!(

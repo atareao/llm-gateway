@@ -22,6 +22,7 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use prometheus::Encoder as _;
 
 use crate::config::{BackendKind, GatewayConfig, Profile};
+use crate::discovery::SelectionReason;
 use crate::proxy::backend_id;
 use crate::telemetry;
 
@@ -718,12 +719,16 @@ impl Metrics {
     }
 
     /// Registra un cambio del modelo elegido de una ruta, por motivo.
-    pub fn record_model_selection(&self, route: &str, reason: &str) {
+    ///
+    /// `reason` es el enum [`SelectionReason`]: el vocabulario de 4 valores
+    /// del contrato `gateway_selection` (`initial`, `cheaper`, `failover`,
+    /// `removed`) es imposible de violar desde el sistema de tipos.
+    pub fn record_model_selection(&self, route: &str, reason: SelectionReason) {
         self.model_selection.add(
             1,
             &[
                 KeyValue::new("route", route.to_owned()),
-                KeyValue::new("reason", reason.to_owned()),
+                KeyValue::new("reason", reason.to_string()),
             ],
         );
     }
@@ -734,6 +739,12 @@ impl Metrics {
     /// sobrescribe el último valor (no acumula). Un lado sin precio conservará
     /// el último valor publicado hasta que vuelva a conocerse: eliminar la
     /// serie no es posible desde el SDK y un `0` sería un precio falso.
+    ///
+    /// Limitaciones documentadas en `docs/observability-ledger.md` (notas de
+    /// la auditoría del Grupo 5): series huérfanas cuando el modelo cambia o
+    /// sale de catálogo —el SDK OTel no borra la serie anterior, filtra por
+    /// `model` o cruza con `llm_gateway_model_selection_total`— y desfase del
+    /// gauge hasta el siguiente refresco cuando este es on-demand.
     pub fn set_selected_model_price(
         &self,
         route: &str,
@@ -758,6 +769,10 @@ impl Metrics {
     /// Gauge de estado con etiqueta única `model`; `blend` es la ponderación
     /// de selección `0.75·pin + 0.25·pout`, en USD/Mtok. Republicar el mismo
     /// modelo sobrescribe la serie (no la duplica).
+    ///
+    /// Cuando un modelo sale de la lista curada, su última serie queda huérfana
+    /// hasta reiniciar (el SDK OTel no borra series): ver las notas de la
+    /// auditoría del Grupo 5 en `docs/observability-ledger.md`.
     pub fn set_allowlist_price(&self, model: &str, blend: f64) {
         self.allowlist_price
             .record(blend, &[KeyValue::new("model", model.to_owned())]);
@@ -1504,9 +1519,9 @@ mod tests {
     #[test]
     fn model_selection_counter_increments_by_reason() {
         let metrics = Metrics::new(&config("ledger-seleccion", false));
-        metrics.record_model_selection("ledger-seleccion", "failover");
-        metrics.record_model_selection("ledger-seleccion", "failover");
-        metrics.record_model_selection("ledger-seleccion", "initial");
+        metrics.record_model_selection("ledger-seleccion", SelectionReason::Failover);
+        metrics.record_model_selection("ledger-seleccion", SelectionReason::Failover);
+        metrics.record_model_selection("ledger-seleccion", SelectionReason::Initial);
 
         let text = metrics.render();
         let failover = ledger_line(
@@ -1674,7 +1689,7 @@ mod tests {
             Some(200),
             Some(0.0036),
         );
-        metrics.record_model_selection("ledger-sin-request-id", "initial");
+        metrics.record_model_selection("ledger-sin-request-id", SelectionReason::Initial);
         metrics.set_selected_model_price(
             "ledger-sin-request-id",
             "acme/flash-a",

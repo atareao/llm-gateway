@@ -148,14 +148,21 @@ fn cache(base_url: &str, ttl: Duration) -> Arc<CatalogCache> {
         base_url.to_owned(),
         ttl,
         metrics(),
+        true,
     ))
 }
 
 /// Caché con un timeout de fetch corto, para tests que no deben colgarse.
 fn cache_with_timeout(base_url: &str, ttl: Duration, timeout: Duration) -> Arc<CatalogCache> {
     Arc::new(
-        CatalogCache::new(reqwest::Client::new(), base_url.to_owned(), ttl, metrics())
-            .with_timeout(timeout),
+        CatalogCache::new(
+            reqwest::Client::new(),
+            base_url.to_owned(),
+            ttl,
+            metrics(),
+            true,
+        )
+        .with_timeout(timeout),
     )
 }
 
@@ -488,6 +495,7 @@ async fn failed_refresh_increments_failure_counter() {
         base.clone(),
         Duration::from_secs(300),
         Arc::clone(&metrics),
+        true,
     );
 
     let result = cache.refresh().await;

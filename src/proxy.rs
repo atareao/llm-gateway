@@ -748,6 +748,7 @@ async fn route_with_failover(
                             event,
                             started,
                             metrics: Arc::clone(&state.metrics),
+                            events: state.config.ledger_events_enabled(),
                         }),
                     ));
                 }
@@ -840,7 +841,7 @@ async fn route_with_failover(
                                 price.map(|(_, pout)| pout),
                             ),
                         };
-                        emit_request_event(&event);
+                        emit_request_event(&event, state.config.ledger_events_enabled());
                         // Métricas del ledger (#39, Grupo 5): los contadores de
                         // tokens y coste se alimentan de los mismos datos que
                         // el evento, solo con lo conocido.
@@ -935,7 +936,7 @@ async fn route_with_failover(
         pout: price.map(|(_, pout)| pout),
         cost_usd: None,
     };
-    emit_request_event(&event);
+    emit_request_event(&event, state.config.ledger_events_enabled());
 
     // Se distingue el motivo del agotamiento: si algún intento falló por no
     // traer `tool_calls`, el cliente recibe un código específico.
@@ -1549,10 +1550,15 @@ fn parse_body_ledger(bytes: &[u8]) -> (TokenUsage, Option<String>) {
 /// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
 /// sin tocar la lógica de la petición.
 ///
+/// Con `observability.events: false` (`enabled = false`) no se emite ninguno.
+///
 /// La emisión va aislada con `catch_unwind`: un fallo del exportador —hoy, un
 /// panic en un subscriber/layer; mañana, un fallo del transport real— NO
 /// propaga el error a la petición, cuya respuesta queda intacta (4.3).
-fn emit_request_event(event: &RequestEvent) {
+fn emit_request_event(event: &RequestEvent, enabled: bool) {
+    if !enabled {
+        return;
+    }
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         tracing::info!(
             event_type = event.event_type,
@@ -1597,6 +1603,9 @@ struct RequestSink {
     /// Asa a los instrumentos del ledger: los contadores de tokens y coste se
     /// incrementan junto con el evento, al fin real del stream.
     metrics: Arc<Metrics>,
+    /// `false` con `observability.events: false`: el evento `request` no se
+    /// emite (las métricas del ledger sí se incrementan igualmente).
+    events: bool,
 }
 
 impl RequestSink {
@@ -1614,7 +1623,7 @@ impl RequestSink {
             self.event.pin,
             self.event.pout,
         );
-        emit_request_event(&self.event);
+        emit_request_event(&self.event, self.events);
         // Métricas del ledger (#39, Grupo 5): mismos datos que el evento.
         if let Some(model) = self.event.model_id.as_deref() {
             self.metrics.record_ledger_usage(
@@ -2842,6 +2851,7 @@ route:
                 event,
                 started: Instant::now(),
                 metrics: ledger_metrics(),
+                events: true,
             }),
         );
 
@@ -2951,7 +2961,7 @@ route:
     fn emit_request_event_logs_contract_fields() {
         let (captured, _guard) = capture_ledger_logs();
 
-        emit_request_event(&sample_event());
+        emit_request_event(&sample_event(), true);
 
         let logs = captured.lock().expect("lock captured ledger logs").clone();
         let request = logs
@@ -2983,7 +2993,7 @@ route:
 
         let survived = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tracing::subscriber::with_default(panicking_ledger_subscriber(), || {
-                emit_request_event(&event);
+                emit_request_event(&event, true);
             });
         }));
 
@@ -3017,6 +3027,7 @@ route:
             event,
             started: Instant::now(),
             metrics,
+            events: true,
         }
     }
 
