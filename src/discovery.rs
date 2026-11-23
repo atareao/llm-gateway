@@ -808,8 +808,19 @@ fn selection_reason(
     catalog: &[ModelEntry],
     candidates: &[String],
 ) -> Option<SelectionReason> {
-    let _ = (prev, chosen, catalog, candidates);
-    None
+    let Some(prev) = prev else {
+        return Some(SelectionReason::Initial);
+    };
+    if prev == chosen {
+        return None;
+    }
+    let present = catalog.iter().any(|model| model.id == prev);
+    let eligible = candidates.iter().any(|id| id == prev);
+    Some(match (present, eligible) {
+        (false, _) => SelectionReason::Removed,
+        (true, false) => SelectionReason::Failover,
+        (true, true) => SelectionReason::Cheaper,
+    })
 }
 
 /// Construye el evento `gateway_selection` de un cambio de selección, con los
@@ -824,15 +835,45 @@ fn selection_event(
     candidates: &[String],
     ts: u64,
 ) -> Option<SelectionEvent> {
-    let _ = (route, backend, prev, chosen, catalog, candidates, ts);
-    None
+    let reason = selection_reason(prev, chosen, catalog, candidates)?;
+    let price = catalog
+        .iter()
+        .find(|model| model.id == chosen)
+        .and_then(price_per_token)
+        .map(|(pin, pout)| (TOKENS_PER_MILLION * pin, TOKENS_PER_MILLION * pout));
+    Some(SelectionEvent {
+        event_type: "selection",
+        ts,
+        route: route.to_owned(),
+        backend: backend.to_owned(),
+        model_id: chosen.to_owned(),
+        reason,
+        pin: price.map(|(pin, _)| pin),
+        pout: price.map(|(_, pout)| pout),
+        prev_model_id: prev.map(str::to_owned),
+    })
 }
 
 /// Emite los eventos de selección como logs estructurados con `event_type`
 /// `selection` (D5): `tracing` los envía a OpenObserve vía el stack OTLP de
 /// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
 /// sin tocar la detección de cambios.
-fn emit_selection_events(_events: &[SelectionEvent]) {}
+fn emit_selection_events(events: &[SelectionEvent]) {
+    for event in events {
+        tracing::info!(
+            event_type = event.event_type,
+            ts = event.ts,
+            route = %event.route,
+            backend = %event.backend,
+            model_id = %event.model_id,
+            reason = %event.reason,
+            pin = event.pin,
+            pout = event.pout,
+            prev_model_id = event.prev_model_id,
+            "gateway_selection"
+        );
+    }
+}
 
 /// Clasifica un cambio de precio por la variación del `blend`; si empata (sube
 /// una pata y baja la otra en la misma proporción), decide el lado del `pin`.
@@ -1079,6 +1120,9 @@ pub struct Registry {
     dynamic: Vec<DynamicBackend>,
     /// Posición en `dynamic` del backend dinámico `(route, backend)`.
     index: HashMap<(usize, usize), usize>,
+    /// Nombres de ruta por índice de configuración, para etiquetar los eventos
+    /// del ledger (`gateway_selection.route`).
+    route_names: Vec<String>,
     blacklist: Arc<Blacklist>,
     metrics: Arc<Metrics>,
     /// Deadline del gate global de cuota free agotada; `None` si está cerrado.
@@ -1190,6 +1234,11 @@ impl Registry {
             catalogs,
             dynamic,
             index,
+            route_names: config
+                .route
+                .iter()
+                .map(|route| route.name.clone())
+                .collect(),
             blacklist: Arc::new(Blacklist::new(Arc::clone(&metrics))),
             metrics,
             free_quota_exhausted_until: RwLock::new(None),
@@ -1440,10 +1489,36 @@ impl Registry {
         );
         drop(selections);
 
+        // El cambio de selección se emite antes de consumir `candidates`: la
+        // razón necesita saber si el modelo anterior sigue siendo elegible. Sin
+        // candidatos no hay modelo nuevo al que etiquetar y no se emite.
+        if let Some(event) = selection_event(
+            self.route_name(route),
+            &entry.base_url,
+            sticky.as_ref().map(|selection| selection.model.as_str()),
+            &chosen,
+            catalog,
+            &candidates,
+            now_ms(),
+        ) {
+            emit_selection_events(std::slice::from_ref(&event));
+        }
+
         // El elegido al frente; el resto, en orden de precio, es el failover.
         let mut ordered: Vec<String> = candidates.into_iter().filter(|id| id != &chosen).collect();
         ordered.insert(0, chosen);
         ordered
+    }
+
+    /// Nombre de la ruta por índice de configuración, para etiquetar los
+    /// eventos del ledger. Un índice fuera de rango (no debería ocurrir: los
+    /// `(route, backend)` con selección salen de la configuración) se etiqueta
+    /// `unknown` en lugar de paniquear.
+    fn route_name(&self, route: usize) -> &str {
+        self.route_names
+            .get(route)
+            .map(String::as_str)
+            .unwrap_or("unknown")
     }
 
     /// Avisa de los patrones de `allow` sin ninguna coincidencia en el catálogo.
