@@ -481,3 +481,75 @@ async fn streaming_ignores_missing_tool_calls() {
         "en streaming no debe contactarse el fallback por falta de tool_calls"
     );
 }
+
+/// Mock SSE que emite el `usage` en el chunk final, con la línea `data:` del
+/// último evento **partida entre dos chunks** (límites TCP arbitrarios).
+async fn spawn_sse_usage_backend() -> String {
+    async fn sse() -> Response {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hola\"}}],\"usage\":null}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_tok")),
+            Ok(Bytes::from_static(b"ens\":100,\"completion_tokens\":8}}\n\n")),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let stream = futures_util::stream::iter(chunks);
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from_stream(stream))
+            .expect("construir respuesta SSE")
+    }
+
+    let app = Router::new().route("/v1/chat/completions", post(sse));
+    spawn(app).await
+}
+
+/// Scenario: Streaming inyecta include_usage — el cuerpo que el gateway envía
+/// al upstream incluye `stream_options.include_usage: true` aunque el cliente
+/// no lo haya pedido.
+#[tokio::test]
+async fn streaming_request_injects_include_usage_to_upstream() {
+    let backend = spawn_echo_backend().await;
+    let gateway = spawn_gateway(&[(&backend, "qwen2.5:7b-instruct")]).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .json(&json!({"model": "mech-writer", "stream": true, "messages": []}))
+        .send()
+        .await
+        .expect("request al gateway");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: Value = response.json().await.expect("cuerpo JSON del echo");
+    assert_eq!(
+        body.pointer("/stream_options/include_usage"),
+        Some(&json!(true)),
+        "el upstream debe recibir stream_options.include_usage: true: {body}"
+    );
+}
+
+/// Scenario: el relay SSE conserva intacto el chunk final con `usage`, incluso
+/// cuando la línea `data:` llega partida entre chunks del upstream.
+#[tokio::test]
+async fn stream_relay_preserves_final_usage_chunk() {
+    let backend = spawn_sse_usage_backend().await;
+    let gateway = spawn_gateway(&[(&backend, "qwen2.5:7b-instruct")]).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway}/v1/chat/completions"))
+        .json(&json!({"model": "mech-writer", "stream": true, "messages": []}))
+        .send()
+        .await
+        .expect("request al gateway");
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.expect("cuerpo del stream");
+    assert!(
+        body.contains("\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":8}"),
+        "el chunk final con usage debe llegar íntegro al cliente: {body}"
+    );
+    assert!(body.contains("data: [DONE]"), "falta el terminador: {body}");
+}

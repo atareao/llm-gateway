@@ -1065,6 +1065,62 @@ fn assemble(
     response
 }
 
+/// Tokens de una respuesta, con `None` para los valores **desconocidos**.
+///
+/// Un campo `None` significa que el upstream no informó ese token; nunca se
+/// sustituye por `0`: un cero inventado contaminaría costes y métricas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TokenUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Indica si no se conoció ningún token (`usage` ausente o nulo).
+    fn is_unknown(&self) -> bool {
+        self.prompt_tokens.is_none() && self.completion_tokens.is_none()
+    }
+}
+
+/// Extrae el `usage` (tokens de prompt y de completion) de un objeto JSON de
+/// respuesta o de un evento SSE ya parseado.
+///
+/// Campos ausentes, `usage: null` o valores no numéricos quedan como `None`
+/// (desconocidos); no se inventan ceros.
+fn parse_usage(value: &Value) -> TokenUsage {
+    let _ = value;
+    TokenUsage::default()
+}
+
+/// Parsea el cuerpo de una respuesta no-stream y extrae su `usage`.
+///
+/// Un cuerpo que no sea JSON válido produce tokens desconocidos.
+fn parse_body_usage(bytes: &[u8]) -> TokenUsage {
+    let _ = bytes;
+    TokenUsage::default()
+}
+
+/// Inyecta `stream_options.include_usage: true` en el payload de una petición
+/// en streaming, para que el upstream añada el `usage` al chunk final.
+///
+/// Preserva el resto de `stream_options` y fuerza `include_usage` a `true`
+/// aunque el cliente no lo pida (el ledger lo necesita).
+fn inject_include_usage(_payload: &mut Value) {}
+
+/// Acumula las líneas SSE que llegan troceadas y retiene el último `usage`
+/// conocido visto (el del chunk final de un stream con `include_usage`).
+#[derive(Default)]
+struct StreamUsage {
+    buffer: String,
+    usage: TokenUsage,
+}
+
+impl StreamUsage {
+    /// Procesa un fragmento de bytes del stream (límites de chunk arbitrarios;
+    /// una línea `data:` puede llegar partida entre varios fragmentos).
+    fn feed(&mut self, _chunk: &[u8]) {}
+}
+
 /// Clona `body` y sustituye su `model` por `model`. El resto de campos
 /// (incluidos los desconocidos) se conservan intactos.
 fn body_for_model(body: &Value, model: &str) -> Value {
@@ -1177,10 +1233,11 @@ async fn healthz() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Candidate, MAX_RETRY_AFTER, QUOTA_BODY_LIMIT, QuotaSignal, backend_id, chat_url,
-        effective_cooldown, expand_backends, headers_show_daily_exhaustion, parse_retry_after,
-        quota_reset_epoch_ms, quota_signal, read_quota_body, request_requires_tool_call,
-        response_has_tool_call,
+        AppState, Candidate, MAX_RETRY_AFTER, QUOTA_BODY_LIMIT, QuotaSignal, StreamUsage,
+        TokenUsage, backend_id, chat_url, effective_cooldown, expand_backends,
+        headers_show_daily_exhaustion, inject_include_usage, parse_body_usage, parse_retry_after,
+        parse_usage, quota_reset_epoch_ms, quota_signal, read_quota_body,
+        request_requires_tool_call, response_has_tool_call,
     };
     use crate::config::{Backend, BackendKind, GatewayConfig};
     use crate::discovery::{ModelEntry, Pricing};
@@ -1774,5 +1831,145 @@ route:
             outcome.is_none(),
             "un cuerpo por encima del límite debe descartarse"
         );
+    }
+
+    // ---- Grupo 1 «Parseo de usage» del ledger de observabilidad (#39) ----
+
+    /// Scenario: Respuesta no-stream con usage — los tokens quedan extraídos
+    /// del objeto `usage` del body.
+    #[test]
+    fn parse_usage_extracts_tokens_from_response_body() {
+        let body = json!({
+            "id": "gen-1",
+            "choices": [{"message": {"role": "assistant", "content": "hola"}}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 34}
+        });
+
+        let usage = parse_usage(&body);
+
+        assert_eq!(usage.prompt_tokens, Some(12));
+        assert_eq!(usage.completion_tokens, Some(34));
+    }
+
+    /// Scenario: Respuesta no-stream sin usage — el parseo del body completo
+    /// (JSON válido) también extrae los tokens.
+    #[test]
+    fn parse_body_usage_extracts_tokens_from_valid_json() {
+        let body = br#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}"#;
+
+        let usage = parse_body_usage(body);
+
+        assert_eq!(usage, TokenUsage { prompt_tokens: Some(3), completion_tokens: Some(4) });
+    }
+
+    /// Scenario: Sin usage los tokens quedan desconocidos — y **no** se
+    /// registra `0` cuando falta `usage`.
+    #[test]
+    fn parse_usage_without_usage_reports_unknown_not_zero() {
+        let body = json!({"id": "gen-1", "choices": []});
+
+        let usage = parse_usage(&body);
+
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.completion_tokens, None);
+        assert!(
+            usage != TokenUsage { prompt_tokens: Some(0), completion_tokens: Some(0) },
+            "los tokens desconocidos no deben representarse como 0"
+        );
+    }
+
+    /// Un body que no sea JSON válido produce tokens desconocidos (sin ceros
+    /// inventados).
+    #[test]
+    fn parse_body_usage_invalid_json_is_unknown() {
+        assert_eq!(parse_body_usage(b"no es json"), TokenUsage::default());
+    }
+
+    /// `usage` parcial (solo `prompt_tokens`): el campo que falta queda
+    /// desconocido, sin inventar un valor.
+    #[test]
+    fn parse_usage_partial_fields_leave_missing_unknown() {
+        let body = json!({"usage": {"prompt_tokens": 5}});
+
+        let usage = parse_usage(&body);
+
+        assert_eq!(usage, TokenUsage { prompt_tokens: Some(5), completion_tokens: None });
+    }
+
+    /// Scenario: Streaming inyecta include_usage — un body con `stream: true`
+    /// sale con `stream_options.include_usage: true`.
+    #[test]
+    fn inject_include_usage_adds_include_usage_true() {
+        let mut body = json!({"model": "m", "stream": true, "messages": []});
+
+        inject_include_usage(&mut body);
+
+        assert_eq!(
+            body.pointer("/stream_options/include_usage"),
+            Some(&json!(true)),
+            "debe inyectarse stream_options.include_usage: true"
+        );
+        // El resto del body se conserva intacto.
+        assert_eq!(body.get("model"), Some(&json!("m")));
+        assert_eq!(body.get("messages"), Some(&json!([])));
+    }
+
+    /// La inyección preserva el resto de `stream_options` del cliente y fuerza
+    /// `include_usage` a `true` aunque viniera a `false`.
+    #[test]
+    fn inject_include_usage_forces_true_preserving_client_options() {
+        let mut body =
+            json!({"stream": true, "stream_options": {"include_usage": false, "foo": 1}});
+
+        inject_include_usage(&mut body);
+
+        assert_eq!(body.pointer("/stream_options/include_usage"), Some(&json!(true)));
+        assert_eq!(body.pointer("/stream_options/foo"), Some(&json!(1)));
+    }
+
+    /// Scenario: Streaming lee el `usage` del chunk final (los intermedios con
+    /// `usage: null` no tapan el valor final).
+    #[test]
+    fn stream_usage_reads_usage_from_final_chunk() {
+        let mut extractor = StreamUsage::default();
+        extractor
+            .feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n");
+
+        extractor.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n",
+        );
+        extractor.feed(b"data: [DONE]\n\n");
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage { prompt_tokens: Some(7), completion_tokens: Some(9) }
+        );
+    }
+
+    /// Una línea `data:` partida entre dos chunks del upstream se reensambla
+    /// antes de parsearse: el `usage` del chunk final no se pierde.
+    #[test]
+    fn stream_usage_reassembles_lines_split_across_chunks() {
+        let mut extractor = StreamUsage::default();
+
+        extractor.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tok");
+        extractor.feed(b"ens\":100,\"completion_tokens\":8}}\n\ndata: [DONE]\n\n");
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage { prompt_tokens: Some(100), completion_tokens: Some(8) }
+        );
+    }
+
+    /// Un chunk posterior con `usage: null` no resetea el `usage` ya conocido.
+    #[test]
+    fn stream_usage_null_chunk_does_not_reset_known_usage() {
+        let mut extractor = StreamUsage::default();
+
+        extractor.feed(b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n");
+        extractor.feed(b"data: {\"choices\":[],\"usage\":null}\n\n");
+
+        assert_eq!(extractor.usage.prompt_tokens, Some(7));
+        assert_eq!(extractor.usage.completion_tokens, Some(9));
     }
 }
