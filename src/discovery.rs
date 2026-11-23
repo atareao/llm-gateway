@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -473,6 +473,91 @@ impl CatalogCache {
     fn spawn_count(&self) -> usize {
         self.spawns.load(Ordering::Relaxed)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Evento de catálogo (`gateway_catalog`)
+// ---------------------------------------------------------------------------
+
+/// Naturaleza del cambio de un modelo respecto al último snapshot del catálogo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogChangeKind {
+    /// El modelo aparece por primera vez en el catálogo observado.
+    New,
+    /// El `blend` del modelo subió respecto al snapshot anterior.
+    PriceUp,
+    /// El `blend` del modelo bajó respecto al snapshot anterior.
+    PriceDown,
+    /// El modelo desapareció del catálogo.
+    Removed,
+}
+
+/// Evento estructurado `gateway_catalog`: un cambio de precio o de presencia
+/// de un modelo, emitido solo cuando algo cambia (dedup contra el último
+/// snapshot, D2 del change).
+///
+/// Los precios (`pin`, `pout`, `blend`, `prev_pin`, `prev_pout`) se normalizan
+/// del catálogo (USD por token) a **USD por millón de tokens**; `blend` es
+/// `0.75 · pin + 0.25 · pout`, la misma ponderación con la que
+/// [`crate::classify::blend_price`] ordena candidatos.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogEvent {
+    /// Tipo de evento del ledger: siempre `catalog`.
+    pub event_type: &'static str,
+    /// Momento de la observación, en ms epoch.
+    pub ts: u64,
+    /// Identificador del modelo (p. ej. `acme/flash-a`).
+    pub model_id: String,
+    /// Organización proveedora: prefijo de `model_id` antes de `/`.
+    pub org: String,
+    /// Precio de entrada en USD/Mtok; nulo en un modelo `removed`.
+    pub pin: Option<f64>,
+    /// Precio de salida en USD/Mtok; nulo en un modelo `removed`.
+    pub pout: Option<f64>,
+    /// `0.75 · pin + 0.25 · pout` en USD/Mtok; nulo en un modelo `removed`.
+    pub blend: Option<f64>,
+    /// Longitud de contexto declarada, si se conoce.
+    pub context_length: Option<u32>,
+    /// Naturaleza del cambio.
+    pub change_kind: CatalogChangeKind,
+    /// Precio de entrada previo, si el modelo ya estaba en el snapshot anterior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_pin: Option<f64>,
+    /// Precio de salida previo, si el modelo ya estaba en el snapshot anterior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_pout: Option<f64>,
+}
+
+/// Último snapshot de precios por `model_id` y detector de cambios.
+#[derive(Default)]
+pub struct PriceTracker {
+    last: RwLock<HashMap<String, TrackedPrice>>,
+}
+
+impl PriceTracker {
+    /// Crea un tracker sin snapshot previo: la primera observación emite `new`
+    /// para cada modelo con precio.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observa un catálogo recién refrescado y devuelve los eventos de cambio.
+    pub fn observe(&self, catalog: &[ModelEntry]) -> Vec<CatalogEvent> {
+        let _ = catalog;
+        Vec::new()
+    }
+}
+
+/// Emite los eventos de catálogo como logs estructurados (sumidero actual).
+fn emit_catalog_events(_events: &[CatalogEvent]) {}
+
+/// Precio de un modelo en el último snapshot observado.
+struct TrackedPrice {
+    pin: f64,
+    pout: f64,
+    context_length: Option<u32>,
 }
 
 /// Blacklist global de modelos dinámicos.
@@ -2204,5 +2289,243 @@ route:
             Some(Duration::from_millis(1000)),
             "la deduplicación por base_url debe conservar el menor intervalo"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Grupo 2: evento de catálogo (`gateway_catalog`)
+    // ------------------------------------------------------------------
+
+    /// Asegura que dos precios coinciden con tolerancia de punto flotante.
+    fn assert_price_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "se esperaba {expected}, obtuvo {actual}"
+        );
+    }
+
+    /// Modelo de pago con precios por token en cadena (formato OpenRouter).
+    fn priced(id: &str, pin: &str, pout: &str) -> ModelEntry {
+        paid_entry(id, pin, pout, 8_000)
+    }
+
+    /// Transición `new`: la primera observación da de alta el modelo con sus
+    /// precios normalizados a USD/Mtok y sin precios previos.
+    #[test]
+    fn catalog_tracker_detects_new_model() {
+        let tracker = PriceTracker::new();
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        assert_eq!(events.len(), 1, "la primera observación da de alta: {events:?}");
+        let event = &events[0];
+        assert_eq!(event.change_kind, CatalogChangeKind::New);
+        assert_eq!(event.model_id, "acme/flash-a");
+        assert_eq!(event.org, "acme");
+        assert_eq!(event.context_length, Some(8_000));
+        assert_price_close(event.pin.expect("pin nuevo"), 1.5);
+        assert_price_close(event.pout.expect("pout nuevo"), 2.0);
+        assert!(event.prev_pin.is_none(), "un modelo nuevo no tiene precio previo");
+        assert!(event.prev_pout.is_none(), "un modelo nuevo no tiene precio previo");
+    }
+
+    /// Transición `price_up`: sube el precio de salida y el evento conserva el
+    /// precio previo.
+    #[test]
+    fn catalog_tracker_detects_price_up() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000002", "0.0000002")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000002", "0.00000025")]);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].change_kind, CatalogChangeKind::PriceUp);
+        assert_price_close(events[0].pout.expect("pout nuevo"), 0.25);
+        assert_price_close(events[0].prev_pout.expect("pout previo"), 0.2);
+    }
+
+    /// Transición `price_down`: el escenario del spec, `pout` pasa de 0.1992 a
+    /// 0.1800 USD/Mtok.
+    #[test]
+    fn catalog_tracker_detects_price_down() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000002", "0.0000001992")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000002", "0.00000018")]);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].change_kind, CatalogChangeKind::PriceDown);
+        assert_price_close(events[0].pout.expect("pout nuevo"), 0.1800);
+        assert_price_close(events[0].prev_pout.expect("pout previo"), 0.1992);
+    }
+
+    /// Transición `removed`: el modelo desaparece del catálogo y el evento
+    /// conserva el último precio conocido; los precios nuevos quedan nulos.
+    #[test]
+    fn catalog_tracker_detects_removed_model() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[]);
+
+        assert_eq!(events.len(), 1, "la baja del modelo emite: {events:?}");
+        assert_eq!(events[0].change_kind, CatalogChangeKind::Removed);
+        assert_eq!(events[0].model_id, "acme/flash-a");
+        assert_eq!(events[0].pin, None, "un modelo removed no tiene precio nuevo");
+        assert_eq!(events[0].pout, None);
+        assert_price_close(events[0].prev_pin.expect("pin previo"), 1.5);
+        assert_price_close(events[0].prev_pout.expect("pout previo"), 2.0);
+        assert_eq!(
+            events[0].context_length,
+            Some(8_000),
+            "el contexto del último snapshot se conserva"
+        );
+    }
+
+    /// Dedup (D2): un precio idéntico entre snapshots consecutivos no vuelve a
+    /// emitir.
+    #[test]
+    fn catalog_tracker_does_not_emit_when_price_is_unchanged() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        assert!(events.is_empty(), "un precio sin cambios no emite: {events:?}");
+    }
+
+    /// Un cambio de precio emite exactamente un evento, y solo para el modelo
+    /// que cambió.
+    #[test]
+    fn catalog_tracker_emits_only_for_models_that_changed() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[
+            priced("acme/flash-a", "0.0000015", "0.000002"),
+            priced("acme/flash-b", "0.000001", "0.000001"),
+        ]);
+
+        let events = tracker.observe(&[
+            priced("acme/flash-a", "0.0000015", "0.000002"),
+            priced("acme/flash-b", "0.000001", "0.000002"),
+        ]);
+
+        assert_eq!(events.len(), 1, "solo el modelo que cambió emite: {events:?}");
+        assert_eq!(events[0].model_id, "acme/flash-b");
+        assert_eq!(events[0].change_kind, CatalogChangeKind::PriceUp);
+    }
+
+    /// Contrato 2.3: `blend = 0.75 · pin + 0.25 · pout` sobre los precios del
+    /// evento, en USD por millón de tokens.
+    #[test]
+    fn catalog_event_blend_is_three_quarters_prompt_and_quarter_completion() {
+        let tracker = PriceTracker::new();
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let event = &events[0];
+        assert_price_close(event.pin.expect("pin"), 1.5);
+        assert_price_close(event.pout.expect("pout"), 2.0);
+        assert_price_close(event.blend.expect("blend"), 0.75 * 1.5 + 0.25 * 2.0);
+    }
+
+    /// El evento serializa los campos del contrato (`event_type`, `ts`,
+    /// `change_kind` en minúscula…) y conserva el precio previo.
+    #[test]
+    fn catalog_event_serializes_contract_fields() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.0000025")]);
+        let json = serde_json::to_value(&events[0]).expect("evento serializable");
+
+        assert_eq!(json["event_type"], "catalog");
+        assert_eq!(json["model_id"], "acme/flash-a");
+        assert_eq!(json["org"], "acme");
+        assert_eq!(json["change_kind"], "price_up");
+        assert!(json["ts"].is_u64(), "ts en ms epoch");
+        assert!(json["pin"].is_number());
+        assert!(json["pout"].is_number());
+        assert!(json["blend"].is_number());
+        assert!(json["context_length"].is_number());
+        assert!(json["prev_pin"].is_number());
+        assert!(json["prev_pout"].is_number());
+    }
+
+    /// Un modelo `new` omite los precios previos del JSON («cuando aplique»).
+    #[test]
+    fn catalog_event_new_omits_prev_prices() {
+        let tracker = PriceTracker::new();
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        let json = serde_json::to_value(&events[0]).expect("evento serializable");
+
+        assert!(json.get("prev_pin").is_none(), "sin precio previo no hay prev_pin");
+        assert!(json.get("prev_pout").is_none());
+    }
+
+    /// Un modelo `removed` serializa `pin`/`pout`/`blend` nulos y conserva los
+    /// últimos precios conocidos.
+    #[test]
+    fn catalog_event_removed_serializes_null_prices() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[]);
+        let json = serde_json::to_value(&events[0]).expect("evento serializable");
+
+        assert!(json["pin"].is_null());
+        assert!(json["pout"].is_null());
+        assert!(json["blend"].is_null());
+        assert!(json["prev_pin"].is_number());
+        assert!(json["prev_pout"].is_number());
+    }
+
+    /// Capa que captura los campos de los logs `INFO` del hilo actual.
+    #[derive(Clone)]
+    struct LedgerLayer {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for LedgerLayer {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().level() != &Level::INFO {
+                return;
+            }
+            let mut visitor = WarnVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("lock captured ledger logs")
+                .push(visitor.fields.join(" "));
+        }
+    }
+
+    /// Captura los logs `INFO` solo para el hilo actual.
+    fn capture_ledger_logs() -> (Arc<Mutex<Vec<String>>>, tracing::subscriber::DefaultGuard) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = registry().with(LedgerLayer {
+            events: Arc::clone(&events),
+        });
+        (events, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// El emisor registra el evento como log estructurado con `event_type`
+    /// `catalog` y los campos del contrato.
+    #[test]
+    fn catalog_events_are_logged_with_event_type_catalog() {
+        let (captured, _guard) = capture_ledger_logs();
+        let tracker = PriceTracker::new();
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        emit_catalog_events(&events);
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let catalog = logs
+            .iter()
+            .find(|log| log.contains("event_type=catalog"))
+            .expect("el evento de catálogo se emite como log estructurado");
+        assert!(catalog.contains("model_id=acme/flash-a"), "{catalog}");
+        assert!(catalog.contains("org=acme"), "{catalog}");
+        assert!(catalog.contains("change_kind=new"), "{catalog}");
+        assert!(catalog.contains("pin=1.5"), "{catalog}");
     }
 }
