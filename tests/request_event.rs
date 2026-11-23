@@ -48,6 +48,18 @@ const CHAT_SSE: &str = concat!(
     "data: [DONE]\n\n"
 );
 
+/// Stream SSE de ejemplo **sin** `usage`: contenido, `finish_reason` y `[DONE]`
+/// (el upstream no informó tokens).
+const CHAT_SSE_NO_USAGE: &str = concat!(
+    "data: ",
+    r#"{"choices":[{"delta":{"content":"hol"},"finish_reason":null}]}"#,
+    "\n\n",
+    "data: ",
+    r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+    "\n\n",
+    "data: [DONE]\n\n"
+);
+
 /// Catálogo del mock: un único modelo de pago con precios conocidos
 /// (`0.000002`/`0.000008` USD por token → 2.0/8.0 USD/Mtok).
 const CATALOG_JSON: &str = r#"{
@@ -351,6 +363,66 @@ async fn request_event_records_attempts_and_failover_across_backends() {
     assert!(event.contains("failover=true"), "{event}");
     assert!(event.contains("model_id=acme/flash-a"), "{event}");
     assert!(event.contains("tokens_in=1000"), "{event}");
+    assert!(event.contains("cost_usd=0.0036"), "{event}");
+}
+
+/// Hueco de cobertura (streaming sin `usage`): el stream sin chunk final de
+/// `usage` emite el evento con tokens y coste desconocidos —el campo no se
+/// registra, nunca `0`— y el `finish_reason` de los chunks.
+#[tokio::test]
+async fn request_event_for_stream_without_usage_keeps_tokens_unknown() {
+    ensure_api_key();
+    let mock = spawn_paid_mock(CHAT_SSE_NO_USAGE, "text/event-stream").await;
+    let gateway = spawn_gateway(&paid_config(&mock)).await;
+    let (captured, _guard) = capture_ledger_logs();
+
+    let response = post_chat(&gateway, "req-ledger-stream-no-usage", true).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.expect("stream completo");
+    assert!(body.contains("[DONE]"), "{body}");
+
+    let event = find_request_event(&captured, "req-ledger-stream-no-usage");
+    assert!(event.contains("streaming=true"), "{event}");
+    assert!(event.contains("outcome=success"), "{event}");
+    assert!(event.contains("finish_reason=stop"), "{event}");
+    assert!(
+        !event.contains("tokens_in="),
+        "sin usage el token no se registra (nunca 0): {event}"
+    );
+    assert!(
+        !event.contains("tokens_out="),
+        "sin usage el token no se registra (nunca 0): {event}"
+    );
+    assert!(
+        !event.contains("cost_usd="),
+        "sin usage el coste no se registra (nunca 0): {event}"
+    );
+}
+
+/// Hueco de cobertura (streaming + failover): el primer backend muerto fuerza
+/// el failover en una petición streaming; el evento se emite al agotarse el
+/// stream con `attempts=2`, `failover=true` y el `usage` del backend final.
+#[tokio::test]
+async fn request_event_for_stream_records_attempts_and_failover() {
+    ensure_api_key();
+    let mock = spawn_paid_mock(CHAT_SSE, "text/event-stream").await;
+    let gateway = spawn_gateway(&failover_config("http://127.0.0.1:1/v1", &mock)).await;
+    let (captured, _guard) = capture_ledger_logs();
+
+    let response = post_chat(&gateway, "req-ledger-stream-failover", true).await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.expect("stream completo");
+    assert!(body.contains("[DONE]"), "{body}");
+
+    let event = find_request_event(&captured, "req-ledger-stream-failover");
+    assert!(event.contains("streaming=true"), "{event}");
+    assert!(event.contains("outcome=success"), "{event}");
+    assert!(event.contains("attempts=2"), "{event}");
+    assert!(event.contains("failover=true"), "{event}");
+    assert!(event.contains("model_id=acme/flash-a"), "{event}");
+    assert!(event.contains("finish_reason=stop"), "{event}");
+    assert!(event.contains("tokens_in=1000"), "{event}");
+    assert!(event.contains("tokens_out=200"), "{event}");
     assert!(event.contains("cost_usd=0.0036"), "{event}");
 }
 

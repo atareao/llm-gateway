@@ -2302,7 +2302,7 @@ route:
     /// Scenario: Respuesta no-stream sin usage — el parseo del body completo
     /// (JSON válido) también extrae los tokens.
     #[test]
-    fn parse_body_usage_extracts_tokens_from_valid_json() {
+    fn parse_body_ledger_extracts_tokens_from_valid_json() {
         let body = br#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}"#;
 
         let (usage, _) = parse_body_ledger(body);
@@ -2339,7 +2339,7 @@ route:
     /// Un body que no sea JSON válido produce tokens desconocidos (sin ceros
     /// inventados).
     #[test]
-    fn parse_body_usage_invalid_json_is_unknown() {
+    fn parse_body_ledger_invalid_json_is_unknown() {
         assert_eq!(parse_body_ledger(b"no es json").0, TokenUsage::default());
     }
 
