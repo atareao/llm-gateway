@@ -8,9 +8,9 @@
 
 ## 2. Evento de catálogo (`gateway_catalog`)
 
-- [ ] 2.1 Mantener en `src/discovery.rs` el último snapshot de precios por `model_id` y detectar cambios (`new`, `price_up`, `price_down`, `removed`), con tests unitarios de cada transición
-- [ ] 2.2 Emitir el evento estructurado (campos `ts`, `model_id`, `org`, `pin`, `pout`, `blend`, `context_length`, `change_kind`, `prev_pin`, `prev_pout`) con dedup en memoria, y verificar con tests que un precio sin cambios no emite y que un cambio sí
-- [ ] 2.3 Verificar con un test que `blend` se calcula como `0.75·pin + 0.25·pout`
+- [x] 2.1 Mantener en `src/discovery.rs` el último snapshot de precios por `model_id` y detectar cambios (`new`, `price_up`, `price_down`, `removed`), con tests unitarios de cada transición
+- [x] 2.2 Emitir el evento estructurado (campos `ts`, `model_id`, `org`, `pin`, `pout`, `blend`, `context_length`, `change_kind`, `prev_pin`, `prev_pout`) con dedup en memoria, y verificar con tests que un precio sin cambios no emite y que un cambio sí
+- [x] 2.3 Verificar con un test que `blend` se calcula como `0.75·pin + 0.25·pout`
 
 ## 3. Evento de selección (`gateway_selection`)
 
