@@ -1,4 +1,4 @@
-//! Descubrimiento del catálogo free de OpenRouter.
+//! Descubrimiento del catálogo de OpenRouter (tier free y tier de pago).
 //!
 //! Un [`CatalogCache`] consulta `GET {base_url}/models` (endpoint público, sin
 //! autenticación), filtra los modelos **gratuitos** que además exponen
@@ -7,21 +7,29 @@
 //! si el TTL ha vencido se devuelve la copia existente y se dispara un refresco
 //! en segundo plano. Un fallo de red conserva la última caché válida.
 //!
+//! El mismo catálogo (una caché por `base_url`) sirve al tier de pago
+//! (`openrouter_paid`), que filtra por la lista curada `discovery.allow`, ordena
+//! por precio y mantiene el modelo elegido con histéresis (ver
+//! [`Registry::expand`]).
+//!
 //! El filtrado de elegibilidad se expone en [`eligible_models`] para que la
 //! clasificación por perfil ([`crate::classify`]) trabaje sobre modelos ya
 //! depurados.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::classify::{ClassifyContext, classify};
+use crate::classify::{
+    COMPLETION_WEIGHT, ClassifyContext, PROMPT_WEIGHT, PaidContext, blend_price, classify,
+    classify_paid, matches_allow,
+};
 use crate::config::{ClassifyOverrides, DEFAULT_REFRESH_INTERVAL_MS, GatewayConfig, Profile};
 use crate::metrics::Metrics;
 
@@ -31,6 +39,18 @@ use crate::metrics::Metrics;
 /// un upstream que acepta la conexión y no responde dejaría colgada la rama
 /// síncrona de [`CatalogCache::ensure`] (y el ticker de refresco).
 pub const CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout total de la consulta de cuota (`GET {base_url}/key`).
+pub const QUOTA_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cota máxima del gate global de cuota free (24 h).
+///
+/// Evita que un `X-RateLimit-Reset` absurdo deje el tier free bloqueado más de
+/// lo razonable; el daño máximo es servir pago durante el resto del día.
+pub const MAX_QUOTA_GATE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Milisegundos de un día (resolución del reset diario de OpenRouter).
+const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
 /// Entrada del catálogo `GET /models` de OpenRouter.
 #[derive(Debug, Clone, Deserialize)]
@@ -168,6 +188,97 @@ pub async fn fetch_catalog(
     Ok(body.data)
 }
 
+/// URL del endpoint de clave a partir de la `base_url` (que incluye `/v1`).
+pub fn key_url(base_url: &str) -> String {
+    format!("{}/key", base_url.trim_end_matches('/'))
+}
+
+/// Extrae `free_model_daily_requests.remaining` del cuerpo de `GET /key`.
+///
+/// Acepta el bloque en la raíz o anidado bajo `data`, y el valor como número o
+/// cadena. Un `remaining` negativo se normaliza a `0`.
+pub fn free_quota_remaining(body: &Value) -> Option<u64> {
+    let data = body.get("data").unwrap_or(body);
+    let remaining = data.get("free_model_daily_requests")?.get("remaining")?;
+    let value = match remaining {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }?;
+    Some(value.max(0) as u64)
+}
+
+/// Consulta `GET {base_url}/key` y devuelve la cuota free restante observada.
+///
+/// Si el cuerpo no expone `free_model_daily_requests.remaining`, devuelve
+/// `Ok(None)`. No consume cuota de modelos free.
+///
+/// # Errors
+/// Devuelve [`DiscoveryError`] si falla el transporte (incluido el timeout), el
+/// status no es exitoso o el cuerpo no decodifica.
+pub async fn fetch_free_quota(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<Option<u64>, DiscoveryError> {
+    let mut request = client.get(key_url(base_url)).timeout(timeout);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+
+    let response = request.send().await.map_err(DiscoveryError::Transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(DiscoveryError::Status(status.as_u16()));
+    }
+
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(DiscoveryError::Decode)?;
+    Ok(free_quota_remaining(&body))
+}
+
+/// Convierte un epoch UTC en milisegundos a un [`Instant`] futuro.
+///
+/// Devuelve `None` si el instante ya pasó: un reset en el pasado no debe abrir
+/// el gate.
+pub fn epoch_ms_to_instant(epoch_ms: u64) -> Option<Instant> {
+    let target = UNIX_EPOCH + Duration::from_millis(epoch_ms);
+    let delta = target.duration_since(SystemTime::now()).ok()?;
+    if delta.is_zero() {
+        return None;
+    }
+    Some(Instant::now() + delta)
+}
+
+/// Próximo `00:00 UTC` como [`Instant`].
+pub fn next_utc_midnight() -> Instant {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let delta = SECS_PER_DAY - (secs % SECS_PER_DAY);
+    Instant::now() + Duration::from_secs(delta)
+}
+
+/// Deadline T del gate de cuota free.
+///
+/// Usa `reset_epoch_ms` (epoch en ms) si es futuro; si falta, el siguiente
+/// `00:00 UTC`. Un reset en el pasado devuelve `None` (no abre el gate). El
+/// resultado se acota a [`MAX_QUOTA_GATE`].
+pub fn quota_deadline(reset_epoch_ms: Option<u64>) -> Option<Instant> {
+    let now = Instant::now();
+    let deadline = match reset_epoch_ms {
+        Some(ms) => epoch_ms_to_instant(ms)?,
+        None => next_utc_midnight(),
+    };
+    if deadline <= now {
+        return None;
+    }
+    Some(deadline.min(now + MAX_QUOTA_GATE))
+}
+
 /// Instantánea de la caché: catálogo y momento de captura.
 struct Snapshot {
     models: Arc<Vec<ModelEntry>>,
@@ -184,10 +295,16 @@ pub struct CatalogCache {
     /// Serializa los refrescos: el ticker y el refresco on-demand lo consultan
     /// para no lanzar fetches duplicados concurrentes.
     refresh_lock: tokio::sync::Mutex<()>,
+    /// Último snapshot de precios por `model_id`, para el dedup del evento
+    /// `gateway_catalog`.
+    prices: PriceTracker,
     /// Número de refrescos lanzados en segundo plano; solo para tests.
     #[cfg(test)]
     spawns: AtomicUsize,
     metrics: Arc<Metrics>,
+    /// `false` con `observability.events: false`: el refresco no emite el
+    /// evento `gateway_catalog` (el resto de camino no cambia).
+    ledger_events: bool,
 }
 
 impl CatalogCache {
@@ -199,6 +316,7 @@ impl CatalogCache {
         base_url: String,
         ttl: Duration,
         metrics: Arc<Metrics>,
+        ledger_events: bool,
     ) -> Self {
         Self {
             client,
@@ -207,9 +325,11 @@ impl CatalogCache {
             timeout: CATALOG_TIMEOUT,
             state: RwLock::new(None),
             refresh_lock: tokio::sync::Mutex::new(()),
+            prices: PriceTracker::new(),
             #[cfg(test)]
             spawns: AtomicUsize::new(0),
             metrics,
+            ledger_events,
         }
     }
 
@@ -301,6 +421,7 @@ impl CatalogCache {
             Ok(models) => {
                 let total = models.len();
                 let eligible = models.iter().filter(|model| is_eligible(model)).count();
+                let events = self.prices.observe(&models);
                 let snapshot = Snapshot {
                     models: Arc::new(models),
                     fetched_at: Instant::now(),
@@ -312,6 +433,7 @@ impl CatalogCache {
                 self.metrics
                     .record_discovery_catalog(&self.base_url, total, eligible);
                 self.metrics.record_discovery_refresh(&self.base_url, true);
+                emit_catalog_events(&events, self.ledger_events);
                 Ok(())
             }
             Err(err) => {
@@ -363,6 +485,479 @@ impl CatalogCache {
     fn spawn_count(&self) -> usize {
         self.spawns.load(Ordering::Relaxed)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Evento de catálogo (`gateway_catalog`)
+// ---------------------------------------------------------------------------
+
+/// Factor de normalización de precios: el catálogo los trae en USD por token y
+/// el evento se expresa en **USD por millón de tokens**.
+/// Tokens por millón, para normalizar los precios del catálogo (USD por
+/// token) a USD/Mtok. `pub(crate)`: el coste de `gateway_requests`
+/// ([`crate::proxy`]) comparte la misma normalización.
+pub(crate) const TOKENS_PER_MILLION: f64 = 1_000_000.0;
+
+/// Precio de un modelo en el último snapshot observado (USD por token).
+#[derive(Debug, Clone, Copy)]
+struct TrackedPrice {
+    /// Precio de entrada por token.
+    pin: f64,
+    /// Precio de salida por token.
+    pout: f64,
+    /// Longitud de contexto declarada en ese snapshot.
+    context_length: Option<u32>,
+}
+
+/// Naturaleza del cambio de un modelo respecto al último snapshot del catálogo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogChangeKind {
+    /// El modelo aparece por primera vez en el catálogo observado.
+    New,
+    /// El `blend` del modelo subió respecto al snapshot anterior.
+    PriceUp,
+    /// El `blend` del modelo bajó respecto al snapshot anterior.
+    PriceDown,
+    /// El modelo desapareció del catálogo.
+    Removed,
+}
+
+impl std::fmt::Display for CatalogChangeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::New => "new",
+            Self::PriceUp => "price_up",
+            Self::PriceDown => "price_down",
+            Self::Removed => "removed",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Evento estructurado `gateway_catalog`: un cambio de precio o de presencia
+/// de un modelo, emitido solo cuando algo cambia (dedup contra el último
+/// snapshot, D2 del change).
+///
+/// Los precios (`pin`, `pout`, `blend`, `prev_pin`, `prev_pout`) se normalizan
+/// del catálogo (USD por token) a **USD por millón de tokens**; `blend` es
+/// `0.75 · pin + 0.25 · pout`, la misma ponderación con la que
+/// [`crate::classify::blend_price`] ordena candidatos.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogEvent {
+    /// Tipo de evento del ledger: siempre `catalog`.
+    pub event_type: &'static str,
+    /// Momento de la observación, en ms epoch.
+    pub ts: u64,
+    /// Identificador del modelo (p. ej. `acme/flash-a`).
+    pub model_id: String,
+    /// Organización proveedora: prefijo de `model_id` antes de `/`.
+    pub org: String,
+    /// Precio de entrada en USD/Mtok; nulo en un modelo `removed`.
+    pub pin: Option<f64>,
+    /// Precio de salida en USD/Mtok; nulo en un modelo `removed`.
+    pub pout: Option<f64>,
+    /// `0.75 · pin + 0.25 · pout` en USD/Mtok; nulo en un modelo `removed`.
+    pub blend: Option<f64>,
+    /// Longitud de contexto declarada, si se conoce.
+    pub context_length: Option<u32>,
+    /// Naturaleza del cambio.
+    pub change_kind: CatalogChangeKind,
+    /// Precio de entrada previo, si el modelo ya estaba en el snapshot anterior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_pin: Option<f64>,
+    /// Precio de salida previo, si el modelo ya estaba en el snapshot anterior.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_pout: Option<f64>,
+}
+
+/// Último snapshot de precios por `model_id` y detector de cambios (D2).
+///
+/// Deduplicación en memoria del evento `gateway_catalog`: un precio idéntico
+/// entre refrescos consecutivos no vuelve a emitir. Tras reiniciar, el
+/// snapshot completo se reemite como `new`, lo que es barato y esperado.
+#[derive(Debug, Default)]
+pub struct PriceTracker {
+    /// Último precio observado por identificador de modelo.
+    last: RwLock<HashMap<String, TrackedPrice>>,
+}
+
+impl PriceTracker {
+    /// Crea un tracker sin snapshot previo: la primera observación emite `new`
+    /// para cada modelo con precio.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Observa un catálogo recién refrescado y devuelve los eventos de cambio.
+    ///
+    /// Emite un evento por modelo que aparece (`new`), desaparece (`removed`)
+    /// o cambia de precio (`price_up`/`price_down`); nada para los que repiten
+    /// precio. Los modelos presentes sin precio parseable no alteran el último
+    /// snapshot conocido ni emiten: «desconocido» no es «gratis».
+    pub fn observe(&self, catalog: &[ModelEntry]) -> Vec<CatalogEvent> {
+        let mut last = self
+            .last
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (events, next) = diff_prices(&last, catalog, now_ms());
+        *last = next;
+        events
+    }
+}
+
+/// Emite los eventos de catálogo como logs estructurados con `event_type`
+/// `catalog` (D5): `tracing` los envía a OpenObserve vía el stack OTLP de
+/// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
+/// sin tocar la detección de cambios.
+///
+/// Con `observability.events: false` (`enabled = false`) no se emite ninguno.
+fn emit_catalog_events(events: &[CatalogEvent], enabled: bool) {
+    if !enabled {
+        return;
+    }
+    for event in events {
+        tracing::info!(
+            event_type = event.event_type,
+            ts = event.ts,
+            model_id = %event.model_id,
+            org = %event.org,
+            pin = event.pin,
+            pout = event.pout,
+            blend = event.blend,
+            context_length = event.context_length,
+            change_kind = %event.change_kind,
+            prev_pin = event.prev_pin,
+            prev_pout = event.prev_pout,
+            "gateway_catalog"
+        );
+    }
+}
+
+/// Compara `catalog` contra el snapshot `last` y produce los eventos junto con
+/// el nuevo snapshot. Función pura para poder testear cada transición.
+fn diff_prices(
+    last: &HashMap<String, TrackedPrice>,
+    catalog: &[ModelEntry],
+    ts: u64,
+) -> (Vec<CatalogEvent>, HashMap<String, TrackedPrice>) {
+    let mut events = Vec::new();
+    let mut next: HashMap<String, TrackedPrice> = HashMap::with_capacity(catalog.len());
+    for model in catalog {
+        let id = model.id.as_str();
+        let Some((pin, pout)) = price_per_token(model) else {
+            // Presente sin precio parseable: «desconocido» no es «gratis». Se
+            // retiene el último precio conocido sin emitir, para que un precio
+            // ilegible no produzca una baja falsa ni una oscilación
+            // `removed`→`new` al reaparecer el precio.
+            if let Some(prev) = last.get(id) {
+                next.insert(id.to_owned(), *prev);
+            }
+            continue;
+        };
+        let context_length = model.context_length;
+        let (change_kind, prev_pin, prev_pout) = match last.get(id) {
+            None => (CatalogChangeKind::New, None, None),
+            Some(prev) if prev.pin == pin && prev.pout == pout => {
+                next.insert(
+                    id.to_owned(),
+                    TrackedPrice {
+                        pin,
+                        pout,
+                        context_length,
+                    },
+                );
+                continue;
+            }
+            Some(prev) => (
+                change_kind_of(prev, pin, pout),
+                Some(prev.pin),
+                Some(prev.pout),
+            ),
+        };
+        next.insert(
+            id.to_owned(),
+            TrackedPrice {
+                pin,
+                pout,
+                context_length,
+            },
+        );
+        events.push(catalog_event(
+            id,
+            ts,
+            change_kind,
+            Some((pin, pout)),
+            context_length,
+            prev_pin.zip(prev_pout),
+        ));
+    }
+    // Con la retención anterior, `next` contiene exactamente los ids presentes
+    // en el catálogo (con precio parseable o retenidos): `removed` solo
+    // alcanza a los ids realmente ausentes del catálogo.
+    let mut removed: Vec<(&String, &TrackedPrice)> = last
+        .iter()
+        .filter(|(id, _)| !next.contains_key(id.as_str()))
+        .collect();
+    removed.sort_unstable_by_key(|(id, _)| *id);
+    for (id, prev) in removed {
+        events.push(catalog_event(
+            id,
+            ts,
+            CatalogChangeKind::Removed,
+            None,
+            prev.context_length,
+            Some((prev.pin, prev.pout)),
+        ));
+    }
+    (events, next)
+}
+
+/// Construye un evento `gateway_catalog` con los precios normalizados a
+/// USD/Mtok. `current` es el precio nuevo (`None` en una baja) y `prev` el del
+/// snapshot anterior (`None` en un alta).
+fn catalog_event(
+    model_id: &str,
+    ts: u64,
+    change_kind: CatalogChangeKind,
+    current: Option<(f64, f64)>,
+    context_length: Option<u32>,
+    prev: Option<(f64, f64)>,
+) -> CatalogEvent {
+    let to_mtok = |price: (f64, f64)| (TOKENS_PER_MILLION * price.0, TOKENS_PER_MILLION * price.1);
+    let current = current.map(to_mtok);
+    let prev = prev.map(to_mtok);
+    CatalogEvent {
+        event_type: "catalog",
+        ts,
+        model_id: model_id.to_owned(),
+        org: org_of(model_id).to_owned(),
+        pin: current.map(|(pin, _)| pin),
+        pout: current.map(|(_, pout)| pout),
+        blend: current.map(|(pin, pout)| blend_parts(pin, pout)),
+        context_length,
+        change_kind,
+        prev_pin: prev.map(|(pin, _)| pin),
+        prev_pout: prev.map(|(_, pout)| pout),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Evento de selección (`gateway_selection`)
+// ---------------------------------------------------------------------------
+
+/// Naturaleza del cambio de selección de un `(route, backend)` de pago.
+///
+/// Vocabulario del contrato `gateway_selection` (delta del change
+/// `add-observability-ledger`): `initial`, `cheaper`, `failover`, `removed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionReason {
+    /// Primera elección observada para el `(route, backend)`.
+    Initial,
+    /// Tras `reselect_interval_ms`, el más barato mejoró al menos
+    /// `min_price_delta` y releva al pegajoso.
+    Cheaper,
+    /// El modelo pegajoso quedó en blacklist y deja de ser elegible.
+    Failover,
+    /// El modelo pegajoso desapareció del catálogo.
+    Removed,
+}
+
+impl std::fmt::Display for SelectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::Initial => "initial",
+            Self::Cheaper => "cheaper",
+            Self::Failover => "failover",
+            Self::Removed => "removed",
+        };
+        f.write_str(text)
+    }
+}
+
+/// Evento estructurado `gateway_selection`: un cambio del modelo elegido de un
+/// `(route, backend)` de pago, emitido solo cuando el modelo cambia (D2).
+///
+/// Los precios (`pin`, `pout`) se normalizan del catálogo (USD por token) a
+/// **USD por millón de tokens**, igual que [`CatalogEvent`], y son los del
+/// modelo **recién elegido**.
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectionEvent {
+    /// Tipo de evento del ledger: siempre `selection`.
+    pub event_type: &'static str,
+    /// Momento de la elección, en ms epoch.
+    pub ts: u64,
+    /// Nombre de la ruta (`route.name` de la configuración).
+    pub route: String,
+    /// `base_url` del backend de pago.
+    pub backend: String,
+    /// Identificador del modelo recién elegido.
+    pub model_id: String,
+    /// Naturaleza del cambio.
+    pub reason: SelectionReason,
+    /// Precio de entrada del modelo elegido, en USD/Mtok.
+    pub pin: Option<f64>,
+    /// Precio de salida del modelo elegido, en USD/Mtok.
+    pub pout: Option<f64>,
+    /// Modelo elegido antes del cambio, si lo había.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prev_model_id: Option<String>,
+}
+
+/// Determina la razón del cambio de selección entre el modelo elegido antes
+/// (`prev`) y el elegido ahora (`chosen`). Función pura para poder testear
+/// cada transición.
+///
+/// Devuelve `None` cuando no hay cambio: un mismo modelo no emite evento. La
+/// elegibilidad previa se juzga contra `catalog` (presencia real en el
+/// catálogo) y `candidates` (elegibles tras blacklist): el pegajoso que sigue
+/// en el catálogo pero no entre los candidatos cayó en blacklist
+/// (`failover`); el que ya no está en el catálogo es una baja (`removed`).
+fn selection_reason(
+    prev: Option<&str>,
+    chosen: &str,
+    catalog: &[ModelEntry],
+    candidates: &[String],
+) -> Option<SelectionReason> {
+    let Some(prev) = prev else {
+        return Some(SelectionReason::Initial);
+    };
+    if prev == chosen {
+        return None;
+    }
+    let present = catalog.iter().any(|model| model.id == prev);
+    let eligible = candidates.iter().any(|id| id == prev);
+    Some(match (present, eligible) {
+        (false, _) => SelectionReason::Removed,
+        (true, false) => SelectionReason::Failover,
+        (true, true) => SelectionReason::Cheaper,
+    })
+}
+
+/// Construye el evento `gateway_selection` de un cambio de selección, con los
+/// precios del modelo recién elegido normalizados a USD/Mtok. `None` cuando no
+/// hay cambio de modelo.
+fn selection_event(
+    route: &str,
+    backend: &str,
+    prev: Option<&str>,
+    chosen: &str,
+    catalog: &[ModelEntry],
+    candidates: &[String],
+    ts: u64,
+) -> Option<SelectionEvent> {
+    let reason = selection_reason(prev, chosen, catalog, candidates)?;
+    let price = catalog
+        .iter()
+        .find(|model| model.id == chosen)
+        .and_then(price_per_token)
+        .map(|(pin, pout)| (TOKENS_PER_MILLION * pin, TOKENS_PER_MILLION * pout));
+    Some(SelectionEvent {
+        event_type: "selection",
+        ts,
+        route: route.to_owned(),
+        backend: backend.to_owned(),
+        model_id: chosen.to_owned(),
+        reason,
+        pin: price.map(|(pin, _)| pin),
+        pout: price.map(|(_, pout)| pout),
+        prev_model_id: prev.map(str::to_owned),
+    })
+}
+
+/// Emite los eventos de selección como logs estructurados con `event_type`
+/// `selection` (D5): `tracing` los envía a OpenObserve vía el stack OTLP de
+/// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
+/// sin tocar la detección de cambios.
+///
+/// Es también el wiring de las métricas del ledger (#39, Grupo 5): cada cambio
+/// incrementa `llm_gateway_model_selection_total{route,reason}` y fija el
+/// gauge `llm_gateway_selected_model_price_usd{route,model,side}` con el precio
+/// del modelo recién elegido. Esas métricas se registran SIEMPRE: el opt-out
+/// `observability.events: false` solo suprime el log, nunca las métricas.
+fn emit_selection_events(metrics: &Metrics, events: &[SelectionEvent], enabled: bool) {
+    for event in events {
+        metrics.record_model_selection(&event.route, event.reason);
+        metrics.set_selected_model_price(&event.route, &event.model_id, event.pin, event.pout);
+        if !enabled {
+            continue;
+        }
+        tracing::info!(
+            event_type = event.event_type,
+            ts = event.ts,
+            route = %event.route,
+            backend = %event.backend,
+            model_id = %event.model_id,
+            reason = %event.reason,
+            pin = event.pin,
+            pout = event.pout,
+            prev_model_id = event.prev_model_id,
+            "gateway_selection"
+        );
+    }
+}
+
+/// Clasifica un cambio de precio por la variación del `blend`; si empata (sube
+/// una pata y baja la otra en la misma proporción), decide el lado del `pin`.
+fn change_kind_of(prev: &TrackedPrice, pin: f64, pout: f64) -> CatalogChangeKind {
+    let blend = blend_parts(pin, pout);
+    let prev_blend = blend_parts(prev.pin, prev.pout);
+    if blend > prev_blend {
+        CatalogChangeKind::PriceUp
+    } else if blend < prev_blend {
+        CatalogChangeKind::PriceDown
+    } else if pin > prev.pin {
+        CatalogChangeKind::PriceUp
+    } else {
+        CatalogChangeKind::PriceDown
+    }
+}
+
+/// `blend = 0.75 · pin + 0.25 · pout`, la ponderación de
+/// [`crate::classify::blend_price`] aplicada a precios numéricos.
+fn blend_parts(pin: f64, pout: f64) -> f64 {
+    PROMPT_WEIGHT * pin + COMPLETION_WEIGHT * pout
+}
+
+/// Precios por token (`prompt`, `completion`) de un modelo, o `None` si falta
+/// alguno, no es numérico o no es finito. A diferencia de
+/// `classify::price_value`, un valor ausente no cuenta como `0`.
+fn price_per_token(model: &ModelEntry) -> Option<(f64, f64)> {
+    let pricing = model.pricing.as_ref()?;
+    Some((
+        price_field(pricing.prompt.as_ref())?,
+        price_field(pricing.completion.as_ref())?,
+    ))
+}
+
+/// Parsea un campo de precio (cadena o número) a `f64`. Los valores no finitos
+/// (`NaN`, `inf`) se tratan como no parseables: contaminarían el `blend` (y un
+/// `blend` `NaN` no empata consigo mismo, rompiendo la deduplicación de D2).
+fn price_field(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(number)) => number.as_f64().filter(|v| v.is_finite()),
+        Some(Value::String(text)) => text.trim().parse::<f64>().ok().filter(|v| v.is_finite()),
+        _ => None,
+    }
+}
+
+/// Organización de un identificador de modelo: el prefijo antes de `/`
+/// (`acme/flash-a` → `acme`). Sin barra, el propio identificador.
+fn org_of(model_id: &str) -> &str {
+    model_id.split_once('/').map_or(model_id, |(org, _)| org)
+}
+
+/// Instante actual en ms epoch (`0` si el reloj del sistema va detrás del epoch).
+/// `pub(crate)`: el evento `gateway_requests` de [`crate::proxy`] lo usa para
+/// sellar el `ts` del evento en el momento de la emisión.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Blacklist global de modelos dinámicos.
@@ -448,6 +1043,44 @@ fn purge_expired(entries: &mut HashMap<String, Instant>) {
     entries.retain(|_, until| *until > now);
 }
 
+/// `blend` de un modelo del catálogo por identificador (`0` si no está).
+///
+/// La clasificación de pago devuelve identificadores; el precio observado se
+/// recupera del catálogo cacheado en el momento de la elección.
+fn blend_of(catalog: &[ModelEntry], id: &str) -> f64 {
+    catalog
+        .iter()
+        .find(|model| model.id == id)
+        .and_then(|model| model.pricing.as_ref())
+        .map_or(0.0, blend_price)
+}
+
+/// Mejora relativa de `cheaper` frente al precio observado `current`.
+///
+/// Es la magnitud que se compara con `min_price_delta`: `0.20` exige que el
+/// candidato sea al menos un 20 % más barato. Sin precio de referencia positivo
+/// (un modelo sin precios no es elegible, pero la observación puede ser antigua),
+/// cualquier candidato más barato cuenta como mejora total.
+fn relative_price_improvement(current: f64, cheaper: f64) -> f64 {
+    if current > 0.0 {
+        (current - cheaper) / current
+    } else if cheaper < current {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// Tier de un backend dinámico.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// Tier free (`openrouter_free`): sujeto al gate global de cuota diaria.
+    Free,
+    /// Tier de pago (`openrouter_paid`): lista curada, orden por precio y
+    /// selección pegajosa con histéresis.
+    Paid,
+}
+
 /// Backend dinámico registrado, con su estado de rotación.
 struct DynamicBackend {
     profile: Profile,
@@ -455,6 +1088,16 @@ struct DynamicBackend {
     min_context: Option<u32>,
     cooldown: Duration,
     overrides: Option<ClassifyOverrides>,
+    /// Tier dinámico del backend.
+    tier: Tier,
+    /// `true` si respeta el gate global de cuota diaria.
+    respect_daily_quota: bool,
+    /// Lista curada de patrones glob (solo backends de pago).
+    allow: Vec<String>,
+    /// Cadencia mínima de reselección del modelo de pago.
+    reselect_interval: Duration,
+    /// Mejora relativa mínima de precio exigida para cambiar de modelo de pago.
+    min_price_delta: f64,
     rotation: AtomicUsize,
 }
 
@@ -470,18 +1113,60 @@ impl DynamicBackend {
     }
 }
 
+/// Objetivo del sondeo de cuota: una `base_url` dinámica y su API key.
+struct QuotaTarget {
+    base_url: String,
+    api_key_env: Option<String>,
+    interval: Duration,
+}
+
+/// Selección pegajosa de un backend de pago.
+///
+/// Guarda el modelo elegido, el `blend` con el que se eligió y cuándo se eligió;
+/// el estado no persiste entre reinicios (arranca vacío).
+#[derive(Debug, Clone)]
+struct PaidSelection {
+    /// Identificador del modelo elegido.
+    model: String,
+    /// `blend` observado en el momento de la elección.
+    blend: f64,
+    /// Instante de la elección.
+    chosen_at: Instant,
+}
+
 /// Registro de cachés de catálogo, una por `base_url` dinámica.
 ///
 /// Agrupa el descubrimiento de todos los backends `openrouter_free` de la
 /// configuración en un único `/models` por `base_url` (los perfiles comparten
-/// catálogo) y mantiene la blacklist global y el estado de rotación.
+/// catálogo) y mantiene la blacklist global, el estado de rotación y el gate
+/// global de cuota diaria free.
 pub struct Registry {
+    client: reqwest::Client,
     catalogs: HashMap<String, Arc<CatalogCache>>,
     dynamic: Vec<DynamicBackend>,
     /// Posición en `dynamic` del backend dinámico `(route, backend)`.
     index: HashMap<(usize, usize), usize>,
+    /// Nombres de ruta por índice de configuración, para etiquetar los eventos
+    /// del ledger (`gateway_selection.route`).
+    route_names: Vec<String>,
     blacklist: Arc<Blacklist>,
     metrics: Arc<Metrics>,
+    /// `false` con `observability.events: false`: suprime los tres eventos del
+    /// ledger (catálogo, selección y petición) sin tocar métricas ni OTLP.
+    ledger_events: bool,
+    /// Deadline del gate global de cuota free agotada; `None` si está cerrado.
+    free_quota_exhausted_until: RwLock<Option<Instant>>,
+    /// `true` si algún backend dinámico respeta la cuota diaria.
+    respect_daily_quota: bool,
+    /// Objetivos del sondeo proactivo, uno por `base_url` que respeta la cuota.
+    quota_targets: Vec<QuotaTarget>,
+    /// Selección pegajosa por `(route, backend)` de los backends de pago.
+    paid_selections: RwLock<HashMap<(usize, usize), PaidSelection>>,
+    /// Patrones de `allow` ya avisados como huérfanos, por `(base_url, patrón)`.
+    ///
+    /// Evita emitir el mismo aviso en cada expansión (hot path): un patrón solo
+    /// se avisa una vez hasta el siguiente reinicio.
+    warned_allow_patterns: Mutex<HashSet<(String, String)>>,
 }
 
 impl Registry {
@@ -490,6 +1175,8 @@ impl Registry {
         let mut catalogs: HashMap<String, Arc<CatalogCache>> = HashMap::new();
         let mut dynamic = Vec::new();
         let mut index = HashMap::new();
+        let mut quota_targets: Vec<QuotaTarget> = Vec::new();
+        let mut respect_daily_quota = false;
 
         for (route_idx, route) in config.route.iter().enumerate() {
             for (backend_idx, backend) in route.backend.iter().enumerate() {
@@ -506,8 +1193,39 @@ impl Registry {
                         backend.base_url.clone(),
                         ttl,
                         Arc::clone(&metrics),
+                        config.ledger_events_enabled(),
                     ))
                 });
+                let respect = backend.is_free_tier()
+                    && discovery.is_none_or(|discovery| discovery.respect_daily_quota);
+                if respect {
+                    respect_daily_quota = true;
+                    let interval = discovery.map_or(
+                        Duration::from_millis(crate::config::DEFAULT_QUOTA_POLL_INTERVAL_MS),
+                        |discovery| discovery.quota_poll_interval(),
+                    );
+                    match quota_targets
+                        .iter_mut()
+                        .find(|target| target.base_url == backend.base_url)
+                    {
+                        Some(existing) if existing.interval != interval => {
+                            // El sondeo es único por `base_url`: si dos backends
+                            // declaran intervalos distintos se toma el menor (el
+                            // más conservador) y se avisa. No es un error.
+                            existing.interval = existing.interval.min(interval);
+                            tracing::warn!(
+                                base_url = %backend.base_url,
+                                "quota_poll_interval_ms incoherente por base_url; se toma el menor"
+                            );
+                        }
+                        Some(_) => {}
+                        None => quota_targets.push(QuotaTarget {
+                            base_url: backend.base_url.clone(),
+                            api_key_env: backend.api_key_env.clone(),
+                            interval,
+                        }),
+                    }
+                }
                 index.insert((route_idx, backend_idx), dynamic.len());
                 dynamic.push(DynamicBackend {
                     profile: backend.profile(),
@@ -519,17 +1237,46 @@ impl Registry {
                             crate::config::DEFAULT_BLACKLIST_COOLDOWN_MS,
                         )),
                     overrides: discovery.and_then(|discovery| discovery.overrides.clone()),
+                    tier: if backend.is_free_tier() {
+                        Tier::Free
+                    } else {
+                        Tier::Paid
+                    },
+                    respect_daily_quota: respect,
+                    allow: discovery
+                        .map(|discovery| discovery.allow.clone())
+                        .unwrap_or_default(),
+                    reselect_interval: discovery.map_or(
+                        Duration::from_millis(crate::config::DEFAULT_RESELECT_INTERVAL_MS),
+                        |discovery| discovery.reselect_interval(),
+                    ),
+                    min_price_delta: discovery
+                        .map_or(crate::config::DEFAULT_MIN_PRICE_DELTA, |discovery| {
+                            discovery.min_price_delta
+                        }),
                     rotation: AtomicUsize::new(0),
                 });
             }
         }
 
         Self {
+            client,
             catalogs,
             dynamic,
             index,
+            route_names: config
+                .route
+                .iter()
+                .map(|route| route.name.clone())
+                .collect(),
             blacklist: Arc::new(Blacklist::new(Arc::clone(&metrics))),
             metrics,
+            ledger_events: config.ledger_events_enabled(),
+            free_quota_exhausted_until: RwLock::new(None),
+            respect_daily_quota,
+            quota_targets,
+            paid_selections: RwLock::new(HashMap::new()),
+            warned_allow_patterns: Mutex::new(HashSet::new()),
         }
     }
 
@@ -538,9 +1285,200 @@ impl Registry {
         self.catalogs.get(base_url)
     }
 
+    /// Precio (`pin`, `pout`) de un modelo en el último snapshot del catálogo
+    /// de `base_url`, normalizado a **USD por millón de tokens** (la misma
+    /// unidad de los eventos `catalog` y `selection`).
+    ///
+    /// Es el precio **en el momento de la consulta**: lo usa el evento
+    /// `gateway_requests` para costar la petición con el precio vigente al
+    /// enrutarse, no el de una configuración estática. `None` si no hay
+    /// catálogo para esa `base_url`, el modelo no está en él o su precio no es
+    /// parseable (un precio desconocido no se inventa).
+    pub fn model_price(&self, base_url: &str, model_id: &str) -> Option<(f64, f64)> {
+        let catalog = self.catalog(base_url)?.cached()?;
+        catalog
+            .iter()
+            .find(|model| model.id == model_id)
+            .and_then(price_per_token)
+            .map(|(pin, pout)| (TOKENS_PER_MILLION * pin, TOKENS_PER_MILLION * pout))
+    }
+
     /// Blacklist global compartida.
     pub fn blacklist(&self) -> &Arc<Blacklist> {
         &self.blacklist
+    }
+
+    // --- Ledger de observabilidad (#39, Grupo 5): gauges de precio -----------
+
+    /// Publica los gauges de precio del ledger desde el snapshot **actual** del
+    /// catálogo de `base_url`: una serie de `llm_gateway_allowlist_price_usd`
+    /// por modelo de la lista curada con precio conocido y el
+    /// `llm_gateway_selected_model_price_usd` de la selección pegajosa de cada
+    /// backend de pago sobre esa `base_url`.
+    ///
+    /// Se llama tras cada refresco del catálogo (ticker de
+    /// [`Registry::spawn_refresh`]), **no** por petición: el precio del
+    /// seleccionado queda así fresco aunque el elegido no cambie (histéresis).
+    /// Sin catálogo en caché no publica nada; los modelos con precio no
+    /// parseable no emiten serie (nunca un precio `0` falso).
+    pub(crate) fn publish_price_gauges(&self, base_url: &str) {
+        let Some(cache) = self.catalogs.get(base_url) else {
+            return;
+        };
+        let Some(catalog) = cache.cached() else {
+            return;
+        };
+
+        // Gauge del seleccionado: la selección pegajosa de cada backend de pago
+        // sobre esta base, con el precio del snapshot vigente.
+        let selections = self
+            .paid_selections
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for ((route_idx, backend_idx), selection) in selections.iter() {
+            let Some(entry) = self.dynamic(*route_idx, *backend_idx) else {
+                continue;
+            };
+            if entry.base_url != base_url || entry.tier != Tier::Paid {
+                continue;
+            }
+            if let Some((pin, pout)) = self.model_price(base_url, &selection.model) {
+                self.metrics.set_selected_model_price(
+                    self.route_name(*route_idx),
+                    &selection.model,
+                    Some(pin),
+                    Some(pout),
+                );
+            }
+        }
+        drop(selections);
+
+        // Gauge de la lista curada: una serie por modelo de `allow` con precio
+        // conocido, etiquetada solo con `model`. Dos backends que comparten
+        // `base_url` publican los mismos valores (mismo catálogo): idempotente.
+        for entry in &self.dynamic {
+            if entry.base_url != base_url || entry.tier != Tier::Paid || entry.allow.is_empty() {
+                continue;
+            }
+            for model in catalog.iter() {
+                if !matches_allow(&model.id, &entry.allow) {
+                    continue;
+                }
+                if let Some((pin, pout)) = price_per_token(model) {
+                    // Del catálogo (USD por token) a USD/Mtok, la unidad de los
+                    // eventos y gauges del ledger.
+                    let (pin, pout) = (TOKENS_PER_MILLION * pin, TOKENS_PER_MILLION * pout);
+                    self.metrics
+                        .set_allowlist_price(&model.id, blend_parts(pin, pout));
+                }
+            }
+        }
+    }
+
+    /// `true` si algún backend dinámico respeta la cuota diaria free.
+    pub fn respect_daily_quota(&self) -> bool {
+        self.respect_daily_quota
+    }
+
+    /// Intervalo del objetivo de sondeo de `base_url` (solo tests).
+    #[cfg(test)]
+    fn quota_interval(&self, base_url: &str) -> Option<Duration> {
+        self.quota_targets
+            .iter()
+            .find(|target| target.base_url == base_url)
+            .map(|target| target.interval)
+    }
+
+    /// `true` si el backend free `(route, backend)` se saltará por el gate abierto.
+    ///
+    /// Exige que el backend respete la cuota, que exista catálogo para su
+    /// `base_url` (si no, no habría aportado candidatos de todos modos) y que el
+    /// gate esté abierto. Lo usa `expand_backends` para contar **un** salto por
+    /// petición y ruta, no uno por backend free.
+    pub fn free_quota_skip(&self, route: usize, backend: usize) -> bool {
+        let Some(entry) = self.dynamic(route, backend) else {
+            return false;
+        };
+        entry.tier == Tier::Free
+            && entry.respect_daily_quota
+            && self.catalogs.contains_key(&entry.base_url)
+            && self.quota_gate_open()
+    }
+
+    /// Abre el gate global de cuota free hasta `deadline`.
+    ///
+    /// No hace nada si ningún backend respeta la cuota o si `deadline` ya venció.
+    /// El deadline se acota a [`MAX_QUOTA_GATE`].
+    ///
+    /// Política deliberada de «conservar el deadline más lejano»: si el gate ya
+    /// está abierto, un `429` con un deadline anterior **no** lo acorta. Un mismo
+    /// agotamiento puede llegar por varias rutas y `base_url` con resets
+    /// ligeramente distintos; acortar por el primero en llegar cerraría el gate
+    /// antes de que la cuota se recupere de verdad, así que se conserva el
+    /// vencimiento más lejano. El sondeo es quien puede cerrarlo antes (ver
+    /// [`Registry::close_quota_gate`]).
+    pub fn open_quota_gate(&self, deadline: Instant) {
+        if !self.respect_daily_quota {
+            return;
+        }
+        let now = Instant::now();
+        if deadline <= now {
+            return;
+        }
+        let deadline = deadline.min(now + MAX_QUOTA_GATE);
+        let mut guard = self
+            .free_quota_exhausted_until
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_none_or(|existing| existing < deadline) {
+            *guard = Some(deadline);
+        }
+    }
+
+    /// `true` si el gate de cuota free está abierto.
+    ///
+    /// El camino rápido (gate cerrado o deadline vigente) solo toma el lock de
+    /// **lectura**; únicamente cuando el deadline ha vencido se promueve a
+    /// escritura para purgarlo (doble comprobación).
+    pub fn quota_gate_open(&self) -> bool {
+        let now = Instant::now();
+        {
+            let guard = self
+                .free_quota_exhausted_until
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match *guard {
+                Some(deadline) if deadline > now => return true,
+                None => return false,
+                Some(_) => {}
+            }
+        }
+
+        let mut guard = self
+            .free_quota_exhausted_until
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match *guard {
+            Some(deadline) if deadline > Instant::now() => true,
+            Some(_) => {
+                *guard = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Cierra el gate de cuota free si estaba abierto.
+    ///
+    /// Lo usa el sondeo: si vuelve a observar cuota disponible (`remaining > 0`)
+    /// —por ejemplo justo tras el reset a las 00:00 UTC— el gate debe cerrarse de
+    /// inmediato en lugar de bloquear el tier free hasta el deadline.
+    pub fn close_quota_gate(&self) {
+        let mut guard = self
+            .free_quota_exhausted_until
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = None;
     }
 
     /// Backend dinámico registrado en `(route, backend)`, si lo hay.
@@ -556,8 +1494,13 @@ impl Registry {
     }
 
     /// Expande el backend dinámico `(route, backend)` a los modelos concretos
-    /// elegibles de su perfil, en orden de preferencia, excluyendo los modelos en
-    /// blacklist y aplicando rotación round-robin entre peticiones sucesivas.
+    /// elegibles, en orden de preferencia.
+    ///
+    /// En un backend `openrouter_free` son los modelos free clasificados para su
+    /// perfil, excluyendo los que están en blacklist y aplicando rotación
+    /// round-robin entre peticiones sucesivas. En un backend `openrouter_paid`
+    /// son los modelos de la lista curada ordenados por precio, con selección
+    /// pegajosa y sin rotación.
     ///
     /// Devuelve una lista vacía si el backend no es dinámico, no hay catálogo o
     /// el perfil no aporta candidatos.
@@ -565,6 +1508,11 @@ impl Registry {
         let Some(entry) = self.dynamic(route, backend) else {
             return Vec::new();
         };
+        if entry.tier == Tier::Free && entry.respect_daily_quota && self.quota_gate_open() {
+            // El conteo del salto lo hace `expand_backends` una vez por petición y
+            // ruta; aquí `expand` se ejecuta una vez por backend.
+            return Vec::new();
+        }
         let Some(cache) = self.catalogs.get(&entry.base_url) else {
             return Vec::new();
         };
@@ -572,7 +1520,15 @@ impl Registry {
             return Vec::new();
         };
 
-        let eligible = eligible_models(&catalog);
+        match entry.tier {
+            Tier::Free => self.expand_free(entry, &catalog),
+            Tier::Paid => self.expand_paid(route, backend, entry, &catalog),
+        }
+    }
+
+    /// Expansión del tier free: clasificación por perfil más rotación round-robin.
+    fn expand_free(&self, entry: &DynamicBackend, catalog: &[ModelEntry]) -> Vec<String> {
+        let eligible = eligible_models(catalog);
         let ordered = classify(&eligible, entry.classify_context());
         self.metrics
             .record_discovery_profile(&entry.base_url, entry.profile, ordered.len());
@@ -586,8 +1542,148 @@ impl Registry {
         candidates
     }
 
+    /// Expansión del tier de pago: lista curada, orden por precio y selección
+    /// pegajosa con histéresis, sin rotación.
+    ///
+    /// Devuelve el modelo elegido al frente y el resto en orden de precio como
+    /// failover. Un modelo en blacklist o ausente del catálogo deja de ser
+    /// elegible y se cambia de inmediato al más barato disponible.
+    fn expand_paid(
+        &self,
+        route: usize,
+        backend: usize,
+        entry: &DynamicBackend,
+        catalog: &[ModelEntry],
+    ) -> Vec<String> {
+        self.warn_unmatched_allow(entry, catalog);
+
+        let context = PaidContext::new(entry.min_context, &entry.allow);
+        let candidates = self
+            .blacklist
+            .retain_eligible(&classify_paid(catalog, context));
+
+        let Some(cheapest) = candidates.first().cloned() else {
+            // Sin candidatos elegibles (lista curada vacía, sin coincidencias o
+            // todo en blacklist) no hay elección que conservar.
+            self.write_selections().remove(&(route, backend));
+            return Vec::new();
+        };
+
+        let mut selections = self.write_selections();
+        let sticky = selections.get(&(route, backend)).cloned();
+        let cheapest_blend = blend_of(catalog, &cheapest);
+
+        let chosen = match &sticky {
+            Some(selection) if selection.model != cheapest => {
+                let still_eligible = candidates.iter().any(|id| id == &selection.model);
+                let due = selection.chosen_at.elapsed() >= entry.reselect_interval;
+                let enough = relative_price_improvement(selection.blend, cheapest_blend)
+                    >= entry.min_price_delta;
+                if still_eligible && !(due && enough) {
+                    selection.model.clone()
+                } else {
+                    cheapest.clone()
+                }
+            }
+            _ => cheapest.clone(),
+        };
+
+        // El instante de elección solo se reinicia cuando cambia el modelo: el
+        // refresco de precios no debe reiniciar la histéresis.
+        let chosen_at = match &sticky {
+            Some(selection) if selection.model == chosen => selection.chosen_at,
+            _ => Instant::now(),
+        };
+        let observed = blend_of(catalog, &chosen);
+        selections.insert(
+            (route, backend),
+            PaidSelection {
+                model: chosen.clone(),
+                blend: observed,
+                chosen_at,
+            },
+        );
+        drop(selections);
+
+        // El cambio de selección se emite antes de consumir `candidates`: la
+        // razón necesita saber si el modelo anterior sigue siendo elegible. Sin
+        // candidatos no hay modelo nuevo al que etiquetar y no se emite.
+        if let Some(event) = selection_event(
+            self.route_name(route),
+            &entry.base_url,
+            sticky.as_ref().map(|selection| selection.model.as_str()),
+            &chosen,
+            catalog,
+            &candidates,
+            now_ms(),
+        ) {
+            emit_selection_events(
+                &self.metrics,
+                std::slice::from_ref(&event),
+                self.ledger_events,
+            );
+        }
+
+        // El elegido al frente; el resto, en orden de precio, es el failover.
+        let mut ordered: Vec<String> = candidates.into_iter().filter(|id| id != &chosen).collect();
+        ordered.insert(0, chosen);
+        ordered
+    }
+
+    /// Nombre de la ruta por índice de configuración, para etiquetar los
+    /// eventos del ledger. Un índice fuera de rango (no debería ocurrir: los
+    /// `(route, backend)` con selección salen de la configuración) se etiqueta
+    /// `unknown` en lugar de paniquear.
+    fn route_name(&self, route: usize) -> &str {
+        self.route_names
+            .get(route)
+            .map(String::as_str)
+            .unwrap_or("unknown")
+    }
+
+    /// Avisa de los patrones de `allow` sin ninguna coincidencia en el catálogo.
+    ///
+    /// Emite **un único** `tracing::warn!` por `(base_url, patrón)`: el par queda
+    /// registrado en `warned_allow_patterns` y no se vuelve a avisar en las
+    /// expansiones siguientes. Así la lista curada a medio migrar no inunda el log
+    /// en el hot path ni es un error de arranque.
+    fn warn_unmatched_allow(&self, entry: &DynamicBackend, catalog: &[ModelEntry]) {
+        if entry.allow.is_empty() {
+            return;
+        }
+        let mut warned = self
+            .warned_allow_patterns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for pattern in &entry.allow {
+            let matched = catalog
+                .iter()
+                .any(|model| matches_allow(&model.id, std::slice::from_ref(pattern)));
+            if !matched && warned.insert((entry.base_url.clone(), pattern.clone())) {
+                tracing::warn!(
+                    pattern = %pattern,
+                    base_url = %entry.base_url,
+                    "discovery.allow: patrón sin coincidencias en el catálogo"
+                );
+            }
+        }
+    }
+
+    /// Toma el lock de escritura de las selecciones de pago, ignorando un posible
+    /// envenenamiento.
+    fn write_selections(
+        &self,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<(usize, usize), PaidSelection>> {
+        self.paid_selections
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Identificadores de modelos dinámicos elegibles (para `/v1/models`),
     /// deduplicados, sin rotación ni filtrado por blacklist.
+    ///
+    /// Solo se anuncian los modelos del tier free: los ids de la lista curada de
+    /// pago no son enrutables como `model` de una petición.
     ///
     /// La deduplicación conserva el orden de primera aparición entre backends y
     /// entre llamadas con el mismo catálogo.
@@ -595,6 +1691,9 @@ impl Registry {
         let mut ids: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for entry in &self.dynamic {
+            if entry.tier != Tier::Free {
+                continue;
+            }
             let Some(cache) = self.catalogs.get(&entry.base_url) else {
                 continue;
             };
@@ -617,16 +1716,22 @@ impl Registry {
     /// con [`MissedTickBehavior::Delay`]. Un refresco fallido nunca aborta el
     /// bucle (la caché previa se conserva).
     ///
+    /// Tras cada tick se publican los gauges de precio del ledger
+    /// ([`Registry::publish_price_gauges`]): es el punto donde ya se ha
+    /// actualizado el snapshot de precios y no es camino de petición.
+    ///
     /// Devuelve un `JoinHandle` por catálogo; el llamante decide qué hacer con
     /// ellos (`main.rs` los aborta en el cierre ordenado).
-    pub fn spawn_refresh(&self) -> Vec<JoinHandle<()>> {
+    pub fn spawn_refresh(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
         let mut handles = Vec::new();
-        for cache in self.catalogs.values() {
+        for (base_url, cache) in self.catalogs.iter() {
             let interval = cache.ttl();
             if interval.is_zero() {
                 continue;
             }
             let cache = Arc::clone(cache);
+            let this = Arc::clone(self);
+            let base_url = base_url.clone();
             handles.push(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -635,10 +1740,118 @@ impl Registry {
                     // Pasa por el mismo guardián que el refresco on-demand para
                     // no solapar dos fetches de `/models`.
                     cache.refresh_guarded().await;
+                    // Gauges de precio del ledger (#39, Grupo 5).
+                    this.publish_price_gauges(&base_url);
                 }
             }));
         }
         handles
+    }
+
+    /// Lanza una tarea de sondeo de cuota free por `base_url` que respeta la
+    /// cuota, siguiendo el patrón de [`Registry::spawn_refresh`]: primer tick
+    /// inmediato y después cada `quota_poll_interval_ms`, con
+    /// [`MissedTickBehavior::Delay`].
+    ///
+    /// No lanza ninguna tarea si el gate está deshabilitado o no hay objetivos.
+    /// Un fallo del sondeo nunca altera el gate (stale-while-error).
+    pub fn spawn_quota_poll(self: &Arc<Self>) -> Vec<JoinHandle<()>> {
+        let mut handles = Vec::new();
+        for target in &self.quota_targets {
+            if target.interval.is_zero() {
+                continue;
+            }
+            let this = Arc::clone(self);
+            let target = QuotaTarget {
+                base_url: target.base_url.clone(),
+                api_key_env: target.api_key_env.clone(),
+                interval: target.interval,
+            };
+            handles.push(tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(target.interval);
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    this.poll_quota_once(&target).await;
+                }
+            }));
+        }
+        handles
+    }
+
+    /// Ejecuta un ciclo de sondeo de cuota para `target`.
+    ///
+    /// Registra el gauge con el último `remaining` observado y abre el gate si
+    /// llega a `0` (deadline: siguiente `00:00 UTC`). Un fallo se registra pero
+    /// conserva el estado del gate.
+    async fn poll_quota_once(&self, target: &QuotaTarget) {
+        let Some(api_key) = resolve_poll_key(target.api_key_env.as_deref()) else {
+            return;
+        };
+        match fetch_free_quota(
+            &self.client,
+            &target.base_url,
+            api_key.as_deref(),
+            QUOTA_TIMEOUT,
+        )
+        .await
+        {
+            Ok(Some(remaining)) => {
+                self.metrics
+                    .record_free_quota_remaining(&target.base_url, remaining);
+                if remaining == 0 {
+                    if let Some(deadline) = quota_deadline(None) {
+                        self.open_quota_gate(deadline);
+                        tracing::warn!(
+                            base_url = %target.base_url,
+                            "cuota diaria free agotada (sondeo); gate abierto"
+                        );
+                    }
+                } else if self.quota_gate_open() {
+                    // La cuota volvió (p. ej. justo tras el reset a las 00:00 UTC):
+                    // se cierra el gate de inmediato en vez de esperar al deadline.
+                    self.close_quota_gate();
+                    tracing::info!(
+                        base_url = %target.base_url,
+                        remaining,
+                        "cuota diaria free recuperada (sondeo); gate cerrado"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    base_url = %target.base_url,
+                    "GET /key sin free_model_daily_requests; se conserva el estado"
+                );
+            }
+            Err(err) => {
+                // Stale-while-error: el fallo no altera el gate.
+                tracing::warn!(
+                    base_url = %target.base_url,
+                    error = %err,
+                    "sondeo de cuota free fallido; se conserva el estado"
+                );
+            }
+        }
+    }
+}
+
+/// Resuelve la API key del sondeo de cuota a partir de su variable de entorno.
+///
+/// - `None` → `Some(None)`: endpoint sin autenticación.
+/// - `Some(var)` definida y no vacía → `Some(Some(key))`.
+/// - `Some(var)` ausente o vacía → `None`: se omite el sondeo (el backend
+///   tampoco podría usarla).
+fn resolve_poll_key(api_key_env: Option<&str>) -> Option<Option<String>> {
+    match api_key_env {
+        None => Some(None),
+        Some(var) => match std::env::var(var) {
+            Ok(value) if !value.is_empty() => Some(Some(value)),
+            _ => {
+                tracing::debug!(env_var = %var, "api_key_env sin resolver; se omite el sondeo");
+                None
+            }
+        },
     }
 }
 
@@ -646,6 +1859,11 @@ impl Registry {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Mutex;
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry;
 
     fn entry(id: &str, params: &[&str], prompt: Value, completion: Value) -> ModelEntry {
         ModelEntry {
@@ -871,6 +2089,7 @@ route:
             "http://127.0.0.1:1/v1".to_owned(),
             Duration::ZERO,
             metrics(),
+            true,
         ));
         *cache
             .state
@@ -1013,6 +2232,1625 @@ route:
             registry.cooldown(1, 1),
             None,
             "un slot estático no está registrado"
+        );
+    }
+
+    /// Milisegundos epoch UTC dentro de `delta` a partir de ahora.
+    fn epoch_ms_in(delta: Duration) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("reloj posterior a 1970");
+        u64::try_from((now + delta).as_millis()).expect("epoch en ms cabe en u64")
+    }
+
+    /// Config mínima con un backend dinámico sobre `base_url`, para el gate.
+    fn quota_config(base_url: &str) -> GatewayConfig {
+        let yaml = format!(
+            r#"
+route:
+  - name: quota-unit
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base_url}"
+        api_key_env: "OPENROUTER_API_KEY"
+"#
+        );
+        serde_saphyr::from_str(&yaml).expect("config de test válida")
+    }
+
+    #[test]
+    fn key_url_joins_slashes() {
+        assert_eq!(
+            key_url("https://openrouter.ai/api/v1"),
+            "https://openrouter.ai/api/v1/key"
+        );
+        assert_eq!(
+            key_url("https://openrouter.ai/api/v1/"),
+            "https://openrouter.ai/api/v1/key"
+        );
+    }
+
+    #[test]
+    fn free_quota_remaining_parses_nested_payload() {
+        let nested = json!({
+            "data": {"free_model_daily_requests": {"used": 1003, "limit": 1000, "remaining": 0}}
+        });
+        assert_eq!(free_quota_remaining(&nested), Some(0));
+
+        let top = json!({"free_model_daily_requests": {"remaining": "250"}});
+        assert_eq!(free_quota_remaining(&top), Some(250));
+
+        let missing = json!({"data": {"label": "sin cuota"}});
+        assert_eq!(free_quota_remaining(&missing), None);
+    }
+
+    #[test]
+    fn quota_deadline_falls_back_to_next_utc_midnight() {
+        let deadline = quota_deadline(None).expect("sin cabecera hay deadline");
+        let delta = deadline.saturating_duration_since(Instant::now()).as_secs();
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("reloj posterior a 1970")
+            .as_secs();
+        let expected = 86_400 - (now_unix % 86_400);
+        assert!(
+            delta.abs_diff(expected) <= 1,
+            "el deadline debe ser el siguiente 00:00 UTC: delta={delta}s expected={expected}s"
+        );
+    }
+
+    #[test]
+    fn quota_deadline_uses_reset_epoch_ms() {
+        let deadline = quota_deadline(Some(epoch_ms_in(Duration::from_secs(6 * 3600))))
+            .expect("un reset futuro abre el gate");
+        let delta = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            delta > Duration::from_secs(6 * 3600 - 5) && delta < Duration::from_secs(6 * 3600 + 5),
+            "el deadline debe seguir el reset, got {delta:?}"
+        );
+    }
+
+    #[test]
+    fn quota_deadline_caps_at_24h() {
+        let deadline = quota_deadline(Some(epoch_ms_in(Duration::from_secs(10 * 24 * 3600))))
+            .expect("un reset futuro abre el gate");
+        let delta = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            delta <= MAX_QUOTA_GATE && delta > MAX_QUOTA_GATE - Duration::from_secs(5),
+            "el deadline debe acotarse a 24 h, got {delta:?}"
+        );
+    }
+
+    #[test]
+    fn quota_deadline_past_reset_is_none() {
+        let past = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("reloj posterior a 1970")
+            .as_millis()
+            .saturating_sub(60_000);
+        let past = u64::try_from(past).expect("epoch en ms cabe en u64");
+        assert_eq!(
+            quota_deadline(Some(past)),
+            None,
+            "un reset en el pasado no abre el gate"
+        );
+    }
+
+    #[test]
+    fn quota_gate_opens_and_expires() {
+        let _guard = blacklist_gauge_guard();
+        let registry = Registry::new(
+            &quota_config("http://quota-gate.test/v1"),
+            reqwest::Client::new(),
+            metrics(),
+        );
+        assert!(!registry.quota_gate_open(), "el gate arranca cerrado");
+
+        registry.open_quota_gate(Instant::now() + Duration::from_millis(50));
+        assert!(registry.quota_gate_open(), "el gate debe abrirse");
+
+        std::thread::sleep(Duration::from_millis(90));
+        assert!(!registry.quota_gate_open(), "el gate debe expirar");
+    }
+
+    #[test]
+    fn quota_gate_stays_closed_when_respect_is_false() {
+        let _guard = blacklist_gauge_guard();
+        let base = "http://quota-disabled.test/v1";
+        let yaml = format!(
+            r#"
+route:
+  - name: quota-disabled-unit
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          respect_daily_quota: false
+"#
+        );
+        let config: GatewayConfig = serde_saphyr::from_str(&yaml).expect("config de test válida");
+        let registry = Registry::new(&config, reqwest::Client::new(), metrics());
+        assert!(!registry.respect_daily_quota());
+
+        registry.open_quota_gate(Instant::now() + Duration::from_secs(60));
+        assert!(!registry.quota_gate_open(), "el gate no debe abrirse");
+    }
+
+    #[tokio::test]
+    async fn expand_returns_zero_candidates_with_gate_open() {
+        let _guard = blacklist_gauge_guard();
+        let base = "http://quota-expand.test/v1";
+        let registry = Registry::new(&quota_config(base), reqwest::Client::new(), metrics());
+        registry
+            .catalog(base)
+            .expect("caché registrada")
+            .seed(vec![entry(
+                "dyn/aa:free",
+                &["tools", "tool_choice"],
+                json!("0"),
+                json!("0"),
+            )]);
+
+        assert_eq!(
+            registry.expand(0, 0).await.len(),
+            1,
+            "sin gate debe haber candidato"
+        );
+
+        registry.open_quota_gate(Instant::now() + Duration::from_millis(50));
+        assert!(
+            registry.expand(0, 0).await.is_empty(),
+            "con el gate abierto no debe haber candidatos free"
+        );
+
+        std::thread::sleep(Duration::from_millis(90));
+        assert_eq!(
+            registry.expand(0, 0).await.len(),
+            1,
+            "al expirar el gate el free vuelve a proponerse"
+        );
+    }
+
+    /// `base_url` del backend de pago de los tests.
+    const PAID_BASE: &str = "http://paid.test/v1";
+
+    /// Config mínima con un backend de pago sobre `base_url` y ruta `paid-unit`.
+    ///
+    /// El nombre de ruta es el de los tests históricos; los nuevos tests del
+    /// ledger (Grupo 5) usan [`paid_config_named`] para aislar sus series del
+    /// registro global de métricas.
+    fn paid_config(base_url: &str, discovery: &str) -> GatewayConfig {
+        paid_config_named(base_url, discovery, "paid-unit")
+    }
+
+    /// Config mínima con un backend de pago sobre `base_url` y ruta propia.
+    fn paid_config_named(base_url: &str, discovery: &str, route: &str) -> GatewayConfig {
+        let yaml = format!(
+            r#"
+route:
+  - name: {route}
+    backend:
+      - kind: openrouter_paid
+        profile: code
+        base_url: "{base_url}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+{discovery}
+"#
+        );
+        serde_saphyr::from_str(&yaml).expect("config de test válida")
+    }
+
+    /// Modelo de pago con precios, contexto y tool-calling explícitos.
+    fn paid_entry(id: &str, prompt: &str, completion: &str, context_length: u32) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(context_length),
+            pricing: Some(Pricing {
+                prompt: Some(json!(prompt)),
+                completion: Some(json!(completion)),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Bloque `discovery` (indentado) con la lista curada de los tests.
+    fn paid_discovery(extra: &str) -> String {
+        format!("          allow: [\"acme/flash-*\"]\n{extra}")
+    }
+
+    /// Registry con un backend de pago sobre `base_url` y su catálogo precargado.
+    fn paid_registry(base_url: &str, discovery: &str, models: Vec<ModelEntry>) -> Registry {
+        let registry = Registry::new(
+            &paid_config(base_url, discovery),
+            reqwest::Client::new(),
+            metrics(),
+        );
+        registry
+            .catalog(base_url)
+            .expect("caché del backend de pago")
+            .seed(models);
+        registry
+    }
+
+    /// Modelo de pago barato (`blend` 0.04).
+    fn paid_cheap() -> ModelEntry {
+        paid_entry("acme/flash-a", "0.04", "0.04", 8_000)
+    }
+
+    /// Modelo de pago caro (`blend` 0.1).
+    fn paid_expensive() -> ModelEntry {
+        paid_entry("acme/flash-b", "0.1", "0.1", 128_000)
+    }
+
+    /// Scenario 5.4: sin rotación, dos expansiones devuelven el mismo orden.
+    #[tokio::test]
+    async fn paid_expand_returns_the_same_order_on_consecutive_expansions() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+
+        let first = registry.expand(0, 0).await;
+        let second = registry.expand(0, 0).await;
+
+        assert_eq!(
+            first,
+            vec!["acme/flash-a".to_owned(), "acme/flash-b".to_owned()],
+            "orden por precio ascendente"
+        );
+        assert_eq!(
+            first, second,
+            "sin round-robin el primer candidato no cambia entre expansiones"
+        );
+    }
+
+    /// Scenario: Sin coincidencias con la lista curada el backend aporta cero
+    /// candidatos.
+    #[tokio::test]
+    async fn paid_expand_with_unmatched_pattern_returns_no_candidates() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            "          allow: [\"lab-inexistente/modelo-x\"]\n",
+            vec![paid_cheap()],
+        );
+
+        assert!(
+            registry.expand(0, 0).await.is_empty(),
+            "un patrón huérfano no aporta candidatos"
+        );
+    }
+
+    /// Scenario 5.7: sin `allow` el backend de pago aporta cero candidatos.
+    #[tokio::test]
+    async fn paid_expand_without_allow_returns_no_candidates() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            "          min_context: 1000\n",
+            vec![paid_cheap()],
+        );
+
+        assert!(
+            registry.expand(0, 0).await.is_empty(),
+            "sin lista curada no hay candidatos de pago"
+        );
+    }
+
+    /// Scenario: Tras reinicio elige el más barato (sin estado previo).
+    #[tokio::test]
+    async fn paid_selection_first_expansion_picks_cheapest() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order[0], "acme/flash-a",
+            "la primera expansión elige el modelo más barato de la lista curada"
+        );
+    }
+
+    /// Scenario: Mantiene el modelo dentro de `reselect_interval_ms` aunque el
+    /// catálogo refrescado traiga uno más barato.
+    #[tokio::test]
+    async fn paid_selection_keeps_sticky_model_within_interval() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        // Refresco del catálogo: `B` pasa a ser un 30 % más barato que `A`.
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_cheap(),
+                paid_entry("acme/flash-b", "0.028", "0.028", 128_000),
+            ]);
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order[0], "acme/flash-a",
+            "dentro del intervalo el modelo pegajoso se mantiene"
+        );
+        assert_eq!(
+            order[1], "acme/flash-b",
+            "el más barato queda como failover en orden de precio"
+        );
+    }
+
+    /// Scenario: cambia tras `reselect_interval_ms` si la mejora es suficiente.
+    #[tokio::test]
+    async fn paid_selection_switches_after_interval_with_enough_improvement() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 50\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_cheap(),
+                paid_entry("acme/flash-b", "0.028", "0.028", 128_000),
+            ]);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order[0], "acme/flash-b",
+            "pasado el intervalo, un 30 % más barato releva al pegajoso"
+        );
+        assert_eq!(order[1], "acme/flash-a");
+    }
+
+    /// Scenario: no cambia si la mejora es marginal (5 %).
+    #[tokio::test]
+    async fn paid_selection_keeps_sticky_on_marginal_improvement() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 50\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_cheap(),
+                paid_entry("acme/flash-b", "0.038", "0.038", 128_000),
+            ]);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order[0], "acme/flash-a",
+            "una mejora por debajo de min_price_delta no justifica cambiar"
+        );
+    }
+
+    /// Scenario: cambio inmediato si el pegajoso cae en blacklist.
+    #[tokio::test]
+    async fn paid_selection_switches_immediately_when_sticky_is_blacklisted() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .blacklist()
+            .mark("acme/flash-a", Duration::from_secs(60));
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order,
+            vec!["acme/flash-b".to_owned()],
+            "el pegajoso blacklisteado deja de ser elegible"
+        );
+    }
+
+    /// Scenario: cambio inmediato si el pegajoso desaparece del catálogo.
+    #[tokio::test]
+    async fn paid_selection_switches_immediately_when_sticky_disappears() {
+        let _guard = blacklist_gauge_guard();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![paid_expensive()]);
+
+        let order = registry.expand(0, 0).await;
+
+        assert_eq!(
+            order,
+            vec!["acme/flash-b".to_owned()],
+            "si el pegajoso sale del catálogo se pasa de inmediato al más barato"
+        );
+    }
+
+    /// Capa mínima de `tracing` que acumula los eventos `WARN` como texto.
+    #[derive(Clone)]
+    struct WarnLayer {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for WarnLayer {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().level() != &Level::WARN {
+                return;
+            }
+            let mut visitor = WarnVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("lock captured warnings")
+                .push(visitor.fields.join(" "));
+        }
+    }
+
+    /// Visitante que serializa los campos del evento como `campo=valor`.
+    #[derive(Default)]
+    struct WarnVisitor {
+        fields: Vec<String>,
+    }
+
+    impl Visit for WarnVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+
+    /// Captura los avisos `WARN` solo para el hilo actual.
+    fn capture_warnings() -> (Arc<Mutex<Vec<String>>>, tracing::subscriber::DefaultGuard) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = registry().with(WarnLayer {
+            events: Arc::clone(&events),
+        });
+        (events, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Scenario 2: el aviso de un patrón huérfano se emite una sola vez por
+    /// `(base_url, patrón)`, no en cada expansión.
+    #[tokio::test]
+    async fn paid_expand_warns_once_per_unmatched_pattern() {
+        let _guard = blacklist_gauge_guard();
+        let (events, _capture) = capture_warnings();
+        let registry = paid_registry(
+            PAID_BASE,
+            "          allow: [\"lab-inexistente/modelo-x\", \"acme/flash-*\"]\n",
+            vec![paid_cheap()],
+        );
+
+        assert_eq!(
+            registry.expand(0, 0).await,
+            vec!["acme/flash-a".to_owned()],
+            "el patrón con coincidencias aporta su candidato"
+        );
+        let _ = registry.expand(0, 0).await;
+
+        let warnings = events.lock().expect("lock captured warnings").clone();
+        let unmatched: Vec<&String> = warnings
+            .iter()
+            .filter(|warning| warning.contains("lab-inexistente/modelo-x"))
+            .collect();
+        assert_eq!(
+            unmatched.len(),
+            1,
+            "un único aviso por patrón huérfano: {warnings:?}"
+        );
+        assert!(
+            unmatched[0].contains(PAID_BASE),
+            "el aviso debe incluir la base_url: {}",
+            unmatched[0]
+        );
+    }
+
+    /// Con todas las coincidencias no se emite ningún aviso.
+    #[tokio::test]
+    async fn paid_expand_does_not_warn_when_all_patterns_match() {
+        let _guard = blacklist_gauge_guard();
+        let (events, _capture) = capture_warnings();
+        let registry = paid_registry(PAID_BASE, &paid_discovery(""), vec![paid_cheap()]);
+
+        let order = registry.expand(0, 0).await;
+        let _ = registry.expand(0, 0).await;
+
+        assert_eq!(order, vec!["acme/flash-a".to_owned()]);
+        assert!(
+            events.lock().expect("lock captured warnings").is_empty(),
+            "sin patrones huérfanos no hay avisos"
+        );
+    }
+
+    /// Scenario 7: dos backends free con la misma `base_url` y distinto
+    /// `quota_poll_interval_ms` comparten un objetivo con el menor intervalo.
+    #[test]
+    fn quota_targets_dedupe_by_base_url_taking_min_interval() {
+        let _guard = blacklist_gauge_guard();
+        let base = "http://quota-dedupe.test/v1";
+        let yaml = format!(
+            r#"
+route:
+  - name: quota-dedupe-a
+    backend:
+      - kind: openrouter_free
+        profile: code
+        base_url: "{base}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          quota_poll_interval_ms: 5000
+  - name: quota-dedupe-b
+    backend:
+      - kind: openrouter_free
+        profile: writer
+        base_url: "{base}"
+        api_key_env: "OPENROUTER_API_KEY"
+        discovery:
+          quota_poll_interval_ms: 1000
+"#
+        );
+        let config: GatewayConfig = serde_saphyr::from_str(&yaml).expect("config de test válida");
+        let registry = Registry::new(&config, reqwest::Client::new(), metrics());
+
+        assert_eq!(
+            registry.quota_interval(base),
+            Some(Duration::from_millis(1000)),
+            "la deduplicación por base_url debe conservar el menor intervalo"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Grupo 2: evento de catálogo (`gateway_catalog`)
+    // ------------------------------------------------------------------
+
+    /// Asegura que dos precios coinciden con tolerancia de punto flotante.
+    fn assert_price_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "se esperaba {expected}, obtuvo {actual}"
+        );
+    }
+
+    /// Modelo de pago con precios por token en cadena (formato OpenRouter).
+    fn priced(id: &str, pin: &str, pout: &str) -> ModelEntry {
+        paid_entry(id, pin, pout, 8_000)
+    }
+
+    /// Modelo con precios crudos como `Value` (número o cadena, válido o no).
+    fn raw_priced(id: &str, prompt: Value, completion: Value) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(8_000),
+            pricing: Some(Pricing {
+                prompt: Some(prompt),
+                completion: Some(completion),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Modelo presente en el catálogo sin campo `pricing`.
+    fn unpriced_entry(id: &str) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(8_000),
+            pricing: None,
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Transición `new`: la primera observación da de alta el modelo con sus
+    /// precios normalizados a USD/Mtok y sin precios previos.
+    #[test]
+    fn catalog_tracker_detects_new_model() {
+        let tracker = PriceTracker::new();
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "la primera observación da de alta: {events:?}"
+        );
+        let event = &events[0];
+        assert_eq!(event.change_kind, CatalogChangeKind::New);
+        assert_eq!(event.model_id, "acme/flash-a");
+        assert_eq!(event.org, "acme");
+        assert_eq!(event.context_length, Some(8_000));
+        assert_price_close(event.pin.expect("pin nuevo"), 1.5);
+        assert_price_close(event.pout.expect("pout nuevo"), 2.0);
+        assert!(
+            event.prev_pin.is_none(),
+            "un modelo nuevo no tiene precio previo"
+        );
+        assert!(
+            event.prev_pout.is_none(),
+            "un modelo nuevo no tiene precio previo"
+        );
+    }
+
+    /// Transición `price_up`: sube el precio de salida y el evento conserva el
+    /// precio previo.
+    #[test]
+    fn catalog_tracker_detects_price_up() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000002", "0.0000002")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000002", "0.00000025")]);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].change_kind, CatalogChangeKind::PriceUp);
+        assert_price_close(events[0].pout.expect("pout nuevo"), 0.25);
+        assert_price_close(events[0].prev_pout.expect("pout previo"), 0.2);
+    }
+
+    /// Transición `price_down`: el escenario del spec, `pout` pasa de 0.1992 a
+    /// 0.1800 USD/Mtok.
+    #[test]
+    fn catalog_tracker_detects_price_down() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000002", "0.0000001992")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000002", "0.00000018")]);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].change_kind, CatalogChangeKind::PriceDown);
+        assert_price_close(events[0].pout.expect("pout nuevo"), 0.1800);
+        assert_price_close(events[0].prev_pout.expect("pout previo"), 0.1992);
+    }
+
+    /// Transición `removed`: el modelo desaparece del catálogo y el evento
+    /// conserva el último precio conocido; los precios nuevos quedan nulos.
+    #[test]
+    fn catalog_tracker_detects_removed_model() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[]);
+
+        assert_eq!(events.len(), 1, "la baja del modelo emite: {events:?}");
+        assert_eq!(events[0].change_kind, CatalogChangeKind::Removed);
+        assert_eq!(events[0].model_id, "acme/flash-a");
+        assert_eq!(
+            events[0].pin, None,
+            "un modelo removed no tiene precio nuevo"
+        );
+        assert_eq!(events[0].pout, None);
+        assert_price_close(events[0].prev_pin.expect("pin previo"), 1.5);
+        assert_price_close(events[0].prev_pout.expect("pout previo"), 2.0);
+        assert_eq!(
+            events[0].context_length,
+            Some(8_000),
+            "el contexto del último snapshot se conserva"
+        );
+    }
+
+    /// Dedup (D2): un precio idéntico entre snapshots consecutivos no vuelve a
+    /// emitir.
+    #[test]
+    fn catalog_tracker_does_not_emit_when_price_is_unchanged() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        assert!(
+            events.is_empty(),
+            "un precio sin cambios no emite: {events:?}"
+        );
+    }
+
+    /// Un cambio de precio emite exactamente un evento, y solo para el modelo
+    /// que cambió.
+    #[test]
+    fn catalog_tracker_emits_only_for_models_that_changed() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[
+            priced("acme/flash-a", "0.0000015", "0.000002"),
+            priced("acme/flash-b", "0.000001", "0.000001"),
+        ]);
+
+        let events = tracker.observe(&[
+            priced("acme/flash-a", "0.0000015", "0.000002"),
+            priced("acme/flash-b", "0.000001", "0.000002"),
+        ]);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "solo el modelo que cambió emite: {events:?}"
+        );
+        assert_eq!(events[0].model_id, "acme/flash-b");
+        assert_eq!(events[0].change_kind, CatalogChangeKind::PriceUp);
+    }
+
+    /// Contrato 2.3: `blend = 0.75 · pin + 0.25 · pout` sobre los precios del
+    /// evento, en USD por millón de tokens.
+    #[test]
+    fn catalog_event_blend_is_three_quarters_prompt_and_quarter_completion() {
+        let tracker = PriceTracker::new();
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let event = &events[0];
+        assert_price_close(event.pin.expect("pin"), 1.5);
+        assert_price_close(event.pout.expect("pout"), 2.0);
+        assert_price_close(event.blend.expect("blend"), 0.75 * 1.5 + 0.25 * 2.0);
+    }
+
+    /// El evento serializa los campos del contrato (`event_type`, `ts`,
+    /// `change_kind` en minúscula…) y conserva el precio previo.
+    #[test]
+    fn catalog_event_serializes_contract_fields() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.0000025")]);
+        let json = serde_json::to_value(&events[0]).expect("evento serializable");
+
+        assert_eq!(json["event_type"], "catalog");
+        assert_eq!(json["model_id"], "acme/flash-a");
+        assert_eq!(json["org"], "acme");
+        assert_eq!(json["change_kind"], "price_up");
+        assert!(json["ts"].is_u64(), "ts en ms epoch");
+        assert!(json["pin"].is_number());
+        assert!(json["pout"].is_number());
+        assert!(json["blend"].is_number());
+        assert!(json["context_length"].is_number());
+        assert!(json["prev_pin"].is_number());
+        assert!(json["prev_pout"].is_number());
+    }
+
+    /// Un modelo `new` omite los precios previos del JSON («cuando aplique»).
+    #[test]
+    fn catalog_event_new_omits_prev_prices() {
+        let tracker = PriceTracker::new();
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        let json = serde_json::to_value(&events[0]).expect("evento serializable");
+
+        assert!(
+            json.get("prev_pin").is_none(),
+            "sin precio previo no hay prev_pin"
+        );
+        assert!(json.get("prev_pout").is_none());
+    }
+
+    /// Un modelo `removed` serializa `pin`/`pout`/`blend` nulos y conserva los
+    /// últimos precios conocidos.
+    #[test]
+    fn catalog_event_removed_serializes_null_prices() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[]);
+        let json = serde_json::to_value(&events[0]).expect("evento serializable");
+
+        assert!(json["pin"].is_null());
+        assert!(json["pout"].is_null());
+        assert!(json["blend"].is_null());
+        assert!(json["prev_pin"].is_number());
+        assert!(json["prev_pout"].is_number());
+    }
+
+    /// Un modelo presente cuyo precio deja de ser parseable (`pricing`
+    /// ausente, campo no numérico o cadena no numérica) NO emite `removed`:
+    /// «desconocido» no es «gratis» (D2). El último snapshot conocido se
+    /// retiene hasta que vuelva un precio legible.
+    #[test]
+    fn catalog_tracker_retains_snapshot_when_price_becomes_unparseable() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[unpriced_entry("acme/flash-a")]);
+
+        assert!(
+            events.is_empty(),
+            "un precio ilegible no es una baja ni un alta: {events:?}"
+        );
+
+        // El snapshot se retiene: al volver el precio idéntico no reemite.
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        assert!(
+            events.is_empty(),
+            "el precio reaparecido idéntico no reemite: {events:?}"
+        );
+    }
+
+    /// Al reaparecer un precio parseable tras uno ilegible se emite el cambio
+    /// real (`price_up`/`price_down`) con los precios previos retenidos, no un
+    /// `new` sin historial.
+    #[test]
+    fn catalog_tracker_emits_price_change_when_unparseable_price_reappears() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        tracker.observe(&[unpriced_entry("acme/flash-a")]);
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.0000025")]);
+
+        assert_eq!(
+            events.len(),
+            1,
+            "reaparece con cambio de precio: {events:?}"
+        );
+        assert_eq!(
+            events[0].change_kind,
+            CatalogChangeKind::PriceUp,
+            "no es un alta: el modelo seguía en el snapshot: {events:?}"
+        );
+        assert_price_close(events[0].pout.expect("pout nuevo"), 2.5);
+        assert_price_close(events[0].prev_pout.expect("pout previo"), 2.0);
+        assert_price_close(events[0].prev_pin.expect("pin previo"), 1.5);
+    }
+
+    /// Un precio como cadena no numérica se trata igual que uno ausente: sin
+    /// emisión y con el snapshot retenido.
+    #[test]
+    fn catalog_tracker_treats_non_numeric_string_price_as_unparseable() {
+        let tracker = PriceTracker::new();
+        tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+
+        let events = tracker.observe(&[raw_priced(
+            "acme/flash-a",
+            json!("0.0000015"),
+            json!("gratis"),
+        )]);
+
+        assert!(
+            events.is_empty(),
+            "una cadena no numérica no emite ni borra: {events:?}"
+        );
+    }
+
+    /// `NaN` e `inf` no son precios válidos: se tratan como no parseables para
+    /// no propagar un `blend` no finito que rompería la deduplicación (un
+    /// `blend` `NaN` no empata consigo mismo y emitiría en cada refresco).
+    #[test]
+    fn catalog_tracker_treats_nan_and_inf_price_as_unparseable() {
+        let tracker = PriceTracker::new();
+
+        let events =
+            tracker.observe(&[raw_priced("acme/flash-a", json!("NaN"), json!("0.000002"))]);
+        assert!(events.is_empty(), "NaN no es un precio: {events:?}");
+
+        let events =
+            tracker.observe(&[raw_priced("acme/flash-a", json!("inf"), json!("0.000002"))]);
+        assert!(events.is_empty(), "inf no es un precio: {events:?}");
+
+        // «Desconocido» no es «gratis»: sin precio finito conocido, la primera
+        // observación válida da de alta el modelo como `new`.
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        assert_eq!(
+            events.len(),
+            1,
+            "el primer precio finito da de alta: {events:?}"
+        );
+        assert_eq!(events[0].change_kind, CatalogChangeKind::New);
+    }
+
+    /// Desempate en `change_kind_of`: con `blend` idéntico (sube una pata y
+    /// baja la otra en la misma proporción) decide el lado del `pin`, en ambos
+    /// sentidos.
+    #[test]
+    fn change_kind_of_tie_breaks_equal_blend_by_pin() {
+        // 0.75·1.0 + 0.25·4.0 = 1.75 = 0.75·2.0 + 0.25·1.0 (blend empata).
+        let prev = TrackedPrice {
+            pin: 1.0,
+            pout: 4.0,
+            context_length: None,
+        };
+        assert_eq!(
+            change_kind_of(&prev, 2.0, 1.0),
+            CatalogChangeKind::PriceUp,
+            "empate de blend con pin al alza: price_up"
+        );
+
+        // Simetría: 0.75·2.0 + 0.25·1.0 = 1.75 = 0.75·1.0 + 0.25·4.0.
+        let prev = TrackedPrice {
+            pin: 2.0,
+            pout: 1.0,
+            context_length: None,
+        };
+        assert_eq!(
+            change_kind_of(&prev, 1.0, 4.0),
+            CatalogChangeKind::PriceDown,
+            "empate de blend con pin a la baja: price_down"
+        );
+    }
+
+    /// Capa que captura los campos de los logs `INFO` del hilo actual.
+    #[derive(Clone)]
+    struct LedgerLayer {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for LedgerLayer {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().level() != &Level::INFO {
+                return;
+            }
+            let mut visitor = WarnVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("lock captured ledger logs")
+                .push(visitor.fields.join(" "));
+        }
+    }
+
+    /// Captura los logs `INFO` solo para el hilo actual.
+    fn capture_ledger_logs() -> (Arc<Mutex<Vec<String>>>, tracing::subscriber::DefaultGuard) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = registry().with(LedgerLayer {
+            events: Arc::clone(&events),
+        });
+        (events, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// El emisor registra el evento como log estructurado con `event_type`
+    /// `catalog` y los campos del contrato.
+    #[test]
+    fn catalog_events_are_logged_with_event_type_catalog() {
+        let (captured, _guard) = capture_ledger_logs();
+        let tracker = PriceTracker::new();
+
+        let events = tracker.observe(&[priced("acme/flash-a", "0.0000015", "0.000002")]);
+        emit_catalog_events(&events, true);
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let catalog = logs
+            .iter()
+            .find(|log| log.contains("event_type=catalog"))
+            .expect("el evento de catálogo se emite como log estructurado");
+        assert!(catalog.contains("model_id=acme/flash-a"), "{catalog}");
+        assert!(catalog.contains("org=acme"), "{catalog}");
+        assert!(catalog.contains("change_kind=new"), "{catalog}");
+        assert!(catalog.contains("pin=1.5"), "{catalog}");
+    }
+
+    // --- Precio en el momento de la petición (`gateway_requests`) ------------
+
+    /// Escenario 4.2: el precio del modelo elegido se consulta del snapshot
+    /// de catálogo en el momento de la petición, normalizado a USD/Mtok (la
+    /// misma unidad de los eventos `catalog`/`selection`); un modelo fuera del
+    /// catálogo (o sin precio parseable) es precio desconocido, no `0`.
+    #[test]
+    fn model_price_returns_normalized_prices_of_cached_catalog() {
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_entry("acme/flash-a", "0.000002", "0.000008", 8_000)],
+        );
+
+        assert_eq!(
+            registry.model_price(PAID_BASE, "acme/flash-a"),
+            Some((2.0, 8.0)),
+            "USD/token del catálogo normalizado a USD/Mtok"
+        );
+        assert_eq!(
+            registry.model_price(PAID_BASE, "acme/flash-z"),
+            None,
+            "modelo fuera del catálogo: precio desconocido"
+        );
+        assert_eq!(
+            registry.model_price("http://otro.test/v1", "acme/flash-a"),
+            None,
+            "base_url sin catálogo: precio desconocido"
+        );
+    }
+
+    // --- Evento de selección (`gateway_selection`) ---------------------------
+
+    /// Transición `initial`: sin selección previa, el primer elegido emite
+    /// `initial`.
+    #[test]
+    fn selection_reason_is_initial_without_prev() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-a".to_owned(), "acme/flash-b".to_owned()];
+
+        let reason = selection_reason(None, "acme/flash-a", &catalog, &candidates);
+
+        assert_eq!(
+            reason,
+            Some(SelectionReason::Initial),
+            "sin selección previa la razón es initial: {reason:?}"
+        );
+    }
+
+    /// Transición `cheaper`: el pegajoso sigue siendo elegible pero, pasado el
+    /// intervalo, el más barato mejora lo suficiente.
+    #[test]
+    fn selection_reason_is_cheaper_when_prev_still_eligible() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned(), "acme/flash-a".to_owned()];
+
+        let reason = selection_reason(Some("acme/flash-a"), "acme/flash-b", &catalog, &candidates);
+
+        assert_eq!(
+            reason,
+            Some(SelectionReason::Cheaper),
+            "el pegajoso elegible relevado por precio es cheaper: {reason:?}"
+        );
+    }
+
+    /// Transición `failover`: el pegajoso sigue en el catálogo pero ya no es
+    /// elegible (cayó en blacklist).
+    #[test]
+    fn selection_reason_is_failover_when_prev_in_catalog_but_not_eligible() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned()];
+
+        let reason = selection_reason(Some("acme/flash-a"), "acme/flash-b", &catalog, &candidates);
+
+        assert_eq!(
+            reason,
+            Some(SelectionReason::Failover),
+            "el pegajoso blacklisteado es failover: {reason:?}"
+        );
+    }
+
+    /// Transición `removed`: el pegajoso desapareció del catálogo.
+    #[test]
+    fn selection_reason_is_removed_when_prev_absent_from_catalog() {
+        let catalog = vec![paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned()];
+
+        let reason = selection_reason(Some("acme/flash-a"), "acme/flash-b", &catalog, &candidates);
+
+        assert_eq!(
+            reason,
+            Some(SelectionReason::Removed),
+            "el pegajoso ausente del catálogo es removed: {reason:?}"
+        );
+    }
+
+    /// Un mismo modelo elegido en refrescos consecutivos no emite evento (D2).
+    #[test]
+    fn selection_reason_is_none_when_model_unchanged() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-a".to_owned(), "acme/flash-b".to_owned()];
+
+        let reason = selection_reason(Some("acme/flash-a"), "acme/flash-a", &catalog, &candidates);
+
+        assert!(reason.is_none(), "sin cambio no hay razón: {reason:?}");
+    }
+
+    /// El evento incluye los campos del contrato y los precios del modelo
+    /// recién elegido, normalizados a USD/Mtok.
+    #[test]
+    fn selection_event_builds_contract_fields() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned(), "acme/flash-a".to_owned()];
+
+        let event = selection_event(
+            "code",
+            "http://paid.test/v1",
+            Some("acme/flash-a"),
+            "acme/flash-b",
+            &catalog,
+            &candidates,
+            1_000,
+        )
+        .expect("un cambio de selección produce evento");
+
+        assert_eq!(event.event_type, "selection");
+        assert_eq!(event.ts, 1_000);
+        assert_eq!(event.route, "code");
+        assert_eq!(event.backend, "http://paid.test/v1");
+        assert_eq!(event.model_id, "acme/flash-b");
+        assert_eq!(event.reason, SelectionReason::Cheaper);
+        assert_eq!(
+            event.prev_model_id.as_deref(),
+            Some("acme/flash-a"),
+            "el modelo relevado queda como prev_model_id"
+        );
+        // 0.1 USD por token (`flash-b`) → 100_000 USD/Mtok.
+        assert_price_close(event.pin.expect("pin del elegido"), 100_000.0);
+        assert_price_close(event.pout.expect("pout del elegido"), 100_000.0);
+    }
+
+    /// El evento serializa los campos del contrato (`event_type`, `reason` en
+    /// minúscula, `prev_model_id` cuando existe).
+    #[test]
+    fn selection_event_serializes_contract_fields() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-b".to_owned(), "acme/flash-a".to_owned()];
+
+        let event = selection_event(
+            "code",
+            "http://paid.test/v1",
+            Some("acme/flash-a"),
+            "acme/flash-b",
+            &catalog,
+            &candidates,
+            1_000,
+        )
+        .expect("un cambio de selección produce evento");
+        let json = serde_json::to_value(&event).expect("evento serializable");
+
+        assert_eq!(json["event_type"], "selection");
+        assert_eq!(json["ts"], 1_000);
+        assert_eq!(json["route"], "code");
+        assert_eq!(json["backend"], "http://paid.test/v1");
+        assert_eq!(json["model_id"], "acme/flash-b");
+        assert_eq!(json["reason"], "cheaper");
+        assert!(json["pin"].is_number());
+        assert!(json["pout"].is_number());
+        assert_eq!(json["prev_model_id"], "acme/flash-a");
+    }
+
+    /// Una elección `initial` omite `prev_model_id` del JSON («cuando exista»).
+    #[test]
+    fn selection_event_initial_omits_prev_model_id() {
+        let catalog = vec![paid_cheap(), paid_expensive()];
+        let candidates = vec!["acme/flash-a".to_owned(), "acme/flash-b".to_owned()];
+
+        let event = selection_event(
+            "code",
+            "http://paid.test/v1",
+            None,
+            "acme/flash-a",
+            &catalog,
+            &candidates,
+            1_000,
+        )
+        .expect("una elección inicial produce evento");
+        let json = serde_json::to_value(&event).expect("evento serializable");
+
+        assert_eq!(json["reason"], "initial");
+        assert!(
+            json.get("prev_model_id").is_none(),
+            "sin selección previa no hay prev_model_id: {json}"
+        );
+    }
+
+    /// Scenario «Elección inicial»: la primera expansión emite el log
+    /// `selection` con `reason: initial`, la ruta y el backend, y sin
+    /// `prev_model_id`.
+    #[tokio::test]
+    async fn selection_event_logged_on_first_expansion() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+
+        registry.expand(0, 0).await;
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let selection = logs
+            .iter()
+            .find(|log| log.contains("event_type=selection"))
+            .expect("el evento de selección se emite como log estructurado");
+        assert!(selection.contains("reason=initial"), "{selection}");
+        assert!(selection.contains("route=paid-unit"), "{selection}");
+        assert!(
+            selection.contains("backend=http://paid.test/v1"),
+            "{selection}"
+        );
+        assert!(selection.contains("model_id=acme/flash-a"), "{selection}");
+        assert!(
+            !selection.contains("prev_model_id=acme"),
+            "sin selección previa no hay prev_model_id: {selection}"
+        );
+    }
+
+    /// Scenario «Cambio por modelo más barato»: tras `reselect_interval_ms`, un
+    /// candidato claramente más barato emite `reason: cheaper` con
+    /// `prev_model_id`.
+    #[tokio::test]
+    async fn selection_event_reason_cheaper_is_logged() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 50\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        // Refresco del catálogo: `B` pasa a ser un 30 % más barato que `A`.
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_cheap(),
+                paid_entry("acme/flash-b", "0.028", "0.028", 128_000),
+            ]);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        registry.expand(0, 0).await;
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let selection = logs
+            .iter()
+            .rev()
+            .find(|log| log.contains("event_type=selection"))
+            .expect("el cambio de selección se emite");
+        assert!(selection.contains("reason=cheaper"), "{selection}");
+        assert!(selection.contains("model_id=acme/flash-b"), "{selection}");
+        assert!(
+            selection.contains("prev_model_id=acme/flash-a"),
+            "{selection}"
+        );
+    }
+
+    /// Scenario «Cambio por failover»: el pegajoso cae en blacklist y se emite
+    /// `reason: failover` con `prev_model_id`.
+    #[tokio::test]
+    async fn selection_event_reason_failover_is_logged() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .blacklist()
+            .mark("acme/flash-a", Duration::from_secs(60));
+
+        registry.expand(0, 0).await;
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let selection = logs
+            .iter()
+            .rev()
+            .find(|log| log.contains("event_type=selection"))
+            .expect("el cambio de selección por blacklist se emite");
+        assert!(selection.contains("reason=failover"), "{selection}");
+        assert!(selection.contains("model_id=acme/flash-b"), "{selection}");
+        assert!(
+            selection.contains("prev_model_id=acme/flash-a"),
+            "{selection}"
+        );
+    }
+
+    /// El pegajoso que desaparece del catálogo emite `reason: removed` con
+    /// `prev_model_id`.
+    #[tokio::test]
+    async fn selection_event_reason_removed_is_logged() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery("          reselect_interval_ms: 600000\n"),
+            vec![paid_cheap(), paid_expensive()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![paid_expensive()]);
+
+        registry.expand(0, 0).await;
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let selection = logs
+            .iter()
+            .rev()
+            .find(|log| log.contains("event_type=selection"))
+            .expect("el cambio de selección por baja del catálogo se emite");
+        assert!(selection.contains("reason=removed"), "{selection}");
+        assert!(selection.contains("model_id=acme/flash-b"), "{selection}");
+        assert!(
+            selection.contains("prev_model_id=acme/flash-a"),
+            "{selection}"
+        );
+    }
+
+    /// El modelo elegido que no cambia entre refrescos no emite evento (D2):
+    /// solo cuenta la elección inicial.
+    #[tokio::test]
+    async fn selection_event_not_logged_when_model_unchanged() {
+        let _guard = blacklist_gauge_guard();
+        let (captured, _logs) = capture_ledger_logs();
+        let registry = paid_registry(
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        // Refresco con el mismo catálogo: el elegido no cambia.
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![paid_cheap(), paid_expensive()]);
+        assert_eq!(registry.expand(0, 0).await[0], "acme/flash-a");
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        assert_eq!(
+            logs.iter()
+                .filter(|log| log.contains("event_type=selection"))
+                .count(),
+            1,
+            "un modelo elegido sin cambios no emite: {logs:?}"
+        );
+    }
+
+    // --- Grupo 5 (#39): métricas del ledger ----------------------------------
+
+    /// Línea de la serie `name` que contiene todos los pares `key="value"`.
+    fn ledger_line<'a>(text: &'a str, name: &str, pairs: &[(&str, &str)]) -> Option<&'a str> {
+        text.lines().find(|line| {
+            line.starts_with(name)
+                && pairs
+                    .iter()
+                    .all(|(key, expected)| line.contains(&format!(r#"{key}="{expected}""#)))
+        })
+    }
+
+    /// Valor de una línea de serie como `f64` (los precios van en USD/Mtok).
+    fn fnum(line: &str) -> f64 {
+        line.rsplit(' ')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(f64::NAN)
+    }
+
+    /// Registry de pago que comparte el `Metrics` con el test, para renderizar
+    /// las series que el wiring del ledger registra.
+    ///
+    /// El nombre de ruta es propio de cada test: los instrumentos viven en el
+    /// registro global y otros tests de selección (que usan `paid-unit`)
+    /// ejecutan en paralelo y también incrementan estos contadores.
+    fn paid_registry_with_metrics(
+        route: &str,
+        base_url: &str,
+        discovery: &str,
+        models: Vec<ModelEntry>,
+    ) -> (Registry, Arc<Metrics>) {
+        let metrics = metrics();
+        let registry = Registry::new(
+            &paid_config_named(base_url, discovery, route),
+            reqwest::Client::new(),
+            Arc::clone(&metrics),
+        );
+        registry
+            .catalog(base_url)
+            .expect("caché del backend de pago")
+            .seed(models);
+        (registry, metrics)
+    }
+
+    /// Scenario «Contador de selecciones por motivo» y «Gauge del modelo
+    /// seleccionado»: un cambio de selección incrementa el contador por motivo
+    /// y fija el gauge con el precio del modelo elegido (USD/Mtok).
+    #[tokio::test]
+    async fn selection_change_records_counter_and_price_gauge() {
+        let _guard = blacklist_gauge_guard();
+        let (registry, metrics) = paid_registry_with_metrics(
+            "paid-ledger-sel",
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![paid_expensive(), paid_cheap()],
+        );
+
+        // Primera expansión: selección inicial del más barato (0.04 USD/token).
+        registry.expand(0, 0).await;
+        let text = metrics.render();
+
+        let initial = ledger_line(
+            &text,
+            "llm_gateway_model_selection_total",
+            &[("route", "paid-ledger-sel"), ("reason", "initial")],
+        )
+        .unwrap_or_else(|| panic!("falta model_selection_total reason=initial:\n{text}"));
+        assert_eq!(fnum(initial), 1.0, "una selección inicial:\n{initial}");
+
+        let pin = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "paid-ledger-sel"),
+                ("model", "acme/flash-a"),
+                ("side", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta el gauge de precio side=prompt:\n{text}"));
+        assert_eq!(
+            fnum(pin),
+            40_000.0,
+            "0.04 USD/token son 40000 USD/Mtok:\n{pin}"
+        );
+
+        let pout = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "paid-ledger-sel"),
+                ("model", "acme/flash-a"),
+                ("side", "completion"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta el gauge de precio side=completion:\n{text}"));
+        assert_eq!(fnum(pout), 40_000.0, "precio de salida:\n{pout}");
+
+        // Failover: `A` cae en blacklist y se cambia al más barato disponible.
+        registry
+            .blacklist()
+            .mark("acme/flash-a", Duration::from_secs(60));
+        registry.expand(0, 0).await;
+        let text = metrics.render();
+
+        let failover = ledger_line(
+            &text,
+            "llm_gateway_model_selection_total",
+            &[("route", "paid-ledger-sel"), ("reason", "failover")],
+        )
+        .unwrap_or_else(|| panic!("falta model_selection_total reason=failover:\n{text}"));
+        assert_eq!(fnum(failover), 1.0, "un failover:\n{failover}");
+
+        let pin = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "paid-ledger-sel"),
+                ("model", "acme/flash-b"),
+                ("side", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("el gauge pasa al modelo de failover:\n{text}"));
+        assert_eq!(
+            fnum(pin),
+            100_000.0,
+            "0.1 USD/token son 100000 USD/Mtok:\n{pin}"
+        );
+    }
+
+    /// Scenario «Gauge de la lista curada» y «Gauge del modelo seleccionado»:
+    /// la publicación desde el snapshot del catálogo emite una serie por modelo
+    /// de la lista curada (blend ponderado) y refresca el precio del modelo
+    /// seleccionado aunque el elegido no cambie.
+    #[tokio::test]
+    async fn publish_price_gauges_reflects_catalog_snapshot() {
+        let _guard = blacklist_gauge_guard();
+        // `flash-a` con patas asimétricas para verificar la ponderación del
+        // blend: 0.75·40000 + 0.25·80000 = 50000 USD/Mtok.
+        let (registry, metrics) = paid_registry_with_metrics(
+            "paid-ledger-snap",
+            PAID_BASE,
+            &paid_discovery(""),
+            vec![
+                paid_entry("acme/flash-a", "0.04", "0.08", 8_000),
+                paid_entry("acme/flash-b", "0.1", "0.2", 128_000),
+            ],
+        );
+
+        registry.publish_price_gauges(PAID_BASE);
+        let text = metrics.render();
+
+        let series = text
+            .lines()
+            .filter(|line| {
+                line.starts_with("llm_gateway_allowlist_price_usd")
+                    && line.contains(r#"model="acme/flash-"#)
+            })
+            .count();
+        assert_eq!(series, 2, "una serie por modelo curado:\n{text}");
+
+        let flash_a = ledger_line(
+            &text,
+            "llm_gateway_allowlist_price_usd",
+            &[("model", "acme/flash-a")],
+        )
+        .unwrap_or_else(|| panic!("falta la serie de flash-a:\n{text}"));
+        assert_eq!(
+            fnum(flash_a),
+            50_000.0,
+            "blend ponderado de flash-a:\n{flash_a}"
+        );
+
+        let flash_b = ledger_line(
+            &text,
+            "llm_gateway_allowlist_price_usd",
+            &[("model", "acme/flash-b")],
+        )
+        .unwrap_or_else(|| panic!("falta la serie de flash-b:\n{text}"));
+        assert_eq!(
+            fnum(flash_b),
+            125_000.0,
+            "blend ponderado de flash-b:\n{flash_b}"
+        );
+
+        // Sin selección previa no hay gauge de modelo seleccionado.
+        assert!(
+            ledger_line(
+                &text,
+                "llm_gateway_selected_model_price_usd",
+                &[("route", "paid-ledger-snap")],
+            )
+            .is_none(),
+            "sin selección no hay gauge del seleccionado:\n{text}"
+        );
+
+        // Con selección pegajosa, un cambio de precio del catálogo **sin cambio
+        // de selección** se refleja en el gauge al republicar el snapshot.
+        registry.expand(0, 0).await;
+        registry
+            .catalog(PAID_BASE)
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_entry("acme/flash-a", "0.05", "0.08", 8_000),
+                paid_entry("acme/flash-b", "0.1", "0.2", 128_000),
+            ]);
+        registry.publish_price_gauges(PAID_BASE);
+        let text = metrics.render();
+
+        let pin = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "paid-ledger-snap"),
+                ("model", "acme/flash-a"),
+                ("side", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta el gauge del seleccionado:\n{text}"));
+        assert_eq!(
+            fnum(pin),
+            50_000.0,
+            "el precio nuevo del snapshot, sin cambio de selección:\n{pin}"
+        );
+
+        let allowlist = ledger_line(
+            &text,
+            "llm_gateway_allowlist_price_usd",
+            &[("model", "acme/flash-a")],
+        )
+        .expect("serie de la lista curada tras el refresco");
+        assert_eq!(
+            fnum(allowlist),
+            57_500.0,
+            "0.75·50000 + 0.25·80000 = 57500:\n{allowlist}"
         );
     }
 }

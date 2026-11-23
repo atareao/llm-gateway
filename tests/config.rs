@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use llm_gateway_rs::config::{BackendKind, Profile, Protocol, load};
+use llm_gateway_rs::config::{BackendKind, DEFAULT_RESELECT_INTERVAL_MS, Profile, Protocol, load};
 
 const VALID_YAML: &str = r#"
 route:
@@ -746,4 +746,165 @@ route:
             "el error debe listar el perfil `{profile}`, got: {msg}"
         );
     }
+}
+
+/// Lista curada por defecto, en el orden exacto del change.
+const CURATED_ALLOW: [&str; 7] = [
+    "deepseek/deepseek-v4.1-flash*",
+    "z-ai/glm-5.*-flash",
+    "qwen/qwen3.7-flash",
+    "tencent/hy4-flash",
+    "inclusionai/ling-3.1-flash",
+    "nvidia/nemotron-3.5-lightning",
+    "minimax/minimax-m3.*-flash",
+];
+
+/// Scenario: El ejemplo usa el backend dinámico de pago con la lista curada y
+/// un `static` final como último recurso.
+#[test]
+fn example_config_uses_paid_backend_with_curated_allow_and_static_resort() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("gateway.yaml.example");
+    let config = load(&path).expect("gateway.yaml.example debe cargar");
+
+    let expected_allow: Vec<String> = CURATED_ALLOW.iter().map(|p| (*p).to_owned()).collect();
+
+    for (route_name, profile) in [
+        ("architect", Profile::Architect),
+        ("code", Profile::Code),
+        ("writer", Profile::Writer),
+    ] {
+        let route = config
+            .route
+            .iter()
+            .find(|route| route.name == route_name)
+            .unwrap_or_else(|| panic!("falta la ruta '{route_name}'"));
+
+        let paid = route
+            .backend
+            .iter()
+            .find(|backend| backend.kind == BackendKind::OpenrouterPaid)
+            .unwrap_or_else(|| {
+                panic!("la ruta '{route_name}' no declara un backend openrouter_paid")
+            });
+
+        assert_eq!(
+            paid.profile,
+            Some(profile),
+            "perfil de la ruta '{route_name}'"
+        );
+        assert_eq!(
+            paid.api_key_env.as_deref(),
+            Some("OPENROUTER_API_KEY"),
+            "el respaldo de pago necesita api_key_env en '{route_name}'"
+        );
+
+        let discovery = paid
+            .discovery
+            .as_ref()
+            .unwrap_or_else(|| panic!("el backend de pago de '{route_name}' no tiene discovery"));
+        assert_eq!(
+            discovery.allow, expected_allow,
+            "la lista curada de '{route_name}' debe ser la del change y en su orden"
+        );
+        assert_eq!(
+            discovery.reselect_interval_ms, DEFAULT_RESELECT_INTERVAL_MS,
+            "la cadencia de reselección de '{route_name}' debe ser 4 h"
+        );
+        assert_eq!(discovery.min_context, Some(32_768));
+
+        let last = route.backend.last().expect("la ruta tiene backends");
+        assert_eq!(
+            last.kind,
+            BackendKind::Static,
+            "tras el backend de pago debe quedar un `static` final en '{route_name}'"
+        );
+        assert!(
+            last.model.as_deref().is_some_and(|m| !m.is_empty()),
+            "el `static` final de '{route_name}' necesita un `model`"
+        );
+    }
+}
+
+// --- Grupo 6 (#39): bloque `observability` con `events` (opt-out del ledger) ---
+
+/// Config válida con el bloque `observability` desactivando los eventos.
+const CONFIG_EVENTS_FALSE: &str = r#"
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://localhost:11434/v1"
+        model: "qwen2.5:7b-instruct"
+observability:
+  events: false
+"#;
+
+/// Config válida con el bloque `observability` pero sin el campo `events`.
+const CONFIG_EVENTS_ABSENT: &str = r#"
+route:
+  - name: mech-writer
+    backend:
+      - base_url: "http://localhost:11434/v1"
+        model: "qwen2.5:7b-instruct"
+observability: {}
+"#;
+
+/// 6.1: `observability.events: false` se parsea tal cual.
+#[test]
+fn observability_events_false_is_parsed() {
+    let file = write_temp(CONFIG_EVENTS_FALSE);
+
+    let config = load(file.path()).expect("config con events=false debe cargar");
+
+    let observability = config
+        .observability
+        .as_ref()
+        .expect("el bloque observability se parsea");
+    assert!(
+        !observability.events,
+        "events: false debe parsearse como false"
+    );
+}
+
+/// 6.1: sin campo `events` dentro del bloque, el default es `true`.
+#[test]
+fn observability_events_absent_defaults_to_true() {
+    let file = write_temp(CONFIG_EVENTS_ABSENT);
+
+    let config = load(file.path()).expect("config sin events debe cargar");
+
+    let observability = config
+        .observability
+        .as_ref()
+        .expect("el bloque observability se parsea");
+    assert!(
+        observability.events,
+        "events ausente dentro del bloque debe quedar a true"
+    );
+}
+
+/// 6.1: sin bloque `observability` por completo, los eventos del ledger
+/// siguen activos (`ledger_events_enabled()` resuelve el default).
+#[test]
+fn observability_block_absent_enables_events_by_default() {
+    let file = write_temp(VALID_YAML);
+
+    let config = load(file.path()).expect("config válida");
+
+    assert!(
+        config.ledger_events_enabled(),
+        "sin bloque observability los eventos del ledger quedan activos"
+    );
+}
+
+/// 6.1: el flag resuelto respeta el opt-out explícito.
+#[test]
+fn ledger_events_enabled_resolves_explicit_optout() {
+    let file = write_temp(CONFIG_EVENTS_FALSE);
+
+    let config = load(file.path()).expect("config con events=false debe cargar");
+
+    assert!(
+        !config.ledger_events_enabled(),
+        "events: false debe desactivar los eventos del ledger"
+    );
 }

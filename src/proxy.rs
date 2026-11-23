@@ -35,11 +35,13 @@ use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde_json::{Value, json};
+use futures_util::StreamExt as _;
+use serde::Serialize;
+use serde_json::{Map, Value, json};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
-use crate::config::{Backend, GatewayConfig, Route};
+use crate::config::{Backend, BackendKind, GatewayConfig, Route};
 use crate::discovery::Registry;
 use crate::error::AppError;
 use crate::metrics::{AttemptResult, GlobalOutcome, Metrics, Outcome};
@@ -74,6 +76,29 @@ const DEFAULT_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Un `Retry-After` en formato fecha puede apuntar a años vista; sin cota, un
 /// único `429`/`5xx` con una fecha lejana blacklistearía el modelo durante años.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Horizonte de reset que convierte un `429` en agotamiento **diario**.
+///
+/// La heurística de cabeceras (`X-RateLimit-Remaining: 0`) solo abre el gate si
+/// el reset está a más de cinco minutos vista: un `429` de minuto trae un reset
+/// cercano y no debe bloquear el free todo el día.
+const QUOTA_RESET_HORIZON: Duration = Duration::from_secs(5 * 60);
+
+/// Nombre de `error.metadata.limit_source` que identifica la cuota diaria free.
+const DAILY_LIMIT_SOURCE: &str = "openrouter_free_tier_daily";
+
+/// Tope del cuerpo de un `429` inspeccionado buscando `limit_source`.
+const QUOTA_BODY_LIMIT: usize = 64 * 1024;
+
+/// Señal de cuota deducida del cuerpo de una respuesta `429`.
+enum QuotaSignal {
+    /// Cuota diaria free agotada (`limit_source` = diaria).
+    Daily,
+    /// Otro límite (`per_minute`, proveedor…) que no abre el gate.
+    Other,
+    /// Cuerpo ausente o sin metadatos: se decide por las cabeceras.
+    Unknown,
+}
 
 /// Fallo al contactar con un backend, antes de tener su respuesta.
 enum SendError {
@@ -287,6 +312,13 @@ struct Candidate {
     api_key_env: Option<String>,
     /// Cooldown de blacklist si el candidato procede de un backend dinámico.
     dynamic_cooldown: Option<Duration>,
+    /// `true` si el candidato procede de un backend del tier free
+    /// (`openrouter_free`); solo esos pueden abrir el gate de cuota diaria.
+    free_tier: bool,
+    /// `true` si el candidato respeta el gate global de cuota diaria
+    /// (`openrouter_free` con `discovery.respect_daily_quota`, por defecto `true`).
+    /// Un `429` diario solo abre el gate si el candidato lo respeta.
+    respect_daily_quota: bool,
 }
 
 impl Candidate {
@@ -309,6 +341,12 @@ impl Candidate {
             timeout_ms: backend.timeout_ms,
             api_key_env: backend.api_key_env.clone(),
             dynamic_cooldown: None,
+            free_tier: backend.kind == BackendKind::OpenrouterFree,
+            respect_daily_quota: backend.is_free_tier()
+                && backend
+                    .discovery
+                    .as_ref()
+                    .is_none_or(|discovery| discovery.respect_daily_quota),
         }
     }
 
@@ -340,8 +378,14 @@ impl Candidate {
 /// con [`Candidate::from_backend`].
 async fn expand_backends(state: &AppState, route_idx: usize, route: &Route) -> Vec<Candidate> {
     let mut candidates = Vec::new();
+    // El salto del tier free por el gate se cuenta una sola vez por petición y
+    // ruta, aunque haya varios backends free.
+    let mut free_skipped = false;
     for (slot, backend) in route.backend.iter().enumerate() {
         if backend.is_dynamic() {
+            if state.discovery.free_quota_skip(route_idx, slot) {
+                free_skipped = true;
+            }
             let cooldown = state.discovery.cooldown(route_idx, slot);
             // Un candidato ligero por modelo elegible.
             for model in state.discovery.expand(route_idx, slot).await {
@@ -354,6 +398,9 @@ async fn expand_backends(state: &AppState, route_idx: usize, route: &Route) -> V
         } else {
             candidates.push(Candidate::from_backend(slot, backend));
         }
+    }
+    if free_skipped {
+        state.metrics.record_free_quota_skip(route_idx);
     }
     candidates
 }
@@ -415,6 +462,114 @@ fn parse_retry_after(value: Option<&HeaderValue>) -> Option<Duration> {
     )
 }
 
+/// Reset del límite de la respuesta (`X-RateLimit-Reset`, epoch en ms).
+fn quota_reset_epoch_ms(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("x-ratelimit-reset")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// `true` si las cabeceras indican agotamiento **diario**: `X-RateLimit-Remaining`
+/// a cero **y** un reset a más de [`QUOTA_RESET_HORIZON`] vista.
+fn headers_show_daily_exhaustion(headers: &HeaderMap, reset_ms: Option<u64>) -> bool {
+    let remaining_zero = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        == Some(0.0);
+    if !remaining_zero {
+        return false;
+    }
+    reset_ms
+        .and_then(crate::discovery::epoch_ms_to_instant)
+        .is_some_and(|deadline| {
+            deadline.saturating_duration_since(Instant::now()) > QUOTA_RESET_HORIZON
+        })
+}
+
+/// Señal de cuota deducida del cuerpo de la respuesta.
+///
+/// `limit_source` es autoritativo: `openrouter_free_tier_daily` abre el gate y
+/// cualquier otro valor (minuto, proveedor) lo deja cerrado, ignorando la
+/// heurística de cabeceras. Un `provider_code` presente también se considera
+/// «otro» límite. Sin metadatos, la señal es desconocida.
+fn quota_signal(body: Option<&Value>) -> QuotaSignal {
+    let Some(metadata) = body.and_then(|body| body.pointer("/error/metadata")) else {
+        return QuotaSignal::Unknown;
+    };
+    if let Some(source) = metadata.get("limit_source") {
+        let daily = source.as_str() == Some(DAILY_LIMIT_SOURCE);
+        return if daily {
+            QuotaSignal::Daily
+        } else {
+            QuotaSignal::Other
+        };
+    }
+    if metadata.get("provider_code").is_some() {
+        return QuotaSignal::Other;
+    }
+    QuotaSignal::Unknown
+}
+
+/// Lee el cuerpo de un `429` de forma acotada para buscar `limit_source`.
+///
+/// El cuerpo se descarta por encima de [`QUOTA_BODY_LIMIT`]. Se lee **fragmento
+/// a fragmento** (`chunk`) en vez de `bytes()` para no acumular entero un cuerpo
+/// sin `Content-Length` (chunked) antes de decidir: en cuanto la suma supera el
+/// límite se descarta, sin esperar al resto del cuerpo.
+async fn read_quota_body(mut response: reqwest::Response) -> Option<Value> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > QUOTA_BODY_LIMIT as u64)
+    {
+        return None;
+    }
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > QUOTA_BODY_LIMIT {
+                    return None;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+    serde_json::from_slice(&body).ok()
+}
+
+/// Detecta un `429` de cuota diaria free y abre el gate global.
+///
+/// Solo se invoca para respuestas `429` de un backend del tier free que ya se
+/// van a descartar (son reintentables), así que consumir su cuerpo es seguro.
+async fn detect_daily_quota(state: &AppState, response: reqwest::Response) {
+    let headers = response.headers().clone();
+    let reset_ms = quota_reset_epoch_ms(&headers);
+    let header_daily = headers_show_daily_exhaustion(&headers, reset_ms);
+    let body = read_quota_body(response).await;
+
+    let daily = match quota_signal(body.as_ref()) {
+        QuotaSignal::Daily => true,
+        QuotaSignal::Other => false,
+        QuotaSignal::Unknown => header_daily,
+    };
+    if !daily {
+        return;
+    }
+
+    let Some(deadline) = crate::discovery::quota_deadline(reset_ms) else {
+        return;
+    };
+    state.discovery.open_quota_gate(deadline);
+    tracing::warn!("429 de cuota diaria free; gate abierto hasta el reset");
+}
+
 /// Recorre la cadena de backends de `route` en orden hasta obtener una
 /// respuesta válida (**failover antes del primer byte**): reintenta en error de
 /// conexión, timeout, `429` o `5xx`; un `4xx` distinto de `429` se devuelve tal
@@ -449,6 +604,9 @@ async fn route_with_failover(
     let started = Instant::now();
     let mut attempts = 0usize;
     let mut considered = 0usize;
+    // Último candidato probado: el evento `gateway_requests` etiqueta con el
+    // modelo del último intento (el elegido si hubo éxito).
+    let mut last: Option<&Candidate> = None;
     // Se decide una sola vez por petición y solo aplica en no-stream.
     let requires_tool_call = !streaming && request_requires_tool_call(body);
     let mut no_tool_call_seen = false;
@@ -458,6 +616,7 @@ async fn route_with_failover(
 
     for candidate in &candidates {
         considered += 1;
+        last = Some(candidate);
         let backend_idx = candidate.slot;
         // Resuelto una vez por intento: alimenta los logs de todos los caminos y
         // la cabecera `x-gateway-backend`, sin `format!` repetidos.
@@ -482,7 +641,12 @@ async fn route_with_failover(
         };
         attempts += 1;
 
-        let payload = body_for_model(body, &candidate.model);
+        let mut payload = body_for_model(body, &candidate.model);
+        // En streaming se pide al upstream que incluya el `usage` en el chunk
+        // final (`stream_options.include_usage: true`), base del ledger.
+        if streaming {
+            inject_include_usage(&mut payload);
+        }
         let send_result = send(
             &state.client,
             candidate,
@@ -500,6 +664,17 @@ async fn route_with_failover(
 
         match send_result {
             Ok(response) if is_retryable(response.status()) => {
+                let status = response.status();
+                // Un `429` del tier free puede indicar agotamiento diario: se
+                // inspecciona (cuerpo incluido) antes de descartar la respuesta.
+                // Solo si el backend respeta el gate de cuota diaria: un `429` de
+                // un backend con `respect_daily_quota: false` no debe abrirlo.
+                if candidate.free_tier
+                    && candidate.respect_daily_quota
+                    && status == StatusCode::TOO_MANY_REQUESTS
+                {
+                    detect_daily_quota(state, response).await;
+                }
                 state.metrics.record_attempt(
                     route_idx,
                     backend_idx,
@@ -508,7 +683,7 @@ async fn route_with_failover(
                 );
                 tracing::warn!(
                     backend = %candidate_id,
-                    status = %response.status(),
+                    status = %status,
                     result = AttemptResult::RetryableStatus.label(),
                     latency_ms = attempt_started.elapsed().as_millis() as u64,
                     "backend retornó un status reintentable; probando el siguiente"
@@ -540,7 +715,42 @@ async fn route_with_failover(
                         latency_ms = started.elapsed().as_millis() as u64,
                         "petición completada"
                     );
-                    return Ok(stream_response(response, &candidate_id));
+                    // Ledger de observabilidad (#39): el evento `request` se
+                    // emite al agotarse el stream (chunk centinela), fuera del
+                    // camino de bytes. Los precios se resuelven ahora, en el
+                    // momento de la petición; tokens, `finish_reason`, latencia
+                    // y coste se completan al terminar el stream.
+                    let price = state
+                        .discovery
+                        .model_price(&candidate.base_url, &candidate.model);
+                    let event = RequestEvent {
+                        event_type: REQUEST_EVENT_TYPE,
+                        ts: 0,
+                        request_id: request_id.to_owned(),
+                        route: route.name.clone(),
+                        model_id: Some(candidate.model.clone()),
+                        streaming,
+                        attempts,
+                        failover: attempts > 1,
+                        outcome: Outcome::Success.label(),
+                        finish_reason: None,
+                        latency_ms: 0,
+                        tokens_in: None,
+                        tokens_out: None,
+                        pin: price.map(|(pin, _)| pin),
+                        pout: price.map(|(_, pout)| pout),
+                        cost_usd: None,
+                    };
+                    return Ok(stream_response(
+                        response,
+                        &candidate_id,
+                        Some(RequestSink {
+                            event,
+                            started,
+                            metrics: Arc::clone(&state.metrics),
+                            events: state.config.ledger_events_enabled(),
+                        }),
+                    ));
                 }
 
                 match full_response(response, &candidate_id).await {
@@ -563,6 +773,19 @@ async fn route_with_failover(
                             );
                             no_tool_call_seen = true;
                             continue;
+                        }
+                        // Ledger de observabilidad (#39): tokens y
+                        // `finish_reason` de la respuesta no-stream, con un
+                        // único parseo del cuerpo; sin `usage` quedan
+                        // desconocidos.
+                        let (usage, finish_reason) = parse_body_ledger(&body_bytes);
+                        if !usage.is_unknown() {
+                            tracing::debug!(
+                                backend = %candidate_id,
+                                tokens_in = ?usage.prompt_tokens,
+                                tokens_out = ?usage.completion_tokens,
+                                "usage de la respuesta"
+                            );
                         }
                         state.metrics.record_attempt(
                             route_idx,
@@ -588,6 +811,49 @@ async fn route_with_failover(
                             latency_ms = started.elapsed().as_millis() as u64,
                             "petición completada"
                         );
+                        // Ledger de observabilidad (#39): el evento `request`
+                        // con los precios del modelo en el momento de la
+                        // petición; un fallo del emisor no altera la respuesta
+                        // (4.3).
+                        let price = state
+                            .discovery
+                            .model_price(&candidate.base_url, &candidate.model);
+                        let event = RequestEvent {
+                            event_type: REQUEST_EVENT_TYPE,
+                            ts: crate::discovery::now_ms(),
+                            request_id: request_id.to_owned(),
+                            route: route.name.clone(),
+                            model_id: Some(candidate.model.clone()),
+                            streaming,
+                            attempts,
+                            failover: attempts > 1,
+                            outcome: Outcome::Success.label(),
+                            finish_reason,
+                            latency_ms: started.elapsed().as_millis() as u64,
+                            tokens_in: usage.prompt_tokens,
+                            tokens_out: usage.completion_tokens,
+                            pin: price.map(|(pin, _)| pin),
+                            pout: price.map(|(_, pout)| pout),
+                            cost_usd: cost_usd(
+                                usage.prompt_tokens,
+                                usage.completion_tokens,
+                                price.map(|(pin, _)| pin),
+                                price.map(|(_, pout)| pout),
+                            ),
+                        };
+                        emit_request_event(&event, state.config.ledger_events_enabled());
+                        // Métricas del ledger (#39, Grupo 5): los contadores de
+                        // tokens y coste se alimentan de los mismos datos que
+                        // el evento, solo con lo conocido.
+                        if let Some(model) = event.model_id.as_deref() {
+                            state.metrics.record_ledger_usage(
+                                &event.route,
+                                model,
+                                event.tokens_in,
+                                event.tokens_out,
+                                event.cost_usd,
+                            );
+                        }
                         return Ok(response);
                     }
                     Err(err) => {
@@ -642,6 +908,35 @@ async fn route_with_failover(
         latency_ms = started.elapsed().as_millis() as u64,
         "petición fallida"
     );
+
+    // Ledger de observabilidad (#39): la petición agotó la cadena; el evento
+    // etiqueta con el modelo del último intento (si lo hubo) y registra el
+    // resto de campos con lo conocido: un fallo también es un dato del ledger.
+    let (model_id, price) = last.map_or((None, None), |candidate| {
+        let price = state
+            .discovery
+            .model_price(&candidate.base_url, &candidate.model);
+        (Some(candidate.model.clone()), price)
+    });
+    let event = RequestEvent {
+        event_type: REQUEST_EVENT_TYPE,
+        ts: crate::discovery::now_ms(),
+        request_id: request_id.to_owned(),
+        route: route.name.clone(),
+        model_id,
+        streaming,
+        attempts,
+        failover: attempts > 1,
+        outcome: Outcome::AllFailed.label(),
+        finish_reason: None,
+        latency_ms: started.elapsed().as_millis() as u64,
+        tokens_in: None,
+        tokens_out: None,
+        pin: price.map(|(pin, _)| pin),
+        pout: price.map(|(_, pout)| pout),
+        cost_usd: None,
+    };
+    emit_request_event(&event, state.config.ledger_events_enabled());
 
     // Se distingue el motivo del agotamiento: si algún intento falló por no
     // traer `tool_calls`, el cliente recibe un código específico.
@@ -856,15 +1151,84 @@ async fn full_response(
     Ok((response, body))
 }
 
+/// Frame del stream del upstream, ya sea datos reales o el centinela de fin.
+///
+/// En HTTP/2 los frames DATA vacíos **intermedios** llegan a `bytes_stream()`
+/// como chunks vacíos, igual que el `DATA(0, END_STREAM)` final, así que un
+/// chunk vacío no puede usarse como señal de fin. El fin real se etiqueta con
+/// [`Frame::End`] —único, inyectado tras agotar la fuente— y solo él dispara
+/// el cierre del extractor y la emisión del evento del ledger.
+enum Frame {
+    /// Frame DATA del upstream (con bytes, o vacío: frame DATA(0) de h2).
+    Data(Bytes),
+    /// Señal única de fin real del stream (inyectada tras agotar la fuente).
+    End,
+}
+
 /// Reenvía el cuerpo del upstream como stream SSE, **sin bufferizar**, usando
 /// el stream de `reqwest` directamente.
 ///
+/// A medida que el stream fluye, extrae el `usage` del chunk final ([`StreamUsage`])
+/// para el ledger de observabilidad, sin alterar los bytes que recibe el cliente.
+///
 /// Si el upstream se corta a mitad, el error del stream propaga al cliente y
 /// la conexión se cierra con error; no se reintenta (limitación documentada).
-fn stream_response(response: reqwest::Response, backend_label: &str) -> Response {
+///
+/// Limitaciones del evento en streaming (aceptadas, sin reintento):
+///
+/// - Aborto del cliente a mitad del stream: el body se descarta y el closure
+///   muere antes del fin real → **no hay evento** `gateway_requests` para esa
+///   petición.
+/// - Corte del upstream a mitad: si el stream termina en error no llega el fin
+///   real y **no hay evento**; si el upstream cierra limpio pero incompleto
+///   (sin chunk de `usage` o sin `finish_reason`), el evento se emite con los
+///   datos parciales acumulados (tokens/`finish_reason` desconocidos, sin
+///   ceros inventados).
+fn stream_response(
+    response: reqwest::Response,
+    backend_label: &str,
+    sink: Option<RequestSink>,
+) -> Response {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
-    let body = Body::from_stream(response.bytes_stream());
+    let mut usage = StreamUsage::default();
+    let mut sink = sink;
+    // El `chain` terminal añade un único `Frame::End` tras agotarse la fuente:
+    // solo él cierra el extractor y emite el evento. Los chunks vacíos
+    // intermedios de h2 (frames DATA(0)) se tragan sin tocar el sink — no
+    // aportan bytes y no cierran el stream.
+    let body = Body::from_stream(
+        response
+            .bytes_stream()
+            // El `map` solo etiqueta los datos: conserva el tipo de error del
+            // upstream para que un corte a mitad siga propagando al cliente.
+            .map(|result| result.map(Frame::Data))
+            .chain(futures_util::stream::once(std::future::ready(Ok(
+                Frame::End,
+            ))))
+            .filter_map(move |result| {
+                let keep = match result {
+                    Ok(Frame::Data(bytes)) if bytes.is_empty() => None,
+                    Ok(Frame::Data(bytes)) => {
+                        usage.feed(&bytes);
+                        Some(Ok(bytes))
+                    }
+                    Ok(Frame::End) => {
+                        usage.finish();
+                        // Ledger de observabilidad (#39): el evento `request`
+                        // se emite al fin real del stream, fuera del camino de
+                        // bytes; el passthrough no se altera y un fallo del
+                        // emisor queda aislado (4.3).
+                        if let Some(sink) = sink.take() {
+                            sink.complete(&usage);
+                        }
+                        None
+                    }
+                    Err(err) => Some(Err(err)),
+                };
+                std::future::ready(keep)
+            }),
+    );
 
     assemble(
         status,
@@ -899,6 +1263,378 @@ fn assemble(
     }
 
     response
+}
+
+/// Tokens de una respuesta, con `None` para los valores **desconocidos**.
+///
+/// Un campo `None` significa que el upstream no informó ese token; nunca se
+/// sustituye por `0`: un cero inventado contaminaría costes y métricas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TokenUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Indica si no se conoció ningún token (`usage` ausente o nulo).
+    fn is_unknown(&self) -> bool {
+        self.prompt_tokens.is_none() && self.completion_tokens.is_none()
+    }
+}
+
+/// Extrae el `usage` (tokens de prompt y de completion) de un objeto JSON de
+/// respuesta o de un evento SSE ya parseado.
+///
+/// Campos ausentes, `usage: null` o valores no numéricos quedan como `None`
+/// (desconocidos); no se inventan ceros.
+fn parse_usage(value: &Value) -> TokenUsage {
+    let usage = value.get("usage");
+    TokenUsage {
+        prompt_tokens: usage
+            .and_then(|usage| usage.get("prompt_tokens"))
+            .and_then(Value::as_u64),
+        completion_tokens: usage
+            .and_then(|usage| usage.get("completion_tokens"))
+            .and_then(Value::as_u64),
+    }
+}
+
+/// Inyecta `stream_options.include_usage: true` en el payload de una petición
+/// en streaming, para que el upstream añada el `usage` al chunk final.
+///
+/// Preserva el resto de `stream_options` y fuerza `include_usage` a `true`
+/// aunque el cliente no lo pida (el ledger lo necesita).
+fn inject_include_usage(payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    let options = object
+        .entry("stream_options".to_owned())
+        .and_modify(|value| {
+            // Un valor presente pero no-objeto (p. ej. `null`) se reemplaza:
+            // con `entry().or_insert_with` a secas sobreviviría y la inyección
+            // se perdería en silencio (`as_object_mut` daría `None`).
+            if !value.is_object() {
+                *value = Value::Object(Map::new());
+            }
+        })
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(options) = options.as_object_mut() {
+        options.insert("include_usage".to_owned(), Value::Bool(true));
+    }
+}
+
+/// Cap del buffer de reensamblado de líneas SSE (bytes). Una línea parcial que
+/// lo supere se descarta: el `usage` del chunk final siempre llega en una
+/// línea corta, y el cap solo acota la memoria ante upstreams malformados.
+const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
+
+/// Acumula las líneas SSE que llegan troceadas y retiene el último `usage`
+/// conocido visto (el del chunk final de un stream con `include_usage`).
+///
+/// El buffer es de bytes: la conversión a UTF-8 (lossy) se hace una vez por
+/// línea completa, no en cada fragmento (así un codepoint multibyte partido
+/// entre chunks no se corrompe con caracteres de reemplazo espurios).
+#[derive(Default)]
+struct StreamUsage {
+    buffer: Vec<u8>,
+    /// `true` mientras se descarta una línea parcial sobredimensionada.
+    discarding: bool,
+    usage: TokenUsage,
+    /// Último `finish_reason` **no nulo** visto en los chunks (`choices[0]`).
+    finish_reason: Option<String>,
+}
+
+impl StreamUsage {
+    /// Procesa un fragmento de bytes del stream (límites de chunk arbitrarios;
+    /// una línea `data:` puede llegar partida entre varios fragmentos).
+    ///
+    /// Solo se procesan las líneas completas: el resto queda en el buffer a la
+    /// espera del siguiente fragmento. Una línea parcial que supere
+    /// [`MAX_SSE_LINE_BYTES`] se descarta (junto con todo lo que reste de ella
+    /// hasta su `\n`) para acotar la memoria del reensamblado.
+    fn feed(&mut self, chunk: &[u8]) {
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            if self.discarding {
+                // Línea sobredimensionada en curso: se salta hasta su `\n`
+                // (incluido) sin acumular nada.
+                let Some(pos) = rest.iter().position(|&byte| byte == b'\n') else {
+                    return;
+                };
+                self.discarding = false;
+                rest = &rest[pos + 1..];
+            } else if let Some(pos) = rest.iter().position(|&byte| byte == b'\n') {
+                let (line, tail) = rest.split_at(pos);
+                self.buffer.extend_from_slice(line);
+                self.consume_buffered_line();
+                rest = &tail[1..];
+            } else {
+                self.buffer.extend_from_slice(rest);
+                if self.buffer.len() > MAX_SSE_LINE_BYTES {
+                    self.buffer.clear();
+                    self.discarding = true;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Procesa la línea parcial pendiente al terminar el stream (EOF sin `\n`
+    /// final), para no perder el `usage` de upstreams que no cierran la última
+    /// línea. Idempotente: sin línea pendiente no hace nada.
+    fn finish(&mut self) {
+        if self.buffer.is_empty() {
+            self.discarding = false;
+            return;
+        }
+        self.consume_buffered_line();
+    }
+
+    /// Consume la línea completa acumulada en el buffer. Las líneas
+    /// sobredimensionadas se descartan sin parsear (el `usage` del chunk final
+    /// siempre llega en una línea corta).
+    fn consume_buffered_line(&mut self) {
+        let bytes = std::mem::take(&mut self.buffer);
+        if bytes.len() > MAX_SSE_LINE_BYTES {
+            return;
+        }
+        let line = String::from_utf8_lossy(&bytes);
+        self.consume_line(line.trim_end_matches(['\r', '\n']));
+    }
+
+    /// Consume una línea SSE completa. Solo los eventos `data:` con un JSON
+    /// que traiga `usage` conocido o `finish_reason` informado actualizan el
+    /// valor retenido: los intermedios (`usage: null`, `finish_reason: null`)
+    /// y `data: [DONE]` no lo tocan.
+    fn consume_line(&mut self, line: &str) {
+        let Some(data) = line.strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim_start();
+        if data == "[DONE]" {
+            return;
+        }
+        // Pre-filtro barato: la gran mayoría de los chunks del stream no traen
+        // ni `usage` ni `finish_reason`, y así se evita parsear JSON por cada
+        // línea. Comportamiento idéntico (salvo claves `\uXXXX` escapadas,
+        // irreales en la práctica).
+        let has_usage = data.contains("\"usage\"");
+        let has_finish_reason = data.contains("\"finish_reason\"");
+        if !has_usage && !has_finish_reason {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        if has_usage {
+            let usage = parse_usage(&value);
+            if !usage.is_unknown() && usage != self.usage {
+                tracing::debug!(
+                    tokens_in = ?usage.prompt_tokens,
+                    tokens_out = ?usage.completion_tokens,
+                    "usage del stream (chunk final)"
+                );
+                self.usage = usage;
+            }
+        }
+        // El pre-filtro de `finish_reason` ya se calculó arriba junto al del
+        // `usage`: solo se consulta el valor cuando la línea puede traerlo
+        // (los chunks intermedios traen `null`, que no sobrescribe el último
+        // conocido).
+        if has_finish_reason && let Some(reason) = extract_finish_reason(&value) {
+            self.finish_reason = Some(reason);
+        }
+    }
+}
+
+// --- Ledger de observabilidad: evento de petición (`gateway_requests`) ------
+
+/// `event_type` del evento de petición del ledger (singular, como el resto de
+/// eventos: `catalog`, `selection`, `request`).
+const REQUEST_EVENT_TYPE: &str = "request";
+
+/// Evento estructurado `gateway_requests`: un evento por petición atendida
+/// (D5), con el resultado del enrutado, el `usage` del upstream y el coste
+/// calculado con los precios **en el momento de la petición**.
+///
+/// Los precios (`pin`, `pout`) van en USD por millón de tokens, la misma
+/// unidad de `gateway_catalog` y `gateway_selection`; `cost_usd` se calcula
+/// como `tokens_in·pin + tokens_out·pout` (precios por token, es decir,
+/// divididos entre un millón) y va en USD. Cuando falta el `usage` (o el
+/// precio del modelo), tokens y coste quedan **desconocidos** (`null`): nunca
+/// se inventa un `0`.
+#[derive(Debug, Clone, Serialize)]
+struct RequestEvent {
+    /// Tipo de evento del ledger: siempre `request`.
+    event_type: &'static str,
+    /// Momento de la emisión (fin de la petición), en ms epoch.
+    ts: u64,
+    /// Identificador de correlación de la petición.
+    request_id: String,
+    /// Nombre de la ruta atendida (`route.name` de la configuración).
+    route: String,
+    /// Modelo del último intento; `None` si no se intentó ninguno.
+    model_id: Option<String>,
+    /// `true` si la petición era `stream: true`.
+    streaming: bool,
+    /// Intentos reales contra upstream (con la API key resuelta).
+    attempts: usize,
+    /// `true` si hizo falta más de un intento (failover antes del primer
+    /// byte).
+    failover: bool,
+    /// Resultado global de la petición (`success`/`all_failed`).
+    outcome: &'static str,
+    /// `finish_reason` informado por el upstream, si se conoció.
+    finish_reason: Option<String>,
+    /// Latencia total de la petición, en ms (en streaming, hasta agotar el
+    /// stream).
+    latency_ms: u64,
+    /// Tokens de entrada (`usage.prompt_tokens`); `None` si no se informó.
+    tokens_in: Option<u64>,
+    /// Tokens de salida (`usage.completion_tokens`); `None` si no se informó.
+    tokens_out: Option<u64>,
+    /// Precio de entrada del modelo elegido, en USD/Mtok, en el momento de la
+    /// petición.
+    pin: Option<f64>,
+    /// Precio de salida del modelo elegido, en USD/Mtok, en el momento de la
+    /// petición.
+    pout: Option<f64>,
+    /// Coste de la petición en USD; `None` si faltan tokens o precios.
+    cost_usd: Option<f64>,
+}
+
+/// `cost_usd` de una petición: `tokens_in·pin + tokens_out·pout`, con los
+/// precios en USD/Mtok y el resultado en USD.
+///
+/// Devuelve `None` si falta cualquier pieza (un token desconocido o un precio
+/// desconocido): datos parciales no inventan un coste. Un coste `0.0` **con
+/// precios conocidos** sí es legítimo (0 tokens consumidos es un dato, no una
+/// ausencia).
+fn cost_usd(
+    tokens_in: Option<u64>,
+    tokens_out: Option<u64>,
+    pin: Option<f64>,
+    pout: Option<f64>,
+) -> Option<f64> {
+    Some(
+        (tokens_in? as f64 * pin? + tokens_out? as f64 * pout?)
+            / crate::discovery::TOKENS_PER_MILLION,
+    )
+}
+
+/// `finish_reason` del primer `choices[0]` de una respuesta o evento SSE de
+/// chat. Un `null` (chunks intermedios del stream) o su ausencia devuelven
+/// `None`: solo un valor informado cuenta.
+fn extract_finish_reason(value: &Value) -> Option<String> {
+    value
+        .get("choices")?
+        .get(0)?
+        .get("finish_reason")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// `usage` y `finish_reason` de una respuesta no-stream, con un **único**
+/// parseo del cuerpo (hot path del ledger). Un cuerpo que no sea JSON válido
+/// produce tokens desconocidos y `finish_reason` `None`.
+fn parse_body_ledger(bytes: &[u8]) -> (TokenUsage, Option<String>) {
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(value) => (parse_usage(&value), extract_finish_reason(&value)),
+        Err(_) => (TokenUsage::default(), None),
+    }
+}
+
+/// Emite el evento `gateway_requests` como log estructurado con `event_type`
+/// `request` (D5): `tracing` lo envía a OpenObserve vía el stack OTLP de
+/// [`crate::telemetry`]. Es el punto de extensión para cambiar de transport
+/// sin tocar la lógica de la petición.
+///
+/// Con `observability.events: false` (`enabled = false`) no se emite ninguno.
+///
+/// La emisión va aislada con `catch_unwind`: un fallo del exportador —hoy, un
+/// panic en un subscriber/layer; mañana, un fallo del transport real— NO
+/// propaga el error a la petición, cuya respuesta queda intacta (4.3).
+fn emit_request_event(event: &RequestEvent, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracing::info!(
+            event_type = event.event_type,
+            ts = event.ts,
+            request_id = %event.request_id,
+            route = %event.route,
+            model_id = event.model_id,
+            streaming = event.streaming,
+            attempts = event.attempts,
+            failover = event.failover,
+            outcome = event.outcome,
+            finish_reason = event.finish_reason,
+            latency_ms = event.latency_ms,
+            tokens_in = event.tokens_in,
+            tokens_out = event.tokens_out,
+            pin = event.pin,
+            pout = event.pout,
+            cost_usd = event.cost_usd,
+            "gateway_requests"
+        );
+    }));
+}
+
+/// Receptor del evento `gateway_requests` de una petición **en streaming**.
+///
+/// Se emite al fin real del stream (el [`Frame::End`] inyectado por
+/// [`stream_response`]), fuera del camino de bytes: el passthrough no se toca
+/// y no hay locks contenciosos (el `StreamUsage` queda atrapado en el closure
+/// del stream y este sink es el único que lo lee, al final).
+///
+/// Limitaciones: un aborto del cliente a mitad del stream descarta el sink con
+/// el body y **no emite evento**; un corte del upstream a mitad tampoco lo
+/// emite, o lo emite con datos parciales si el upstream cierra limpio pero
+/// incompleto (ver [`stream_response`]).
+struct RequestSink {
+    /// Campos ya conocidos en el momento del enrutado, con los precios del
+    /// modelo resueltos entonces (el «momento de la petición»).
+    event: RequestEvent,
+    /// Instante de inicio de la petición: la latencia del evento cubre todo el
+    /// streaming, no solo hasta el primer byte.
+    started: Instant,
+    /// Asa a los instrumentos del ledger: los contadores de tokens y coste se
+    /// incrementan junto con el evento, al fin real del stream.
+    metrics: Arc<Metrics>,
+    /// `false` con `observability.events: false`: el evento `request` no se
+    /// emite (las métricas del ledger sí se incrementan igualmente).
+    events: bool,
+}
+
+impl RequestSink {
+    /// Completa el evento con el `usage`/`finish_reason` retenidos por el
+    /// extractor del stream, lo emite y alimenta los contadores del ledger.
+    fn complete(mut self, extractor: &StreamUsage) {
+        self.event.ts = crate::discovery::now_ms();
+        self.event.latency_ms = self.started.elapsed().as_millis() as u64;
+        self.event.tokens_in = extractor.usage.prompt_tokens;
+        self.event.tokens_out = extractor.usage.completion_tokens;
+        self.event.finish_reason = extractor.finish_reason.clone();
+        self.event.cost_usd = cost_usd(
+            self.event.tokens_in,
+            self.event.tokens_out,
+            self.event.pin,
+            self.event.pout,
+        );
+        emit_request_event(&self.event, self.events);
+        // Métricas del ledger (#39, Grupo 5): mismos datos que el evento.
+        if let Some(model) = self.event.model_id.as_deref() {
+            self.metrics.record_ledger_usage(
+                &self.event.route,
+                model,
+                self.event.tokens_in,
+                self.event.tokens_out,
+                self.event.cost_usd,
+            );
+        }
+    }
 }
 
 /// Clona `body` y sustituye su `model` por `model`. El resto de campos
@@ -1013,14 +1749,19 @@ async fn healthz() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Candidate, MAX_RETRY_AFTER, backend_id, chat_url, effective_cooldown,
-        expand_backends, parse_retry_after, request_requires_tool_call, response_has_tool_call,
+        AppState, Candidate, MAX_RETRY_AFTER, MAX_SSE_LINE_BYTES, Metrics, QUOTA_BODY_LIMIT,
+        QuotaSignal, RequestEvent, RequestSink, StreamUsage, TokenUsage, backend_id, chat_url,
+        cost_usd, effective_cooldown, emit_request_event, expand_backends, handle_chat_completions,
+        headers_show_daily_exhaustion, inject_include_usage, parse_body_ledger, parse_retry_after,
+        parse_usage, quota_reset_epoch_ms, quota_signal, read_quota_body,
+        request_requires_tool_call, response_has_tool_call, stream_response,
     };
     use crate::config::{Backend, BackendKind, GatewayConfig};
     use crate::discovery::{ModelEntry, Pricing};
-    use axum::http::HeaderValue;
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue, header};
     use serde_json::json;
-    use std::time::Duration;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     /// Modelo elegible (free + tool-calling) para precargar un catálogo.
     fn eligible_model(id: &str, context_length: u32) -> ModelEntry {
@@ -1350,5 +2091,1149 @@ route:
         assert!(!response_has_tool_call(
             br#"{"choices":[{"message":{"content":"hola"}}]}"#
         ));
+    }
+
+    /// Milisegundos epoch UTC dentro de `delta` a partir de ahora.
+    fn epoch_ms_in(delta: Duration) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("reloj posterior a 1970");
+        u64::try_from((now + delta).as_millis()).expect("epoch en ms cabe en u64")
+    }
+
+    /// Scenario: `limit_source` distingue la cuota diaria del resto.
+    #[test]
+    fn quota_signal_reads_limit_source() {
+        let daily = json!({"error": {"metadata": {"limit_source": "openrouter_free_tier_daily"}}});
+        assert!(matches!(quota_signal(Some(&daily)), QuotaSignal::Daily));
+
+        let minute =
+            json!({"error": {"metadata": {"limit_source": "openrouter_free_tier_per_minute"}}});
+        assert!(matches!(quota_signal(Some(&minute)), QuotaSignal::Other));
+
+        let provider = json!({"error": {"metadata": {"provider_code": 429}}});
+        assert!(matches!(quota_signal(Some(&provider)), QuotaSignal::Other));
+
+        assert!(matches!(quota_signal(None), QuotaSignal::Unknown));
+        let plain = json!({"error": {"message": "boom"}});
+        assert!(matches!(quota_signal(Some(&plain)), QuotaSignal::Unknown));
+    }
+
+    /// Scenario: la heurística exige `Remaining: 0` y un reset a >5 min.
+    #[test]
+    fn header_heuristic_requires_zero_remaining_and_far_reset() {
+        let remaining = HeaderName::from_static("x-ratelimit-remaining");
+        let reset = HeaderName::from_static("x-ratelimit-reset");
+
+        let mut far = HeaderMap::new();
+        far.insert(remaining.clone(), HeaderValue::from_static("0"));
+        far.insert(
+            reset.clone(),
+            HeaderValue::from_str(&epoch_ms_in(Duration::from_secs(6 * 3600)).to_string())
+                .expect("valor de cabecera"),
+        );
+        assert!(
+            headers_show_daily_exhaustion(&far, quota_reset_epoch_ms(&far)),
+            "Remaining 0 con reset a 6 h debe abrir el gate"
+        );
+
+        let mut near = HeaderMap::new();
+        near.insert(remaining.clone(), HeaderValue::from_static("0"));
+        near.insert(
+            reset.clone(),
+            HeaderValue::from_str(&epoch_ms_in(Duration::from_secs(60)).to_string())
+                .expect("valor de cabecera"),
+        );
+        assert!(
+            !headers_show_daily_exhaustion(&near, quota_reset_epoch_ms(&near)),
+            "un reset a 1 min no es agotamiento diario"
+        );
+
+        let mut with_remaining = HeaderMap::new();
+        with_remaining.insert(remaining, HeaderValue::from_static("5"));
+        with_remaining.insert(
+            reset,
+            HeaderValue::from_str(&epoch_ms_in(Duration::from_secs(6 * 3600)).to_string())
+                .expect("valor de cabecera"),
+        );
+        assert!(
+            !headers_show_daily_exhaustion(&with_remaining, quota_reset_epoch_ms(&with_remaining)),
+            "con cuota restante > 0 no es agotamiento diario"
+        );
+    }
+
+    #[test]
+    fn quota_reset_epoch_ms_reads_header() {
+        let name = HeaderName::from_static("x-ratelimit-reset");
+        let mut headers = HeaderMap::new();
+        assert_eq!(quota_reset_epoch_ms(&headers), None);
+
+        headers.insert(name.clone(), HeaderValue::from_static("1700000000000"));
+        assert_eq!(quota_reset_epoch_ms(&headers), Some(1_700_000_000_000));
+
+        headers.insert(name, HeaderValue::from_static("nope"));
+        assert_eq!(quota_reset_epoch_ms(&headers), None);
+    }
+
+    /// Modelo de pago elegible (precio positivo + tool-calling) de un catálogo.
+    fn paid_model(id: &str, price: &str, context_length: u32) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(context_length),
+            pricing: Some(Pricing {
+                prompt: Some(json!(price)),
+                completion: Some(json!(price)),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Scenario 5.4: `expand_backends` expande un backend de pago en orden de
+    /// precio, sin rotación, y conserva el `static` final como último recurso.
+    #[tokio::test]
+    async fn expand_backends_expands_paid_backend_without_rotation() {
+        // El acceso a la blacklist toca el gauge global (sin etiquetas).
+        let _guard = crate::metrics::BlacklistGaugeGuard::lock();
+        let yaml = r#"
+route:
+  - name: paid-expand-test
+    backend:
+      - kind: openrouter_paid
+        base_url: "http://paid.test/v1"
+        api_key_env: "PAID_KEY"
+        timeout_ms: 4000
+        profile: code
+        discovery:
+          refresh_interval_ms: 300000
+          blacklist_cooldown_ms: 7000
+          allow: ["acme/flash-*"]
+      - base_url: "http://static.test/v1"
+        model: "local/final"
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        let state = AppState::new(config).expect("estado de test");
+        state
+            .discovery
+            .catalog("http://paid.test/v1")
+            .expect("caché del backend de pago")
+            .seed(vec![
+                paid_model("acme/flash-b", "0.1", 128_000),
+                paid_model("acme/flash-a", "0.04", 8_000),
+            ]);
+
+        let route = &state.config.route[0];
+        let candidates = expand_backends(&state, 0, route).await;
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.model.as_str())
+                .collect::<Vec<_>>(),
+            ["acme/flash-a", "acme/flash-b", "local/final"],
+            "el de pago aporta sus modelos por precio y el estático cierra la ruta"
+        );
+        for candidate in &candidates[..2] {
+            assert_eq!(candidate.slot, 0, "mismo backend de pago");
+            assert_eq!(candidate.base_url, "http://paid.test/v1");
+            assert_eq!(candidate.timeout_ms, Some(4000), "timeout arrastrado");
+            assert_eq!(candidate.api_key_env.as_deref(), Some("PAID_KEY"));
+            assert_eq!(
+                candidate.dynamic_cooldown,
+                Some(Duration::from_millis(7000)),
+                "los fallos del modelo de pago también blacklistean"
+            );
+            assert!(
+                !candidate.free_tier,
+                "el respaldo de pago no pertenece al tier free"
+            );
+        }
+        assert_eq!(
+            candidates[2].slot, 1,
+            "el estático final es el siguiente backend"
+        );
+
+        let again = expand_backends(&state, 0, route).await;
+        assert_eq!(
+            again[0].model, "acme/flash-a",
+            "sin rotación el primer candidato es el mismo en expansiones sucesivas"
+        );
+    }
+
+    /// Scenario 5.7: sin `allow` el backend de pago no aporta candidatos y la
+    /// ruta continúa con el siguiente backend declarado.
+    #[tokio::test]
+    async fn expand_backends_paid_without_allow_ships_only_the_next_backend() {
+        let _guard = crate::metrics::BlacklistGaugeGuard::lock();
+        let yaml = r#"
+route:
+  - name: paid-no-allow-test
+    backend:
+      - kind: openrouter_paid
+        base_url: "http://paid.test/v1"
+        api_key_env: "PAID_KEY"
+        profile: code
+        discovery:
+          refresh_interval_ms: 300000
+          min_context: 1000
+      - base_url: "http://static.test/v1"
+        model: "local/final"
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        let state = AppState::new(config).expect("estado de test");
+        state
+            .discovery
+            .catalog("http://paid.test/v1")
+            .expect("caché del backend de pago")
+            .seed(vec![paid_model("acme/flash-a", "0.04", 8_000)]);
+
+        let route = &state.config.route[0];
+        let candidates = expand_backends(&state, 0, route).await;
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "sin lista curada el backend de pago aporta cero candidatos"
+        );
+        assert_eq!(candidates[0].model, "local/final");
+        assert_eq!(
+            candidates[0].slot, 1,
+            "la ruta sigue con el siguiente backend"
+        );
+    }
+
+    /// Scenario: el cuerpo de un `429` sin `Content-Length` (chunked) se lee de
+    /// forma acotada; un primer fragmento por encima del límite se descarta sin
+    /// esperar al resto del cuerpo.
+    #[tokio::test]
+    async fn read_quota_body_bounds_reads_of_chunked_bodies() {
+        use axum::body::Body;
+        use axum::routing::get;
+        use futures_util::StreamExt as _;
+        use futures_util::stream;
+
+        // Primer fragmento válido como JSON pero más grande que el límite.
+        let first = format!(r#"{{"error":"{}"}}"#, "x".repeat(QUOTA_BODY_LIMIT + 4096));
+        let app = axum::Router::new().route(
+            "/big",
+            get(move || {
+                let first = first.clone();
+                async move {
+                    let head =
+                        stream::once(async move { Ok::<_, std::io::Error>(first.into_bytes()) });
+                    // El resto del cuerpo nunca llega: una lectura acotada no
+                    // debe esperarlo.
+                    Body::from_stream(head.chain(stream::pending()))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve test server") });
+
+        let response = reqwest::get(format!("http://{addr}/big"))
+            .await
+            .expect("GET /big");
+        assert!(
+            response.content_length().is_none(),
+            "el servidor de test debe responder sin Content-Length"
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_millis(500), read_quota_body(response))
+            .await
+            .expect("la lectura acotada no debe esperar al resto del cuerpo");
+        assert!(
+            outcome.is_none(),
+            "un cuerpo por encima del límite debe descartarse"
+        );
+    }
+
+    // ---- Grupo 1 «Parseo de usage» del ledger de observabilidad (#39) ----
+
+    /// Scenario: Respuesta no-stream con usage — los tokens quedan extraídos
+    /// del objeto `usage` del body.
+    #[test]
+    fn parse_usage_extracts_tokens_from_response_body() {
+        let body = json!({
+            "id": "gen-1",
+            "choices": [{"message": {"role": "assistant", "content": "hola"}}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 34}
+        });
+
+        let usage = parse_usage(&body);
+
+        assert_eq!(usage.prompt_tokens, Some(12));
+        assert_eq!(usage.completion_tokens, Some(34));
+    }
+
+    /// Scenario: Respuesta no-stream sin usage — el parseo del body completo
+    /// (JSON válido) también extrae los tokens.
+    #[test]
+    fn parse_body_ledger_extracts_tokens_from_valid_json() {
+        let body = br#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}"#;
+
+        let (usage, _) = parse_body_ledger(body);
+
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: Some(3),
+                completion_tokens: Some(4)
+            }
+        );
+    }
+
+    /// Scenario: Sin usage los tokens quedan desconocidos — y **no** se
+    /// registra `0` cuando falta `usage`.
+    #[test]
+    fn parse_usage_without_usage_reports_unknown_not_zero() {
+        let body = json!({"id": "gen-1", "choices": []});
+
+        let usage = parse_usage(&body);
+
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.completion_tokens, None);
+        assert!(
+            usage
+                != TokenUsage {
+                    prompt_tokens: Some(0),
+                    completion_tokens: Some(0)
+                },
+            "los tokens desconocidos no deben representarse como 0"
+        );
+    }
+
+    /// Un body que no sea JSON válido produce tokens desconocidos (sin ceros
+    /// inventados).
+    #[test]
+    fn parse_body_ledger_invalid_json_is_unknown() {
+        assert_eq!(parse_body_ledger(b"no es json").0, TokenUsage::default());
+    }
+
+    /// `usage` parcial (solo `prompt_tokens`): el campo que falta queda
+    /// desconocido, sin inventar un valor.
+    #[test]
+    fn parse_usage_partial_fields_leave_missing_unknown() {
+        let body = json!({"usage": {"prompt_tokens": 5}});
+
+        let usage = parse_usage(&body);
+
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: None
+            }
+        );
+    }
+
+    /// Scenario: Streaming inyecta include_usage — un body con `stream: true`
+    /// sale con `stream_options.include_usage: true`.
+    #[test]
+    fn inject_include_usage_adds_include_usage_true() {
+        let mut body = json!({"model": "m", "stream": true, "messages": []});
+
+        inject_include_usage(&mut body);
+
+        assert_eq!(
+            body.pointer("/stream_options/include_usage"),
+            Some(&json!(true)),
+            "debe inyectarse stream_options.include_usage: true"
+        );
+        // El resto del body se conserva intacto.
+        assert_eq!(body.get("model"), Some(&json!("m")));
+        assert_eq!(body.get("messages"), Some(&json!([])));
+    }
+
+    /// La inyección preserva el resto de `stream_options` del cliente y fuerza
+    /// `include_usage` a `true` aunque viniera a `false`.
+    #[test]
+    fn inject_include_usage_forces_true_preserving_client_options() {
+        let mut body =
+            json!({"stream": true, "stream_options": {"include_usage": false, "foo": 1}});
+
+        inject_include_usage(&mut body);
+
+        assert_eq!(
+            body.pointer("/stream_options/include_usage"),
+            Some(&json!(true))
+        );
+        assert_eq!(body.pointer("/stream_options/foo"), Some(&json!(1)));
+    }
+
+    /// Scenario: Streaming lee el `usage` del chunk final (los intermedios con
+    /// `usage: null` no tapan el valor final).
+    #[test]
+    fn stream_usage_reads_usage_from_final_chunk() {
+        let mut extractor = StreamUsage::default();
+        extractor.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":null}\n\n");
+
+        extractor.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n",
+        );
+        extractor.feed(b"data: [DONE]\n\n");
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage {
+                prompt_tokens: Some(7),
+                completion_tokens: Some(9)
+            }
+        );
+    }
+
+    /// Una línea `data:` partida entre dos chunks del upstream se reensambla
+    /// antes de parsearse: el `usage` del chunk final no se pierde.
+    #[test]
+    fn stream_usage_reassembles_lines_split_across_chunks() {
+        let mut extractor = StreamUsage::default();
+
+        extractor.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tok");
+        extractor.feed(b"ens\":100,\"completion_tokens\":8}}\n\ndata: [DONE]\n\n");
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage {
+                prompt_tokens: Some(100),
+                completion_tokens: Some(8)
+            }
+        );
+    }
+
+    /// Un chunk posterior con `usage: null` no resetea el `usage` ya conocido.
+    #[test]
+    fn stream_usage_null_chunk_does_not_reset_known_usage() {
+        let mut extractor = StreamUsage::default();
+
+        extractor.feed(b"data: {\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n");
+        extractor.feed(b"data: {\"choices\":[],\"usage\":null}\n\n");
+
+        assert_eq!(extractor.usage.prompt_tokens, Some(7));
+        assert_eq!(extractor.usage.completion_tokens, Some(9));
+    }
+
+    /// Scenario: una línea parcial sin `\n` que supera el cap de reensamblado
+    /// se descarta (el buffer no crece sin límite) y el stream sigue
+    /// funcionando: el `usage` posterior se registra con normalidad.
+    #[test]
+    fn stream_usage_discards_oversized_partial_line_and_keeps_working() {
+        let mut extractor = StreamUsage::default();
+
+        // Línea parcial enorme (sin `\n`) que supera el cap: se descarta.
+        let big = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        extractor.feed(&big);
+        assert!(
+            extractor.buffer.len() <= MAX_SSE_LINE_BYTES,
+            "el buffer de reensamblado no debe crecer sin límite: {} bytes",
+            extractor.buffer.len()
+        );
+
+        // El resto de la línea descartada (hasta su `\n`) no se interpreta.
+        extractor.feed(
+            b"resto de la linea descartada\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":4}}\n\ndata: [DONE]\n\n",
+        );
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage {
+                prompt_tokens: Some(3),
+                completion_tokens: Some(4)
+            }
+        );
+    }
+
+    /// Scenario: el pre-filtro de `usage` no altera el comportamiento: una
+    /// línea que menciona `"usage"` dentro de un string (sin usage real) no
+    /// toca el valor retenido, y el chunk final con usage sí lo actualiza.
+    #[test]
+    fn stream_usage_prefilter_keeps_behavior_identical() {
+        let mut extractor = StreamUsage::default();
+
+        extractor.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"the word \\\"usage\\\" here\"}}]}\n\n",
+        );
+        extractor.feed(b"data: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2}}\n\n");
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage {
+                prompt_tokens: Some(1),
+                completion_tokens: Some(2)
+            }
+        );
+    }
+
+    /// Scenario: el stream termina sin `\n` final (EOF con línea parcial
+    /// pendiente): `finish` procesa la última línea para no perder el `usage`
+    /// de upstreams que no cierran la línea. Es idempotente si se llama de más.
+    #[test]
+    fn stream_usage_finish_processes_last_partial_line() {
+        let mut extractor = StreamUsage::default();
+        extractor.feed(b"data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}");
+        assert_eq!(
+            extractor.usage,
+            TokenUsage::default(),
+            "sin \\n aún no se procesa"
+        );
+
+        extractor.finish();
+
+        assert_eq!(
+            extractor.usage,
+            TokenUsage {
+                prompt_tokens: Some(5),
+                completion_tokens: Some(6)
+            }
+        );
+
+        // Idempotente: llamar de más no altera el resultado.
+        extractor.finish();
+        assert_eq!(extractor.usage.prompt_tokens, Some(5));
+    }
+
+    /// Scenario: `stream_options: null` del cliente se reemplaza por el objeto
+    /// con `include_usage: true` (un `null` no debe silenciar la inyección).
+    #[test]
+    fn inject_include_usage_replaces_null_stream_options() {
+        let mut body = json!({"stream": true, "stream_options": null});
+
+        inject_include_usage(&mut body);
+
+        assert_eq!(
+            body.pointer("/stream_options/include_usage"),
+            Some(&json!(true)),
+            "un stream_options null debe reemplazarse por el objeto con include_usage"
+        );
+    }
+
+    // --- Evento de petición (`gateway_requests`) -----------------------------
+
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::subscriber::DefaultGuard;
+    use tracing::{Event, Level, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+    /// Evento de ejemplo con usage y precios conocidos (1000 in / 200 out a
+    /// 2.0/8.0 USD/Mtok → coste 0.0036 USD).
+    fn sample_event() -> RequestEvent {
+        RequestEvent {
+            event_type: "request",
+            ts: 1_700_000_000_000,
+            request_id: "req-test-1".to_owned(),
+            route: "code".to_owned(),
+            model_id: Some("acme/flash-a".to_owned()),
+            streaming: false,
+            attempts: 1,
+            failover: false,
+            outcome: "success",
+            finish_reason: Some("stop".to_owned()),
+            latency_ms: 42,
+            tokens_in: Some(1000),
+            tokens_out: Some(200),
+            pin: Some(2.0),
+            pout: Some(8.0),
+            cost_usd: Some(0.0036),
+        }
+    }
+
+    /// Escenario 4.1: el evento serializa **todos** los campos del contrato,
+    /// con `event_type` `request` (singular).
+    #[test]
+    fn request_event_serializes_contract_fields() {
+        let json = serde_json::to_value(sample_event()).expect("evento serializable");
+
+        assert_eq!(json["event_type"], json!("request"));
+        assert_eq!(json["ts"], json!(1_700_000_000_000u64));
+        assert_eq!(json["request_id"], json!("req-test-1"));
+        assert_eq!(json["route"], json!("code"));
+        assert_eq!(json["model_id"], json!("acme/flash-a"));
+        assert_eq!(json["streaming"], json!(false));
+        assert_eq!(json["attempts"], json!(1));
+        assert_eq!(json["failover"], json!(false));
+        assert_eq!(json["outcome"], json!("success"));
+        assert_eq!(json["finish_reason"], json!("stop"));
+        assert_eq!(json["latency_ms"], json!(42));
+        assert_eq!(json["tokens_in"], json!(1000));
+        assert_eq!(json["tokens_out"], json!(200));
+        assert_eq!(json["pin"], json!(2.0));
+        assert_eq!(json["pout"], json!(8.0));
+        assert_eq!(json["cost_usd"], json!(0.0036));
+    }
+
+    /// Escenario «Sin usage el coste queda desconocido»: tokens y coste van
+    /// `null` (nunca `0`) y el resto de campos se registran igualmente.
+    #[test]
+    fn request_event_without_usage_keeps_tokens_and_cost_null() {
+        let event = RequestEvent {
+            tokens_in: None,
+            tokens_out: None,
+            cost_usd: None,
+            finish_reason: Some("stop".to_owned()),
+            ..sample_event()
+        };
+        let json = serde_json::to_value(&event).expect("evento serializable");
+
+        assert!(json["tokens_in"].is_null(), "{json}");
+        assert!(json["tokens_out"].is_null(), "{json}");
+        assert!(json["cost_usd"].is_null(), "{json}");
+        assert_eq!(json["route"], json!("code"), "route se registra igualmente");
+        assert_eq!(json["model_id"], json!("acme/flash-a"));
+        assert_eq!(json["latency_ms"], json!(42));
+        assert_eq!(json["outcome"], json!("success"));
+        assert_eq!(json["finish_reason"], json!("stop"));
+    }
+
+    /// Escenario 4.2: el coste es `tokens_in·pin + tokens_out·pout` en USD
+    /// (precios de entrada en USD/Mtok, divididos entre un millón).
+    #[test]
+    fn cost_usd_combines_tokens_and_prices_in_usd() {
+        let cost = cost_usd(Some(1000), Some(200), Some(2.0), Some(8.0))
+            .expect("coste con usage y precios completos");
+        assert!(
+            (cost - 0.0036).abs() < 1e-12,
+            "1000·2/1e6 + 200·8/1e6 = 0.0036 USD, coste: {cost}"
+        );
+        assert_eq!(
+            cost_usd(Some(1_000_000), Some(0), Some(2.0), Some(8.0)),
+            Some(2.0),
+            "un millón de tokens de entrada a 2 USD/Mtok cuesta 2 USD"
+        );
+    }
+
+    /// Datos parciales no inventan coste: falta cualquier pieza → desconocido.
+    #[test]
+    fn cost_usd_is_unknown_without_full_usage_or_prices() {
+        assert_eq!(cost_usd(None, Some(200), Some(2.0), Some(8.0)), None);
+        assert_eq!(cost_usd(Some(1000), None, Some(2.0), Some(8.0)), None);
+        assert_eq!(cost_usd(Some(1000), Some(200), None, Some(8.0)), None);
+        assert_eq!(cost_usd(Some(1000), Some(200), Some(2.0), None), None);
+    }
+
+    /// Un coste `0.0` con precios y tokens conocidos es un **dato** (0 tokens
+    /// consumidos), no una ausencia: no se confunde con desconocido.
+    #[test]
+    fn cost_usd_zero_tokens_with_known_prices_is_zero() {
+        assert_eq!(
+            cost_usd(Some(0), Some(0), Some(2.0), Some(8.0)),
+            Some(0.0),
+            "0 tokens con precios conocidos es coste 0, no desconocido"
+        );
+    }
+
+    /// Escenario 4.1 (no-stream): un único parseo del cuerpo extrae `usage` y
+    /// `finish_reason`.
+    #[test]
+    fn parse_body_ledger_reads_usage_and_finish_reason() {
+        let body = br#"{
+            "choices": [{"message": {"role": "assistant"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 200}
+        }"#;
+
+        let (usage, finish_reason) = parse_body_ledger(body);
+
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: Some(1000),
+                completion_tokens: Some(200)
+            }
+        );
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// Escenario «Sin usage»: los tokens quedan desconocidos (nunca `0`) y el
+    /// `finish_reason` del upstream se registra igualmente.
+    #[test]
+    fn parse_body_ledger_without_usage_keeps_tokens_unknown() {
+        let body = br#"{"choices": [{"message": {"role": "assistant"}, "finish_reason": "stop"}]}"#;
+
+        let (usage, finish_reason) = parse_body_ledger(body);
+
+        assert_eq!(
+            usage,
+            TokenUsage::default(),
+            "sin usage: desconocidos, no 0"
+        );
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// Un cuerpo que no es JSON válido produce todo desconocido (sin panic).
+    #[test]
+    fn parse_body_ledger_invalid_json_is_all_unknown() {
+        let (usage, finish_reason) = parse_body_ledger(b"<html>gateway error</html>");
+
+        assert_eq!(usage, TokenUsage::default());
+        assert_eq!(finish_reason, None);
+    }
+
+    /// Escenario 4.1 (streaming): el extractor del stream retiene el
+    /// `finish_reason` de los chunks (el chunk final con `usage` no lo trae).
+    #[test]
+    fn stream_usage_captures_finish_reason_from_chunks() {
+        let mut extractor = StreamUsage::default();
+
+        extractor.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"h\"},\"finish_reason\":null}]}\n\n",
+        );
+        extractor.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        extractor.feed(
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":5}}\n\n",
+        );
+        extractor.feed(b"data: [DONE]\n\n");
+
+        assert_eq!(
+            extractor.finish_reason.as_deref(),
+            Some("stop"),
+            "el finish_reason del chunk de contenido se retiene"
+        );
+        assert_eq!(extractor.usage.prompt_tokens, Some(3));
+        assert_eq!(extractor.usage.completion_tokens, Some(5));
+    }
+
+    /// Un `finish_reason: null` intermedio no sobrescribe el último conocido.
+    #[test]
+    fn stream_usage_finish_reason_null_does_not_overwrite() {
+        let mut extractor = StreamUsage::default();
+
+        extractor.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n");
+        extractor.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"mas\"},\"finish_reason\":null}]}\n\n",
+        );
+
+        assert_eq!(extractor.finish_reason.as_deref(), Some("stop"));
+    }
+
+    /// Regresión (h2): un frame DATA vacío **intermedio** llega como chunk
+    /// vacío y NO es el fin del stream. El evento `gateway_requests` se emite
+    /// una sola vez, al fin real, con el `usage`/`finish_reason` completos.
+    #[tokio::test]
+    async fn stream_response_emits_single_complete_event_after_intermediate_empty_chunk() {
+        let (captured, _guard) = capture_ledger_logs();
+
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hola\"},\"finish_reason\":null}]}\n\n",
+            )),
+            // Chunk vacío INTERMEDIO (frame DATA(0) de h2): no cierra el stream.
+            Ok(Bytes::new()),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":9}}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        // Simula lo que `bytes_stream()` entrega en h2: cada frame como un
+        // chunk, vacíos intermedios incluidos, sin centinela propio (el fin lo
+        // añade `stream_response`).
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                    chunks,
+                )))
+                .expect("respuesta de test"),
+        );
+        let event = RequestEvent {
+            streaming: true,
+            request_id: "req-empty-chunk".to_owned(),
+            ..sample_event()
+        };
+        let response = stream_response(
+            response,
+            "static/test",
+            Some(RequestSink {
+                event,
+                started: Instant::now(),
+                metrics: ledger_metrics(),
+                events: true,
+            }),
+        );
+
+        let passthrough = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("cuerpo íntegro")
+            .to_bytes();
+        let passthrough = String::from_utf8_lossy(&passthrough);
+        assert!(
+            passthrough.contains("[DONE]"),
+            "el stream llega íntegro al cliente: {passthrough}"
+        );
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let events: Vec<&String> = logs
+            .iter()
+            .filter(|log| log.contains("event_type=request"))
+            .collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "un solo evento, emitido al fin real del stream: {events:?}"
+        );
+        assert!(
+            events[0].contains("request_id=req-empty-chunk"),
+            "{}",
+            events[0]
+        );
+        assert!(events[0].contains("finish_reason=stop"), "{}", events[0]);
+        assert!(events[0].contains("tokens_in=7"), "{}", events[0]);
+        assert!(events[0].contains("tokens_out=9"), "{}", events[0]);
+    }
+
+    /// Capa que captura los campos de los logs `INFO` del hilo actual.
+    #[derive(Clone)]
+    struct LedgerLayer {
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for LedgerLayer {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            if event.metadata().level() != &Level::INFO {
+                return;
+            }
+            let mut visitor = EventFieldsVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("lock captured ledger logs")
+                .push(visitor.fields.join(" "));
+        }
+    }
+
+    /// Capa que **entra en panic** al registrar el evento `request`: simula un
+    /// exportador caído para el aislamiento del emisor (4.3).
+    #[derive(Clone)]
+    struct PanickingLedgerLayer;
+
+    impl<S: Subscriber> Layer<S> for PanickingLedgerLayer {
+        fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+            let mut visitor = EventFieldsVisitor::default();
+            event.record(&mut visitor);
+            if visitor
+                .fields
+                .iter()
+                .any(|field| field == "event_type=request")
+            {
+                panic!("exportador caído");
+            }
+        }
+    }
+
+    /// Visitante que serializa los campos del evento como `campo=valor`.
+    #[derive(Default)]
+    struct EventFieldsVisitor {
+        fields: Vec<String>,
+    }
+
+    impl Visit for EventFieldsVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={value:?}", field.name()));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+
+    /// Captura los logs `INFO` solo para el hilo actual.
+    fn capture_ledger_logs() -> (Arc<Mutex<Vec<String>>>, DefaultGuard) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(LedgerLayer {
+            events: Arc::clone(&events),
+        });
+        (events, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// Suscriptor que entra en panic con el evento `request` (exportador
+    /// caído), solo para el hilo actual.
+    fn panicking_ledger_subscriber() -> impl Subscriber + Send + Sync {
+        tracing_subscriber::registry().with(PanickingLedgerLayer)
+    }
+
+    /// El emisor registra el evento como log estructurado con `event_type`
+    /// `request` y los campos del contrato (D5).
+    #[test]
+    fn emit_request_event_logs_contract_fields() {
+        let (captured, _guard) = capture_ledger_logs();
+
+        emit_request_event(&sample_event(), true);
+
+        let logs = captured.lock().expect("lock captured ledger logs").clone();
+        let request = logs
+            .iter()
+            .find(|log| log.contains("event_type=request"))
+            .expect("el evento de petición se emite como log estructurado");
+        assert!(request.contains("request_id=req-test-1"), "{request}");
+        assert!(request.contains("route=code"), "{request}");
+        assert!(request.contains("model_id=acme/flash-a"), "{request}");
+        assert!(request.contains("streaming=false"), "{request}");
+        assert!(request.contains("attempts=1"), "{request}");
+        assert!(request.contains("failover=false"), "{request}");
+        assert!(request.contains("outcome=success"), "{request}");
+        assert!(request.contains("finish_reason=stop"), "{request}");
+        assert!(request.contains("latency_ms=42"), "{request}");
+        assert!(request.contains("tokens_in=1000"), "{request}");
+        assert!(request.contains("tokens_out=200"), "{request}");
+        assert!(request.contains("pin=2"), "{request}");
+        assert!(request.contains("pout=8"), "{request}");
+        assert!(request.contains("cost_usd=0.0036"), "{request}");
+    }
+
+    /// Escenario 4.3 (emisor): un fallo del exportador —aquí, un panic en el
+    /// subscriber al registrar el evento— queda aislado y no se propaga a la
+    /// petición.
+    #[test]
+    fn emit_request_event_survives_panicking_exporter() {
+        let event = sample_event();
+
+        let survived = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracing::subscriber::with_default(panicking_ledger_subscriber(), || {
+                emit_request_event(&event, true);
+            });
+        }));
+
+        assert!(
+            survived.is_ok(),
+            "el fallo del exportador debe quedar aislado en el emisor"
+        );
+    }
+
+    // --- Grupo 5 (#39): métricas de tokens y coste ---------------------------
+
+    /// `Metrics` de test: los instrumentos son globales, así que cualquier
+    /// instancia sirve de asa para registrar y renderizar; el aislamiento entre
+    /// tests lo dan las etiquetas `route`/`model` únicas de cada test.
+    fn ledger_metrics() -> Arc<Metrics> {
+        let yaml = r#"
+route:
+  - name: ledger-metrics-test
+    backend:
+      - base_url: "http://127.0.0.1:1/v1"
+        model: "m"
+"#;
+        let config: GatewayConfig = serde_saphyr::from_str(yaml).expect("config de test válida");
+        Arc::new(Metrics::new(&config))
+    }
+
+    /// Construye el receptor del evento `request` de una petición en streaming
+    /// con el `Metrics` que debe incrementar al fin real del stream.
+    fn ledger_sink(event: RequestEvent, metrics: Arc<Metrics>) -> RequestSink {
+        RequestSink {
+            event,
+            started: Instant::now(),
+            metrics,
+            events: true,
+        }
+    }
+
+    /// Modelo de pago con precios asimétricos, para costar con `pin`/`pout`
+    /// distintos (en USD por token, como los trae el catálogo).
+    fn ledger_model(id: &str, prompt: &str, completion: &str) -> ModelEntry {
+        ModelEntry {
+            id: id.to_owned(),
+            name: None,
+            description: None,
+            context_length: Some(8_000),
+            pricing: Some(Pricing {
+                prompt: Some(json!(prompt)),
+                completion: Some(json!(completion)),
+            }),
+            supported_parameters: Some(vec!["tools".to_owned(), "tool_choice".to_owned()]),
+        }
+    }
+
+    /// Línea de la serie `name` que contiene todos los pares `key="value"`.
+    fn ledger_line<'a>(text: &'a str, name: &str, pairs: &[(&str, &str)]) -> Option<&'a str> {
+        text.lines().find(|line| {
+            line.starts_with(name)
+                && pairs
+                    .iter()
+                    .all(|(key, expected)| line.contains(&format!(r#"{key}="{expected}""#)))
+        })
+    }
+
+    /// Valor de una línea de serie como `f64`.
+    fn fnum(line: &str) -> f64 {
+        line.rsplit(' ')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(f64::NAN)
+    }
+
+    /// Scenario «Tokens y coste incrementan» (wiring no-stream): una petición
+    /// atendida con `usage` y precios del catálogo incrementa
+    /// `llm_gateway_tokens_total` por `type` y `llm_gateway_cost_usd_total`
+    /// por ruta y modelo.
+    #[tokio::test]
+    async fn nonstream_success_records_tokens_and_cost_metrics() {
+        // Upstream mock: respuesta 2xx con usage de 1000 in / 200 out.
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "hola"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1000, "completion_tokens": 200},
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve test server") });
+
+        let yaml = format!(
+            r#"
+route:
+  - name: ledger-no-stream
+    backend:
+      - kind: openrouter_paid
+        base_url: "http://{addr}/v1"
+        profile: code
+        discovery:
+          refresh_interval_ms: 300000
+          allow: ["mock/*"]
+"#
+        );
+        let config: GatewayConfig = serde_saphyr::from_str(&yaml).expect("config de test válida");
+        let state = AppState::new(config).expect("estado de test");
+        // Precios 2/8 USD/Mtok (0.000002/0.000008 USD por token): coste
+        // 1000·2e-6 + 200·8e-6 = 0.0036 USD.
+        state
+            .discovery
+            .catalog(&format!("http://{addr}/v1"))
+            .expect("caché del backend de pago")
+            .seed(vec![ledger_model("mock/flash", "0.000002", "0.000008")]);
+        let metrics = Arc::clone(&state.metrics);
+
+        let body = Ok(axum::Json(json!({"model": "ledger-no-stream"})));
+        handle_chat_completions(
+            state,
+            body,
+            "req-ledger-nostream".to_owned(),
+            &tracing::Span::none(),
+        )
+        .await;
+
+        let text = metrics.render();
+        let prompt = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-no-stream"),
+                ("model", "mock/flash"),
+                ("type", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=prompt:\n{text}"));
+        assert_eq!(fnum(prompt), 1000.0, "tokens de entrada:\n{prompt}");
+
+        let completion = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-no-stream"),
+                ("model", "mock/flash"),
+                ("type", "completion"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=completion:\n{text}"));
+        assert_eq!(fnum(completion), 200.0, "tokens de salida:\n{completion}");
+
+        let cost = ledger_line(
+            &text,
+            "llm_gateway_cost_usd_total",
+            &[("route", "ledger-no-stream"), ("model", "mock/flash")],
+        )
+        .unwrap_or_else(|| panic!("falta cost_usd_total:\n{text}"));
+        assert_eq!(fnum(cost), 0.0036, "coste en USD:\n{cost}");
+    }
+
+    /// Scenario «Tokens y coste incrementan» (wiring streaming): el evento del
+    /// fin real del stream también alimenta los contadores del ledger.
+    #[tokio::test]
+    async fn stream_end_records_tokens_and_cost_metrics() {
+        let metrics = ledger_metrics();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hola\"},\"finish_reason\":null}]}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":200}}\n\n",
+            )),
+            Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+        ];
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(reqwest::Body::wrap_stream(futures_util::stream::iter(
+                    chunks,
+                )))
+                .expect("respuesta de test"),
+        );
+        let event = RequestEvent {
+            streaming: true,
+            route: "ledger-stream".to_owned(),
+            model_id: Some("acme/stream-m".to_owned()),
+            ..sample_event()
+        };
+        let response = stream_response(
+            response,
+            "static/test",
+            Some(ledger_sink(event, Arc::clone(&metrics))),
+        );
+
+        http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("cuerpo íntegro");
+
+        let text = metrics.render();
+        let prompt = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-stream"),
+                ("model", "acme/stream-m"),
+                ("type", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=prompt:\n{text}"));
+        assert_eq!(
+            fnum(prompt),
+            1000.0,
+            "tokens de entrada del stream:\n{prompt}"
+        );
+
+        let completion = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-stream"),
+                ("model", "acme/stream-m"),
+                ("type", "completion"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=completion:\n{text}"));
+        assert_eq!(
+            fnum(completion),
+            200.0,
+            "tokens de salida del stream:\n{completion}"
+        );
+
+        let cost = ledger_line(
+            &text,
+            "llm_gateway_cost_usd_total",
+            &[("route", "ledger-stream"), ("model", "acme/stream-m")],
+        )
+        .unwrap_or_else(|| panic!("falta cost_usd_total:\n{text}"));
+        assert_eq!(fnum(cost), 0.0036, "coste en USD del stream:\n{cost}");
     }
 }

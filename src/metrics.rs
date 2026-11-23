@@ -22,6 +22,7 @@ use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use prometheus::Encoder as _;
 
 use crate::config::{BackendKind, GatewayConfig, Profile};
+use crate::discovery::SelectionReason;
 use crate::proxy::backend_id;
 use crate::telemetry;
 
@@ -152,6 +153,8 @@ struct RouteMetrics {
     failover: Vec<KeyValue>,
     /// `[streaming]` → atributos `route`, `streaming`.
     duration: [Vec<KeyValue>; 2],
+    /// Atributos `route` del contador de saltos del tier free.
+    free_quota_skips: Vec<KeyValue>,
     backends: Vec<BackendMetrics>,
 }
 
@@ -178,6 +181,43 @@ pub struct Metrics {
     discovery_refresh: Counter<u64>,
     /// Tamaño actual de la blacklist global.
     discovery_blacklist: Gauge<u64>,
+    /// Cuota diaria free restante observada (por `base_url`).
+    ///
+    /// **No** se pre-registra: solo aparece cuando el sondeo ha observado un
+    /// valor, de modo que sin observación no se emite ninguna serie.
+    free_quota_remaining: Gauge<u64>,
+    /// Peticiones que saltaron el tier free por el gate de cuota abierto (por
+    /// `route`).
+    free_quota_skips: Counter<u64>,
+    /// Tokens procesados por petición atendida (por `route`, `model` y
+    /// `type=prompt|completion`).
+    ///
+    /// **No** se pre-registra: el conjunto de modelos no se conoce al arrancar
+    /// (los dinámicos rotan), y una serie solo aparece con `usage` conocido.
+    tokens: Counter<u64>,
+    /// Coste acumulado estimado de las peticiones atendidas, en USD (por
+    /// `route` y `model`), con los precios del momento de la petición.
+    ///
+    /// **No** se pre-registra: igual que [`Metrics::tokens`], solo hay serie
+    /// cuando el coste es calculable.
+    cost: Counter<f64>,
+    /// Cambios del modelo elegido de una ruta, por motivo
+    /// (`initial`/`cheaper`/`failover`/`removed`).
+    ///
+    /// **No** se pre-registra: como el resto del ledger, la serie solo aparece
+    /// con el primer cambio de selección observado.
+    model_selection: Counter<u64>,
+    /// Precio del modelo seleccionado de una ruta, en USD/Mtok (por
+    /// `side=prompt|completion`).
+    ///
+    /// **No** se pre-registra: sin precio conocido no hay serie (un `0` sería
+    /// un precio falso).
+    selected_price: Gauge<f64>,
+    /// Precio `blend` (USD/Mtok) de cada modelo de la lista curada.
+    ///
+    /// **No** se pre-registra: la lista curada y sus precios solo se conocen
+    /// con el primer snapshot del catálogo.
+    allowlist_price: Gauge<f64>,
     /// Último tamaño de blacklist publicado en el gauge. Arranca en 0, que es
     /// lo que deja el pre-registro de [`Metrics::new`]; así una blacklist vacía
     /// no reescribe el gauge en cada acceso.
@@ -229,6 +269,54 @@ fn discovery_refresh_attrs(base_url: &str, ok: bool) -> Vec<KeyValue> {
     vec![
         KeyValue::new("base_url", base_url.to_owned()),
         KeyValue::new("result", if ok { "success" } else { "failure" }),
+    ]
+}
+
+/// Lado del precio en los gauges del ledger: entrada (`prompt`) o salida
+/// (`completion`), la misma pareja de valores del `type` de los tokens.
+#[derive(Clone, Copy)]
+enum LedgerSide {
+    Prompt,
+    Completion,
+}
+
+impl LedgerSide {
+    /// Valor de la etiqueta `side` (y del `type` de los tokens).
+    fn label(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::Completion => "completion",
+        }
+    }
+}
+
+/// Alias legible para el `type` del contador de tokens: mismo vocabulario
+/// (`prompt`/`completion`) que el lado de los precios.
+type LedgerTokenType = LedgerSide;
+
+/// Atributos `route`, `model`, `type` del contador de tokens.
+fn ledger_tokens_attrs(route: &str, model: &str, kind: LedgerTokenType) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new("route", route.to_owned()),
+        KeyValue::new("model", model.to_owned()),
+        KeyValue::new("type", kind.label()),
+    ]
+}
+
+/// Atributos `route`, `model` del contador de coste.
+fn ledger_pair_attrs(route: &str, model: &str) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new("route", route.to_owned()),
+        KeyValue::new("model", model.to_owned()),
+    ]
+}
+
+/// Atributos `route`, `model`, `side` del gauge de precio del seleccionado.
+fn ledger_price_attrs(route: &str, model: &str, side: LedgerSide) -> Vec<KeyValue> {
+    vec![
+        KeyValue::new("route", route.to_owned()),
+        KeyValue::new("model", model.to_owned()),
+        KeyValue::new("side", side.label()),
     ]
 }
 
@@ -316,6 +404,42 @@ impl Metrics {
             .u64_gauge("llm_gateway_discovery_blacklist")
             .with_description("Número de modelos en blacklist dinámica.")
             .build();
+        let free_quota_remaining = meter
+            .u64_gauge("llm_gateway_free_quota_remaining")
+            .with_description("Cuota diaria free restante observada por base_url.")
+            .build();
+        let free_quota_skips = meter
+            .u64_counter("llm_gateway_free_quota_skips")
+            .with_description("Peticiones que saltaron el tier free por el gate de cuota abierto.")
+            .build();
+        let tokens = meter
+            .u64_counter("llm_gateway_tokens")
+            .with_description("Tokens procesados por ruta, modelo y tipo (prompt/completion).")
+            .build();
+        let cost = meter
+            .f64_counter("llm_gateway_cost_usd")
+            .with_description(
+                "Coste acumulado estimado en USD por ruta y modelo (precios del momento).",
+            )
+            .build();
+        let model_selection = meter
+            .u64_counter("llm_gateway_model_selection")
+            .with_description(
+                "Cambios del modelo elegido por ruta y motivo (initial/cheaper/failover/removed).",
+            )
+            .build();
+        let selected_price = meter
+            .f64_gauge("llm_gateway_selected_model_price_usd")
+            .with_description(
+                "Precio del modelo seleccionado por ruta en USD/Mtok (side=prompt entrada, side=completion salida).",
+            )
+            .build();
+        let allowlist_price = meter
+            .f64_gauge("llm_gateway_allowlist_price_usd")
+            .with_description(
+                "Precio blend (0.75·pin + 0.25·pout, USD/Mtok) de cada modelo de la lista curada.",
+            )
+            .build();
 
         let error_kinds = std::array::from_fn(|index| {
             vec![KeyValue::new("kind", GLOBAL_OUTCOMES[index].label())]
@@ -336,6 +460,7 @@ impl Metrics {
                 let failover = vec![KeyValue::new("route", route.name.clone())];
                 let duration =
                     std::array::from_fn(|streaming| duration_attrs(&route.name, streaming == 1));
+                let free_quota_skips = vec![KeyValue::new("route", route.name.clone())];
                 let backends = route
                     .backend
                     .iter()
@@ -374,6 +499,7 @@ impl Metrics {
                     requests,
                     failover,
                     duration,
+                    free_quota_skips,
                     backends,
                 }
             })
@@ -385,6 +511,7 @@ impl Metrics {
                 requests.add(0, attrs);
             }
             failover.add(0, &route.failover);
+            free_quota_skips.add(0, &route.free_quota_skips);
             for backend in &route.backends {
                 for attrs in &backend.attempts {
                     backend_attempts.add(0, attrs);
@@ -449,6 +576,13 @@ impl Metrics {
             discovery_profile,
             discovery_refresh,
             discovery_blacklist,
+            free_quota_remaining,
+            free_quota_skips,
+            tokens,
+            cost,
+            model_selection,
+            selected_price,
+            allowlist_price,
             blacklist_size: AtomicUsize::new(0),
             #[cfg(test)]
             blacklist_size_updates: AtomicUsize::new(0),
@@ -530,6 +664,118 @@ impl Metrics {
     pub fn record_discovery_refresh(&self, base_url: &str, ok: bool) {
         self.discovery_refresh
             .add(1, &discovery_refresh_attrs(base_url, ok));
+    }
+
+    /// Fija la cuota diaria free restante observada para `base_url`.
+    ///
+    /// Es el único punto que emite la serie `llm_gateway_free_quota_remaining`:
+    /// sin observación (sondeo deshabilitado o sin `free_model_daily_requests`)
+    /// no se publica ninguna serie.
+    pub fn record_free_quota_remaining(&self, base_url: &str, remaining: u64) {
+        self.free_quota_remaining
+            .record(remaining, &discovery_attrs(base_url));
+    }
+
+    /// Registra que la ruta `route` saltó el tier free por el gate abierto.
+    pub fn record_free_quota_skip(&self, route: usize) {
+        if let Some(route) = self.routes.get(route) {
+            self.free_quota_skips.add(1, &route.free_quota_skips);
+        }
+    }
+
+    // --- Ledger de observabilidad (#39, Grupo 5): métricas -------------------
+
+    /// Registra los tokens y el coste de una petición atendida por `model`.
+    ///
+    /// Solo incrementa las series con dato conocido: sin `usage` o sin precio
+    /// no se añade nada (nunca se inventa un `0`; un coste `0.0` con precios
+    /// conocidos es un dato legítimo). Los atributos se construyen por llamada
+    /// porque el conjunto de modelos no es finito ni conocido al arrancar: es
+    /// el mismo compromiso de cardinalidad acotada del ledger (`route`, `model`
+    /// y `type`/`side`/`reason`; nunca `request_id`).
+    pub fn record_ledger_usage(
+        &self,
+        route: &str,
+        model: &str,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+        cost_usd: Option<f64>,
+    ) {
+        if let Some(tokens_in) = tokens_in {
+            self.tokens.add(
+                tokens_in,
+                &ledger_tokens_attrs(route, model, LedgerTokenType::Prompt),
+            );
+        }
+        if let Some(tokens_out) = tokens_out {
+            self.tokens.add(
+                tokens_out,
+                &ledger_tokens_attrs(route, model, LedgerTokenType::Completion),
+            );
+        }
+        if let Some(cost) = cost_usd {
+            self.cost.add(cost, &ledger_pair_attrs(route, model));
+        }
+    }
+
+    /// Registra un cambio del modelo elegido de una ruta, por motivo.
+    ///
+    /// `reason` es el enum [`SelectionReason`]: el vocabulario de 4 valores
+    /// del contrato `gateway_selection` (`initial`, `cheaper`, `failover`,
+    /// `removed`) es imposible de violar desde el sistema de tipos.
+    pub fn record_model_selection(&self, route: &str, reason: SelectionReason) {
+        self.model_selection.add(
+            1,
+            &[
+                KeyValue::new("route", route.to_owned()),
+                KeyValue::new("reason", reason.to_string()),
+            ],
+        );
+    }
+
+    /// Fija el precio del modelo seleccionado de una ruta, por lado.
+    ///
+    /// Es un gauge de estado: solo publica los lados con precio conocido y
+    /// sobrescribe el último valor (no acumula). Un lado sin precio conservará
+    /// el último valor publicado hasta que vuelva a conocerse: eliminar la
+    /// serie no es posible desde el SDK y un `0` sería un precio falso.
+    ///
+    /// Limitaciones documentadas en `docs/observability-ledger.md` (notas de
+    /// la auditoría del Grupo 5): series huérfanas cuando el modelo cambia o
+    /// sale de catálogo —el SDK OTel no borra la serie anterior, filtra por
+    /// `model` o cruza con `llm_gateway_model_selection_total`— y desfase del
+    /// gauge hasta el siguiente refresco cuando este es on-demand.
+    pub fn set_selected_model_price(
+        &self,
+        route: &str,
+        model: &str,
+        pin: Option<f64>,
+        pout: Option<f64>,
+    ) {
+        if let Some(pin) = pin {
+            self.selected_price
+                .record(pin, &ledger_price_attrs(route, model, LedgerSide::Prompt));
+        }
+        if let Some(pout) = pout {
+            self.selected_price.record(
+                pout,
+                &ledger_price_attrs(route, model, LedgerSide::Completion),
+            );
+        }
+    }
+
+    /// Publica el precio de un modelo de la lista curada.
+    ///
+    /// Gauge de estado con etiqueta única `model`; `blend` es la ponderación
+    /// de selección `0.75·pin + 0.25·pout`, en USD/Mtok. Republicar el mismo
+    /// modelo sobrescribe la serie (no la duplica).
+    ///
+    /// Cuando un modelo sale de la lista curada, su última serie queda huérfana
+    /// hasta reiniciar (el SDK OTel no borra series): ver las notas de la
+    /// auditoría del Grupo 5 en `docs/observability-ledger.md`.
+    pub fn set_allowlist_price(&self, model: &str, blend: f64) {
+        self.allowlist_price
+            .record(blend, &[KeyValue::new("model", model.to_owned())]);
     }
 
     /// Fija el tamaño actual de la blacklist dinámica.
@@ -952,12 +1198,25 @@ mod tests {
                         blacklist_cooldown_ms: 60_000,
                         min_context: None,
                         overrides: None,
+                        respect_daily_quota: true,
+                        quota_poll_interval_ms: 60_000,
+                        allow: Vec::new(),
+                        reselect_interval_ms: 14_400_000,
+                        min_price_delta: 0.20,
                     }),
                     warmup: None,
                 }],
             }],
             observability: None,
         }
+    }
+
+    /// Config con un backend dinámico y una ruta propia, para aislar las series
+    /// de cuota del resto de tests (el registro Prometheus es global).
+    fn quota_metrics_config(base_url: &str) -> GatewayConfig {
+        let mut config = dynamic_config(base_url);
+        config.route[0].name = "free-quota-metrics".to_owned();
+        config
     }
 
     /// Línea de la serie `name` cuyo `base_url` es `base_url` (y opcionalmente
@@ -1068,5 +1327,381 @@ mod tests {
             .find(|line| line.starts_with("llm_gateway_discovery_blacklist"))
             .expect("serie de blacklist");
         assert_eq!(value(blacklist), "4", "tamaño de blacklist:\n{text}");
+    }
+
+    /// Scenario: el gauge de cuota y el contador de saltos se emiten.
+    #[test]
+    fn free_quota_gauge_and_skips_counter_are_recorded() {
+        let _guard = BlacklistGaugeGuard::lock();
+        let base = "http://free-quota-metrics.invalid/v1";
+        let metrics = Metrics::new(&quota_metrics_config(base));
+
+        metrics.record_free_quota_remaining(base, 250);
+        metrics.record_free_quota_skip(0);
+
+        let text = metrics.render();
+
+        let gauge = discovery_line(&text, "llm_gateway_free_quota_remaining", base, None)
+            .expect("serie del gauge de cuota");
+        assert_eq!(value(gauge), "250", "gauge de cuota:\n{text}");
+
+        let skips = line_for(
+            &text,
+            "llm_gateway_free_quota_skips_total",
+            "free-quota-metrics",
+        )
+        .expect("serie del contador de saltos");
+        assert_eq!(value(skips), "1", "contador de saltos:\n{text}");
+    }
+
+    // --- Grupo 5 (#39): métricas del ledger ----------------------------------
+
+    /// Línea de la serie `name` que contiene todos los pares `key="value"`.
+    fn ledger_line<'a>(text: &'a str, name: &str, pairs: &[(&str, &str)]) -> Option<&'a str> {
+        text.lines().find(|line| {
+            line.starts_with(name)
+                && pairs
+                    .iter()
+                    .all(|(key, expected)| line.contains(&format!(r#"{key}="{expected}""#)))
+        })
+    }
+
+    /// Valor de una línea de serie como `f64` (precios y coste son flotantes).
+    fn fnum(line: &str) -> f64 {
+        line.rsplit(' ')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(f64::NAN)
+    }
+
+    /// Scenario «Tokens y coste incrementan»: 1000 in / 200 out incrementan
+    /// `tokens_total` por `type` (`prompt`/`completion`) y el coste calculado
+    /// incrementa `cost_usd_total` por ruta y modelo.
+    #[test]
+    fn ledger_tokens_and_cost_counters_increment_per_type() {
+        let metrics = Metrics::new(&config("ledger-tokens", false));
+        metrics.record_ledger_usage(
+            "ledger-tokens",
+            "acme/flash-a",
+            Some(1000),
+            Some(200),
+            Some(0.0036),
+        );
+
+        let text = metrics.render();
+        let prompt = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-tokens"),
+                ("model", "acme/flash-a"),
+                ("type", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=prompt:\n{text}"));
+        assert_eq!(fnum(prompt), 1000.0, "tokens de entrada:\n{prompt}");
+
+        let completion = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[
+                ("route", "ledger-tokens"),
+                ("model", "acme/flash-a"),
+                ("type", "completion"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=completion:\n{text}"));
+        assert_eq!(fnum(completion), 200.0, "tokens de salida:\n{completion}");
+
+        let cost = ledger_line(
+            &text,
+            "llm_gateway_cost_usd_total",
+            &[("route", "ledger-tokens"), ("model", "acme/flash-a")],
+        )
+        .unwrap_or_else(|| panic!("falta cost_usd_total:\n{text}"));
+        assert_eq!(fnum(cost), 0.0036, "coste en USD:\n{cost}");
+    }
+
+    /// Los contadores del ledger acumulan entre peticiones (no reemplazan).
+    #[test]
+    fn ledger_counters_accumulate_across_requests() {
+        let metrics = Metrics::new(&config("ledger-acumulo", false));
+        metrics.record_ledger_usage(
+            "ledger-acumulo",
+            "acme/flash-a",
+            Some(1000),
+            Some(200),
+            Some(0.0036),
+        );
+        metrics.record_ledger_usage(
+            "ledger-acumulo",
+            "acme/flash-a",
+            Some(500),
+            Some(20),
+            Some(0.0026),
+        );
+
+        let text = metrics.render();
+        let prompt = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[("route", "ledger-acumulo"), ("type", "prompt")],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=prompt:\n{text}"));
+        assert_eq!(
+            fnum(prompt),
+            1500.0,
+            "tokens de entrada acumulados:\n{prompt}"
+        );
+
+        let completion = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[("route", "ledger-acumulo"), ("type", "completion")],
+        )
+        .unwrap_or_else(|| panic!("falta tokens_total type=completion:\n{text}"));
+        assert_eq!(
+            fnum(completion),
+            220.0,
+            "tokens de salida acumulados:\n{completion}"
+        );
+
+        let cost = ledger_line(
+            &text,
+            "llm_gateway_cost_usd_total",
+            &[("route", "ledger-acumulo")],
+        )
+        .unwrap_or_else(|| panic!("falta cost_usd_total:\n{text}"));
+        assert!(
+            (fnum(cost) - (0.0036 + 0.0026)).abs() < f64::EPSILON,
+            "coste acumulado:\n{cost}"
+        );
+    }
+
+    /// Sin `usage` (o sin precio) no se registra nada: nunca se inventa un `0`.
+    /// Con datos parciales solo se registra la parte conocida.
+    #[test]
+    fn ledger_usage_without_data_records_nothing() {
+        let metrics = Metrics::new(&config("ledger-vacio", false));
+        metrics.record_ledger_usage("ledger-vacio", "acme/flash-a", None, None, None);
+
+        let text = metrics.render();
+        for name in ["llm_gateway_tokens_total", "llm_gateway_cost_usd_total"] {
+            assert!(
+                ledger_line(&text, name, &[("route", "ledger-vacio")]).is_none(),
+                "{name} no debe existir sin datos:\n{text}"
+            );
+        }
+
+        // Datos parciales: tokens conocidos, coste desconocido (sin precio).
+        metrics.record_ledger_usage("ledger-parcial", "acme/flash-a", Some(10), None, None);
+        let text = metrics.render();
+        let prompt = ledger_line(
+            &text,
+            "llm_gateway_tokens_total",
+            &[("route", "ledger-parcial"), ("type", "prompt")],
+        )
+        .unwrap_or_else(|| panic!("los tokens conocidos sí se registran:\n{text}"));
+        assert_eq!(fnum(prompt), 10.0, "tokens parciales:\n{prompt}");
+        assert!(
+            ledger_line(
+                &text,
+                "llm_gateway_cost_usd_total",
+                &[("route", "ledger-parcial")]
+            )
+            .is_none(),
+            "sin precio no hay serie de coste:\n{text}"
+        );
+    }
+
+    /// Scenario «Contador de selecciones por motivo»: un cambio de selección
+    /// incrementa `model_selection_total{route,reason}`.
+    #[test]
+    fn model_selection_counter_increments_by_reason() {
+        let metrics = Metrics::new(&config("ledger-seleccion", false));
+        metrics.record_model_selection("ledger-seleccion", SelectionReason::Failover);
+        metrics.record_model_selection("ledger-seleccion", SelectionReason::Failover);
+        metrics.record_model_selection("ledger-seleccion", SelectionReason::Initial);
+
+        let text = metrics.render();
+        let failover = ledger_line(
+            &text,
+            "llm_gateway_model_selection_total",
+            &[("route", "ledger-seleccion"), ("reason", "failover")],
+        )
+        .unwrap_or_else(|| panic!("falta model_selection_total reason=failover:\n{text}"));
+        assert_eq!(fnum(failover), 2.0, "dos failovers:\n{failover}");
+
+        let initial = ledger_line(
+            &text,
+            "llm_gateway_model_selection_total",
+            &[("route", "ledger-seleccion"), ("reason", "initial")],
+        )
+        .unwrap_or_else(|| panic!("falta model_selection_total reason=initial:\n{text}"));
+        assert_eq!(fnum(initial), 1.0, "un initial:\n{initial}");
+    }
+
+    /// Scenario «Gauge del modelo seleccionado»: `side=prompt` refleja el
+    /// precio de entrada y `side=completion` el de salida; republicar
+    /// sobrescribe el valor (gauge de estado, no acumula) y sin precio no hay
+    /// serie nueva.
+    #[test]
+    fn selected_price_gauge_reflects_current_price() {
+        let metrics = Metrics::new(&config("ledger-precio-sel", false));
+        metrics.set_selected_model_price("ledger-precio-sel", "acme/flash-a", Some(2.0), Some(8.0));
+
+        let text = metrics.render();
+        let pin = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "ledger-precio-sel"),
+                ("model", "acme/flash-a"),
+                ("side", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta side=prompt:\n{text}"));
+        assert_eq!(fnum(pin), 2.0, "precio de entrada en USD/Mtok:\n{pin}");
+
+        let pout = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "ledger-precio-sel"),
+                ("model", "acme/flash-a"),
+                ("side", "completion"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta side=completion:\n{text}"));
+        assert_eq!(fnum(pout), 8.0, "precio de salida en USD/Mtok:\n{pout}");
+
+        // Republicar: el lado conocido se sobrescribe; el desconocido conserva
+        // el último valor publicado (gauge de estado).
+        metrics.set_selected_model_price("ledger-precio-sel", "acme/flash-a", Some(2.5), None);
+        let text = metrics.render();
+        let pin = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "ledger-precio-sel"),
+                ("model", "acme/flash-a"),
+                ("side", "prompt"),
+            ],
+        )
+        .unwrap_or_else(|| panic!("falta side=prompt tras republicar:\n{text}"));
+        assert_eq!(fnum(pin), 2.5, "precio actualizado:\n{pin}");
+        let pout = ledger_line(
+            &text,
+            "llm_gateway_selected_model_price_usd",
+            &[
+                ("route", "ledger-precio-sel"),
+                ("model", "acme/flash-a"),
+                ("side", "completion"),
+            ],
+        )
+        .expect("el último precio de salida conocido se conserva");
+        assert_eq!(
+            fnum(pout),
+            8.0,
+            "sin pout nuevo se conserva el último:\n{pout}"
+        );
+
+        // Un modelo sin precio conocido no publica ninguna serie. La etiqueta
+        // del modelo es única de este test: otros tests de selección publican
+        // los suyos en el registro global compartido.
+        metrics.set_selected_model_price("ledger-precio-sel", "sel/sin-precio", None, None);
+        let text = metrics.render();
+        assert!(
+            ledger_line(
+                &text,
+                "llm_gateway_selected_model_price_usd",
+                &[("model", "sel/sin-precio")]
+            )
+            .is_none(),
+            "sin precio no hay serie:\n{text}"
+        );
+    }
+
+    /// Scenario «Gauge de la lista curada»: una serie por modelo con precio
+    /// conocido; republicar un modelo actualiza su valor sin duplicar series.
+    ///
+    /// Los modelos son únicos de este test: la etiqueta del gauge es solo
+    /// `model` y otros tests (p. ej. los de selección) publican los suyos en
+    /// el registro global compartido.
+    #[test]
+    fn allowlist_price_gauge_publishes_one_series_per_model() {
+        let metrics = Metrics::new(&config("ledger-precio-allow", false));
+        metrics.set_allowlist_price("ledger/curado-a", 0.04);
+        metrics.set_allowlist_price("ledger/curado-b", 0.1);
+
+        let text = metrics.render();
+        let series = text
+            .lines()
+            .filter(|line| {
+                line.starts_with("llm_gateway_allowlist_price_usd")
+                    && line.contains(r#"model="ledger/curado-"#)
+            })
+            .count();
+        assert_eq!(series, 2, "una serie por modelo:\n{text}");
+
+        let curado_a = ledger_line(
+            &text,
+            "llm_gateway_allowlist_price_usd",
+            &[("model", "ledger/curado-a")],
+        )
+        .unwrap_or_else(|| panic!("falta la serie de ledger/curado-a:\n{text}"));
+        assert_eq!(
+            fnum(curado_a),
+            0.04,
+            "blend de ledger/curado-a:\n{curado_a}"
+        );
+
+        // Republicar actualiza el valor sin duplicar la serie.
+        metrics.set_allowlist_price("ledger/curado-a", 0.05);
+        let text = metrics.render();
+        let series = text
+            .lines()
+            .filter(|line| {
+                line.starts_with("llm_gateway_allowlist_price_usd")
+                    && line.contains(r#"model="ledger/curado-a""#)
+            })
+            .count();
+        assert_eq!(series, 1, "republicar no duplica la serie:\n{text}");
+        let curado_a = ledger_line(
+            &text,
+            "llm_gateway_allowlist_price_usd",
+            &[("model", "ledger/curado-a")],
+        )
+        .expect("serie de ledger/curado-a tras republicar");
+        assert_eq!(fnum(curado_a), 0.05, "precio actual:\n{curado_a}");
+    }
+
+    /// Scenario «request_id no es etiqueta de métrica»: ninguna serie incluye
+    /// `request_id`, ni siquiera tras registrar usage, coste, selección y
+    /// precios.
+    #[test]
+    fn metrics_never_carry_request_id_label() {
+        let metrics = Metrics::new(&config("ledger-sin-request-id", false));
+        metrics.record_ledger_usage(
+            "ledger-sin-request-id",
+            "acme/flash-a",
+            Some(1000),
+            Some(200),
+            Some(0.0036),
+        );
+        metrics.record_model_selection("ledger-sin-request-id", SelectionReason::Initial);
+        metrics.set_selected_model_price(
+            "ledger-sin-request-id",
+            "acme/flash-a",
+            Some(2.0),
+            Some(8.0),
+        );
+        metrics.set_allowlist_price("curado/sin-request-id", 0.04);
+
+        let text = metrics.render();
+        assert!(
+            !text.contains("request_id="),
+            "ninguna serie debe etiquetar request_id:\n{text}"
+        );
     }
 }
